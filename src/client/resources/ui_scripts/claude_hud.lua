@@ -342,7 +342,22 @@ local function clock_text(ms)
     return string.format("%d:%02d", math.floor(s / 60), s % 60)
 end
 
+-- Marines (our front end's allies) when this game has the badge for them.
+local function marines_icon()
+    local name = "h2m_faction_marines"
+    local ok, missing = pcall(function()
+        return game:isdefaultmaterial(name)
+    end)
+    if ok and missing == false then
+        return name
+    end
+    return nil
+end
+
 local function team_name(team, fallback)
+    if team == "allies" and marines_icon() then
+        return "MARINES"
+    end
     local key = team == "axis" and "g_TeamName_Axis" or "g_TeamName_Allies"
     local raw = try("", Engine.GetDvarString, key)
     if raw == "" then
@@ -428,6 +443,9 @@ local function build_score_hud()
         -- own team badge; what the game gives is in the log.
         local over = try("", Engine.GetDvarString, team_dvar == "g_TeamIcon_Axis" and "clc_icon_axis" or "clc_icon_allies")
         log("badge " .. tostring(team_dvar) .. " = '" .. tostring(icon) .. "' override '" .. tostring(over) .. "'")
+        if over == "" and team_dvar ~= "g_TeamIcon_Axis" then
+            over = marines_icon() or ""
+        end
         if over ~= "" then
             icon = over
         end
@@ -1180,7 +1198,7 @@ local function wrap_minimap()
                     type = "UICompass",
                     id = "minimapCompass",
                     states = {
-                        default = tape_state(0),
+                        default = tape_state(1),
                         active = { alpha = 1 },
                         nosignal = { alpha = 0.05 },
                         scrambled = { alpha = 0 },

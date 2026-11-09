@@ -594,6 +594,29 @@ if LUI.MenuTemplate and type(LUI.MenuTemplate.AddButton) == "function" and LUI.A
     log("rows right-aligned")
 end
 
+-- The one place a button's label gets its alignment (every button, however it
+-- was built): left-aligned labels in the front end go to the right end.
+if LUI.UIGenericButton and type(LUI.UIGenericButton.ButtonLabelFactory) == "function" and LUI.Alignment then
+    local orig_label = LUI.UIGenericButton.ButtonLabelFactory
+    local logged = false
+    LUI.UIGenericButton.ButtonLabelFactory = function(settings, ...)
+        if frontend_now() and type(settings) == "table" and settings.align == LUI.Alignment.Left then
+            local ok, copy = pcall(UI.copy, settings)
+            if ok and type(copy) == "table" then
+                copy.align = LUI.Alignment.Right
+                copy.padding = UI.px(36)
+                copy.paddingFocus = UI.px(36)
+                settings = copy
+                if not logged then
+                    logged = true
+                    log("label factory: right-aligned a button label")
+                end
+            end
+        end
+        return orig_label(settings, ...)
+    end
+end
+
 ----------------------------------------------------------------------------
 -- 4. Every menu: the shade down its left, the lit band over the footer.
 ----------------------------------------------------------------------------

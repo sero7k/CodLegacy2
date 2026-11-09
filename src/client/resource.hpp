@@ -16,3 +16,6 @@
 #define LUI_COMMON            307
 
 #define DVAR_LIST			  308
+
+#define CLAUDE_HUD            310
+#define CLAUDE_UI             313

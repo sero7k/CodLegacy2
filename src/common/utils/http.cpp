@@ -1,4 +1,5 @@
 #include "http.hpp"
+#include <chrono>
 #include <algorithm>
 #include <curl/curl.h>
 #include <gsl/gsl>

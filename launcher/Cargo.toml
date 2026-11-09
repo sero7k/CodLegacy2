@@ -1,0 +1,22 @@
+[package]
+name = "cod-legacy-launcher"
+version = "0.1.0"
+edition = "2021"
+description = "Cod Legacy Launcher: a small window that starts Cod Legacy (multiplayer)."
+
+[[bin]]
+name = "cod-legacy-launcher"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.34", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+
+# Not part of any parent workspace: built on its own.
+[workspace]

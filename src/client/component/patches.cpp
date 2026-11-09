@@ -426,14 +426,19 @@ namespace patches
 		{
 			// (hmw_launcher is HMW's own launcher art: a 64-byte stub in the
 			// game folder, and its read fails the load; we have our own launcher.)
-			std::array<std::string, 6> zones
+			// (the rest of HMW's weapon/content zones that sit in hmw-mod/zone;
+			// each is loaded only if its file exists)
+			std::array<std::string, 9> zones
 			{
 				"hmw_killstreak",
 				"hmw_attachments",
 				"hmw_ar1",
 				"hmw_smg",
 				"hmw_shotgun",
-				"hmw_rangers"
+				"hmw_rangers",
+				"hmw_nightshade",
+				"hmw_dlc_factions",
+				"hmw_dlc_killstreaks"
 			};
 
 			try_load_all_zones(zones);

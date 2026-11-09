@@ -11,6 +11,7 @@
 #include <utils/string.hpp>
 
 #include <cctype>
+#include <fstream>
 #include <cstring>
 #include <functional>
 #include <mutex>
@@ -31,6 +32,22 @@ namespace stock_weapons
 		};
 
 		std::mutex tables_mutex;
+		int trace_count = 0;
+
+		// Into claude_ui_errors.log (next to the exe) as well as the console.
+		void trace(const std::string& line)
+		{
+			if (trace_count++ > 40)
+			{
+				return;
+			}
+			console::info("%s\n", line.data());
+			std::ofstream f("claude_ui_errors.log", std::ios::app);
+			if (f)
+			{
+				f << "[stock_weapons] " << line << "\n";
+			}
+		}
 		std::unordered_map<std::string, cached> tables;
 		utils::memory::allocator allocator;
 
@@ -108,8 +125,8 @@ namespace stock_weapons
 			const auto is_stats = name == "mp/statstable.csv";
 			if (is_stats && original->columnCount != column_count)
 			{
-				console::warn("stock weapons: %s has %i columns (need %i), not adding\n",
-					name.data(), original->columnCount, column_count);
+				trace(utils::string::va("%s has %i columns x %i rows (need %i columns), not adding",
+					name.data(), original->columnCount, original->rowCount, column_count));
 				return nullptr;
 			}
 			if (!is_stats && original->columnCount < 1)
@@ -120,7 +137,8 @@ namespace stock_weapons
 			const auto hash = find_hash(original);
 			if (!hash)
 			{
-				console::warn("stock weapons: cannot work out the cell hash of %s, not adding\n", name.data());
+				trace(utils::string::va("cannot work out the cell hash of %s (%i x %i), not adding",
+					name.data(), original->columnCount, original->rowCount));
 				return nullptr;
 			}
 
@@ -141,6 +159,13 @@ namespace stock_weapons
 
 			if (add.empty())
 			{
+				std::string probe;
+				for (const char* n : { "h1_ak47_mp", "h1_m16_mp", "h2_ak47_mp", "iw5_ak47_mp", "ak47_mp", "h1_usp_mp" })
+				{
+					probe += std::string(n) + "=" + (game::DB_XAssetExists(game::ASSET_TYPE_WEAPON, n) ? "yes " : "no ");
+				}
+				trace(utils::string::va("%s: none of the %i stock weapons are loaded; probe: %s",
+					name.data(), row_count, probe.data()));
 				return nullptr;
 			}
 
@@ -178,8 +203,8 @@ namespace stock_weapons
 				}
 			}
 
-			console::info("stock weapons: %s: added %i stock weapons (%i not loaded)\n",
-				name.data(), static_cast<int>(add.size()), static_cast<int>(missing.size()));
+			trace(utils::string::va("%s: added %i stock weapons (%i not loaded)",
+				name.data(), static_cast<int>(add.size()), static_cast<int>(missing.size())));
 			return result;
 		}
 	}

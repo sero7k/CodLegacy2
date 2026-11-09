@@ -589,7 +589,13 @@ if LUI.MenuTemplate and type(LUI.MenuTemplate.AddButton) == "function" and LUI.A
                 end
             end)
         end
-        return orig_add_button(menu, a1, a2, a3, a4, a5, props, a7)
+        UI.in_add_button = true
+        local res = { pcall(orig_add_button, menu, a1, a2, a3, a4, a5, props, a7) }
+        UI.in_add_button = false
+        if not res[1] then
+            error(res[2], 0)
+        end
+        return unpack(res, 2)
     end
     log("rows right-aligned")
 end
@@ -600,7 +606,7 @@ if LUI.UIGenericButton and type(LUI.UIGenericButton.ButtonLabelFactory) == "func
     local orig_label = LUI.UIGenericButton.ButtonLabelFactory
     local logged = false
     LUI.UIGenericButton.ButtonLabelFactory = function(settings, ...)
-        if frontend_now() and type(settings) == "table" and settings.align == LUI.Alignment.Left then
+        if UI.in_add_button and frontend_now() and type(settings) == "table" and settings.align == LUI.Alignment.Left then
             local ok, copy = pcall(UI.copy, settings)
             if ok and type(copy) == "table" then
                 copy.align = LUI.Alignment.Right

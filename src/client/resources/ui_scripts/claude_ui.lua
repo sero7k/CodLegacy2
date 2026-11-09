@@ -888,7 +888,10 @@ pcall(function()
                     have[e[1]] = true
                 end
                 for _, name in ipairs(names) do
-                    if not have[name] then
+                    -- (Only weapons the stats table has a row for: without one the
+                    -- slot shows a blank row with a checkerboard picture.)
+                    local nm = Engine.TableLookup("mp/statstable.csv", 4, name, 3)
+                    if not have[name] and nm and nm ~= "" then
                         table.insert(list, { name, 0 })
                         added = added + 1
                     end

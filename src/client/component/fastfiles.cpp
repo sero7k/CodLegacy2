@@ -7,6 +7,7 @@
 #include "filesystem.hpp"
 #include "imagefiles.hpp"
 #include "weapon.hpp"
+#include "stock_weapons.hpp"
 
 #include "game/dvars.hpp"
 
@@ -141,6 +142,8 @@ namespace fastfiles
 				{
 					if (result.stringTable)
 					{
+						result.stringTable = stock_weapons::patch(result.stringTable);
+
 						const auto override_stringtable = db_find_xasset_header_hook.invoke<game::XAssetHeader>(type, override_asset_name.data(), 0);
 						if (override_stringtable.stringTable)
 						{

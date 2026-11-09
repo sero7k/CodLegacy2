@@ -24,7 +24,7 @@ namespace dedicated_info
 				const auto sv_running = game::Dvar_FindVar("sv_running");
 				if (!sv_running || !sv_running->current.enabled || (*game::svs_clients) == nullptr)
 				{
-					SetConsoleTitle("HorizonMW Dedicated Server");
+					SetConsoleTitle("CodLegacy Dedicated Server");
 					return;
 				}
 

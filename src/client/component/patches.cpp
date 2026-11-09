@@ -623,7 +623,7 @@ namespace patches
 			utils::hook::call(0x1CBD06_b, sv_execute_client_message_stub);
 
 			// Change default hostname and make it replicated
-			dvars::override::register_string("sv_hostname", "^5HorizonMW^7 Default Server", game::DVAR_FLAG_REPLICATED);
+			dvars::override::register_string("sv_hostname", "^5CodLegacy^7 Default Server", game::DVAR_FLAG_REPLICATED);
 
 			// Dont free server/client memory on asset loading (fixes crashing on map rotation)
 			utils::hook::nop(0x132474_b, 5);
@@ -645,8 +645,8 @@ namespace patches
 			
 			*/
 			// change names of window name + stat files for hmw
-			utils::hook::copy_string(0x926210_b, "HorizonMW");	// window name
-			utils::hook::copy_string(0x929168_b, "HorizonMW");	// mulitbyte string (window too?)
+			utils::hook::copy_string(0x926210_b, "CodLegacy");	// window name
+			utils::hook::copy_string(0x929168_b, "CodLegacy");	// mulitbyte string (window too?)
 			utils::hook::copy_string(0x91F464_b, "h2mdta");		// mpdata
 			utils::hook::copy_string(0x91F458_b, "h2mcdta");	// commondata
 

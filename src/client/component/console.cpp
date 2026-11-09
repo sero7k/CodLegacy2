@@ -357,7 +357,7 @@ namespace console
 			printf_hook.create(printf, printf_stub);
 
 			ShowWindow(GetConsoleWindow(), SW_SHOW);
-			SetConsoleTitle("HorizonMW: " VERSION);
+			SetConsoleTitle("CodLegacy: " VERSION);
 
 			con.kill_event = CreateEvent(NULL, TRUE, FALSE, NULL);
 

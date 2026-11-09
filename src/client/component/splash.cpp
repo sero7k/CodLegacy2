@@ -103,7 +103,7 @@ namespace splash
 
 				if (image_)
 				{
-					this->window_ = CreateWindowExA(WS_EX_APPWINDOW, "HMW Splash Screen", "HMW",
+					this->window_ = CreateWindowExA(WS_EX_APPWINDOW, "HMW Splash Screen", "CLC",
 						WS_POPUP | WS_SYSMENU,
 						(x_pixels - 320) / 2, (y_pixels - 100) / 2, 320, 100, nullptr,
 						nullptr,

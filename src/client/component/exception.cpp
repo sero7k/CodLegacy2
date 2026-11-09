@@ -124,7 +124,7 @@ namespace exception
 				++recovery_data.recovery_counts;
 
 				game::Com_Error(game::ERR_DROP, "Fatal error (0x%08X) at 0x%p.\nA minidump has been written.\n\n"
-				                "HorizonMW has tried to recover your game, but it might not run stable anymore.\n\n"
+				                "CodLegacy has tried to recover your game, but it might not run stable anymore.\n\n"
 				                "Make sure to update your graphics card drivers and install operating system updates!\n",
 				                exception_data.code, exception_data.address);
 			}
@@ -167,7 +167,7 @@ namespace exception
 				info.append("\r\n");
 			};
 
-			line("HorizonMW Crash Dump");
+			line("CodLegacy Crash Dump");
 			line("");
 			line("Version: "s + VERSION);
 			line("Environment: "s + game::environment::get_string());
@@ -199,7 +199,7 @@ namespace exception
 			utils::compression::zip::archive zip_file{};
 			zip_file.add("crash.dmp", create_minidump(exceptioninfo));
 			zip_file.add("info.txt", generate_crash_info(exceptioninfo));
-			zip_file.write(crash_name, "HorizonMW Crash Dump");
+			zip_file.write(crash_name, "CodLegacy Crash Dump");
 		}
 
 		bool is_harmless_error(const LPEXCEPTION_POINTERS exceptioninfo)

@@ -2,6 +2,7 @@
 #include <fstream>
 #include "loader/component_loader.hpp"
 
+#include "clantags.hpp"
 #include "console.hpp"
 #include "command.hpp"
 #include "discord.hpp"
@@ -378,6 +379,12 @@ namespace discord
 		utils::hook::detour ui_activision_tag_allowed_hook;
 		bool ui_activision_tag_allowed_stub(char* clantag, char* steamID)
 		{
+			// The project owner may wear any special tag.
+			if (clantags::is_dev(discord_user_id))
+			{
+				return true;
+			}
+
 			if (discord_user_id.empty())
 			{
 				game::StringTable* clantags;

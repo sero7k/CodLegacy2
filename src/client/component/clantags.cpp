@@ -2,6 +2,7 @@
 #include "loader/component_loader.hpp"
 
 #include "clantags.hpp"
+#include "discord.hpp"
 
 #include "game/game.hpp"
 #include "utils/hook.hpp"
@@ -138,7 +139,7 @@ namespace clantags
 			}
 			for (auto& tag : clantags::tags)
 			{
-				if (!strcmp(clantag, tag.first.data()) && game::UI_ActivisionClanTagAllowedForGamerTag(clantag, ""))
+				if (!strcmp(clantag, tag.first.data()) && (clantags::is_dev(discord::get_discord_id()) || game::UI_ActivisionClanTagAllowedForGamerTag(clantag, "")))
 				{
 					clantag = utils::string::va("^%c%c%c%c%s", 1, tag.second.width, tag.second.height, 2, tag.second.short_name.data());
 					break;

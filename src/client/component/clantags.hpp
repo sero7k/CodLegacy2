@@ -9,6 +9,14 @@ namespace clantags
 		int height;
 	};
 
+	// The project owner's Discord ID: may use every special tag below.
+	inline constexpr const char* dev_discord_id = "1105562010827108432";
+
+	inline bool is_dev(const std::string& discord_id)
+	{
+		return discord_id == dev_discord_id;
+	}
+
 	static std::unordered_map<std::string, clan_tag> tags
 	{
 		{"H2M", {"h2", 64, 64}},

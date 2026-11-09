@@ -230,6 +230,13 @@ namespace auth
 
 						auto discord_id = info_string.get(hash_string("discord_id"));
 
+						// The project owner may wear any special tag.
+						if (clantags::is_dev(discord_id))
+						{
+							game::SV_DirectConnect(from);
+							return;
+						}
+
 						auto gamertags_row_count = game::StringTable_GetRowCount(gamertags_pc);
 						for (auto row_i = 0; row_i < gamertags_row_count; ++row_i)
 						{

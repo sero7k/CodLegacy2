@@ -1,4 +1,6 @@
 #pragma once
+#include "game/game.hpp"
+
 
 namespace stock_weapons
 {

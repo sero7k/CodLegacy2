@@ -2,6 +2,8 @@
 #include "loader/component_loader.hpp"
 
 #include "console.hpp"
+#include "game/game.hpp"
+
 #include "stock_weapons.hpp"
 #include "stock_weapons_data.hpp"
 

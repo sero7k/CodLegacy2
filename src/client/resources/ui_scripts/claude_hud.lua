@@ -1147,6 +1147,13 @@ local function wrap_minimap()
             error(root)
         end
         pcall(function()
+            local ids = {}
+            for _, id in ipairs({ "minimap", "minimapWrapper_id", "minimapCompass", "minimapIcons" }) do
+                ids[#ids + 1] = id .. "=" .. tostring(root:getFirstDescendentById(id) ~= nil)
+            end
+            log("minimap built: " .. table.concat(ids, " "))
+        end)
+        pcall(function()
             local tape = root:getFirstDescendentById("minimapCompass")
             if not tape then
                 -- This build's minimap has no compass tape: add H1's own.
@@ -1204,6 +1211,7 @@ local function wrap(type_name, build_ours)
             return stock
         end
         ours:addElement(holder)
+        log("wrapped " .. type_name)
         -- MPHud names each widget's wrapper "wrapper_for_" .. widget.id, so
         -- every widget needs its own id: take the stock widget's (else the
         -- widget type's), never the default one all new elements share.

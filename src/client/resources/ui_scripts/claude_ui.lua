@@ -573,6 +573,27 @@ if LUI.H1ButtonBackground and type(LUI.H1ButtonBackground.new) == "function" the
     end
 end
 
+-- Our menus (view.rs / ghosts.rs rows): the text sits at the row's right end,
+-- not its left. H1's AddButton passes text_align_without_content = Left, so
+-- it is overridden through the button's own properties (front end only).
+if LUI.MenuTemplate and type(LUI.MenuTemplate.AddButton) == "function" and LUI.Alignment then
+    local orig_add_button = LUI.MenuTemplate.AddButton
+    LUI.MenuTemplate.AddButton = function(menu, a1, a2, a3, a4, a5, props, a7)
+        if frontend_now() then
+            pcall(function()
+                props = props or {}
+                if props.text_align_without_content == nil then
+                    props.text_align_without_content = LUI.Alignment.Right
+                    props.text_padding_without_content = UI.px(36)
+                    props.text_padding_focus_without_content = UI.px(36)
+                end
+            end)
+        end
+        return orig_add_button(menu, a1, a2, a3, a4, a5, props, a7)
+    end
+    log("rows right-aligned")
+end
+
 ----------------------------------------------------------------------------
 -- 4. Every menu: the shade down its left, the lit band over the footer.
 ----------------------------------------------------------------------------

@@ -928,9 +928,9 @@ namespace server_list
 			return false;
 		}
 
-		// Only show HMW games
+		// Only show CLC games
 		std::string server_gamename = game_server_response_json["gamename"];
-		if (server_gamename != "HMW")
+		if (server_gamename != "CLC")
 		{
 			failed_to_join_reason = "Invalid gamename.";
 			return false;
@@ -1016,9 +1016,9 @@ namespace server_list
 			return;
 		}
 
-		// Only show HMW games
+		// Only show CLC games
 		std::string server_gamename = game_server_response_json["gamename"];
-		if (server_gamename != "HMW")
+		if (server_gamename != "CLC")
 		{
 			return;
 		}

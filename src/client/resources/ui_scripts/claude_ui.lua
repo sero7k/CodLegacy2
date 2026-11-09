@@ -585,6 +585,27 @@ local function insert_behind(menu, el)
     return ok
 end
 
+-- `unlockall` (the console command sets the flag): the level goes to the
+-- maximum from here, where the game's menus can write the player's data.
+local function add_unlock_poll(menu)
+    pcall(function()
+        menu:addElement(LUI.UITimer.new(500, "claude_unlock_poll"))
+        menu:registerEventHandler("claude_unlock_poll", function()
+            pcall(function()
+                if Engine.GetDvarInt("clc_unlockall_run") ~= 1 then
+                    return
+                end
+                Engine.SetDvarFromString("clc_unlockall_run", "0")
+                local prestige = Engine.GetPlayerData(0, CoD.StatsGroup.Ranked, "prestige") or 0
+                local max = Rank.GetMaxRank(prestige)
+                local xp = max <= 0 and 0 or Rank.GetRankMaxXP(max - 1, prestige)
+                Engine.SetPlayerData(0, CoD.StatsGroup.Ranked, "experience", xp)
+                log("unlockall: level set to max")
+            end)
+        end)
+    end)
+end
+
 local function decorate(menu)
     if not in_frontend then
         -- (In a match the pause menu sits over the game: no shade.)
@@ -639,6 +660,7 @@ local function decorate(menu)
         }))
     end
     menu:addElement(band)
+    add_unlock_poll(menu)
 end
 
 if LUI.MenuTemplate and type(LUI.MenuTemplate.new) == "function" then

@@ -110,13 +110,8 @@ namespace motd
 				return result;
 			};
 
-			const auto result = try_url("https://price.horizonmw.org/");
-
-			if (result.has_value())
-			{
-				return result;
-			}
-
+			// No online news/prices: we run our own servers.
+			(void)try_url;
 			return {};
 		}
 
@@ -124,8 +119,6 @@ namespace motd
 		{
 			map =
 			{
-				{"discord", "https://discord.gg/horizonmw"},
-				{"website", "https://www.youtube.com/@horizonmw"},
 			};
 		}
 

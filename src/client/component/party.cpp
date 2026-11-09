@@ -680,7 +680,7 @@ namespace party
 				}
 
 				std::string gamename = jsonObject["gamename"];
-				if (gamename != "HMW"s) {
+				if (gamename != "CLC"s) {
 					connecting_to_server = false;
 					menu_error("Connection failed: Invalid gamename.");
 					return;
@@ -1175,7 +1175,7 @@ namespace party
 
 					utils::info_string info;
 					info.set("challenge", data);
-					info.set("gamename", "HMW");
+					info.set("gamename", "CLC");
 					info.set("hostname", get_dvar_string("sv_hostname"));
 					info.set("gametype", get_dvar_string("g_gametype"));
 					info.set("sv_motd", get_dvar_string("sv_motd"));

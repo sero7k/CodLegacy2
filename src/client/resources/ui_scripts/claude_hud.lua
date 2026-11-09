@@ -98,6 +98,10 @@ local function text(state, fontname, color, alpha, align)
     state.font = font(fontname, "TitleFontBold")
     state.color = color
     state.alpha = alpha or 1
+    -- (a soft shadow, so the white reads over a bright sky too)
+    if CoD and CoD.TextStyle and CoD.TextStyle.Shadowed then
+        state.textStyle = CoD.TextStyle.Shadowed
+    end
     if align and LUI.Alignment then
         state.alignment = LUI.Alignment[align]
     end
@@ -279,7 +283,7 @@ local function build_weapon_hud()
                 alpha = rest == 0 and 1 or 0.62,
             })
         end
-        local mag = try(nil, Game.GetPlayerClipAmmo)
+        local mag = try(nil, Game.GetPlayerClipAmmo, 1)
         if hidden or mag == nil then
             clip:setText("")
         else
@@ -1144,6 +1148,29 @@ local function wrap_minimap()
         end
         pcall(function()
             local tape = root:getFirstDescendentById("minimapCompass")
+            if not tape then
+                -- This build's minimap has no compass tape: add H1's own.
+                local holder = root:getFirstDescendentById("minimapWrapper_id") or root
+                local mat = luiglobals.RegisterMaterial("minimap_tickertape_mp")
+                local function tape_state(alpha)
+                    return {
+                        topAnchor = true, bottomAnchor = false, leftAnchor = true, rightAnchor = true,
+                        bottom = -4, left = 0, right = 0, height = 16, material = mat, alpha = alpha,
+                    }
+                end
+                LUI.MenuBuilder.BuildAddChild(holder, {
+                    type = "UICompass",
+                    id = "minimapCompass",
+                    states = {
+                        default = tape_state(0),
+                        active = { alpha = 1 },
+                        nosignal = { alpha = 0.05 },
+                        scrambled = { alpha = 0 },
+                    },
+                })
+                tape = root:getFirstDescendentById("minimapCompass")
+                log("minimap: compass tape added (" .. tostring(tape ~= nil) .. ")")
+            end
             if tape then
                 -- The accent under the tape.
                 tape:addElement(rect({ topAnchor = false, bottomAnchor = true, leftAnchor = true, rightAnchor = true, bottom = 0, height = 1, left = 0, right = 0 }, BLUE, 0.7))

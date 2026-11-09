@@ -424,14 +424,15 @@ namespace patches
 		
 		void* ui_init_stub()
 		{
-			std::array<std::string, 7> zones
+			// (hmw_launcher is HMW's own launcher art: a 64-byte stub in the
+			// game folder, and its read fails the load; we have our own launcher.)
+			std::array<std::string, 6> zones
 			{
 				"hmw_killstreak",
 				"hmw_attachments",
 				"hmw_ar1",
 				"hmw_smg",
 				"hmw_shotgun",
-				"hmw_launcher",
 				"hmw_rangers"
 			};
 

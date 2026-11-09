@@ -897,6 +897,23 @@ pcall(function()
         end
     end
 end)
+-- Which of them the game's stats table actually knows (name / image columns).
+pcall(function()
+    local known, unknown = {}, {}
+    for _, classes in pairs(stock) do
+        for _, list in pairs(classes) do
+            for _, n in ipairs(list) do
+                local nm = Engine.TableLookup("mp/statstable.csv", 4, n, 3)
+                if nm and nm ~= "" then
+                    known[#known + 1] = n
+                else
+                    unknown[#unknown + 1] = n
+                end
+            end
+        end
+    end
+    log("mwr_weapons: in statstable: " .. #known .. " / not in statstable: " .. #unknown .. " [" .. table.concat(unknown, ",") .. "]")
+end)
 pcall(function() log("mwr_weapons: added " .. added .. " missing stock weapons (hidden-fix hooks installed)") end)
 
 end

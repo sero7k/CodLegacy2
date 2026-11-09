@@ -79,8 +79,16 @@ namespace ui_scripting
 			return itr == globals.loaded_scripts.end() ? std::string() : itr->second;
 		}
 
+		// Our UI's log (release builds print no LUI errors): claude_ui_errors.log
+		// beside the game, for LUI script errors and the [claude_ui]/[claude_hud] lines.
+		void claude_log(const std::string& line)
+		{
+			utils::io::write_file("claude_ui_errors.log", line + "\n", true);
+		}
+
 		void print_error(const std::string& error)
 		{
+			claude_log("LUI script error: " + error);
 #ifdef DEBUG
 			console::error("************** LUI script execution error **************\n");
 			console::error("%s\n", error.data());
@@ -391,6 +399,11 @@ namespace ui_scripting
 					const auto loc_string = ::game::Key_KeynumToString(key, 1, 0);
 					return ::game::UI_SafeTranslateString(loc_string);
 				}
+			};
+
+			game_type["claudelog"] = [](const game&, const std::string& line)
+			{
+				claude_log(line);
 			};
 
 			game_type["openlink"] = [](const game&, const std::string& name)

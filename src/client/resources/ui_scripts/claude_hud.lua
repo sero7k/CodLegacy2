@@ -30,7 +30,11 @@ end
 
 local log = function(msg)
     pcall(function()
-        print("[claude_hud] " .. tostring(msg))
+        local line = "[claude_hud] " .. tostring(msg)
+        print(line)
+        if game and game.claudelog then
+            game:claudelog(line)
+        end
     end)
 end
 

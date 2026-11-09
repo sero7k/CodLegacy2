@@ -424,6 +424,13 @@ local function build_score_hud()
         }, PANEL, PANEL_ALPHA)
         root:addElement(b.box)
         local icon = try("", Engine.GetDvarString, team_dvar)
+        -- clc_icon_allies / clc_icon_axis (a material name) override the game's
+        -- own team badge; what the game gives is in the log.
+        local over = try("", Engine.GetDvarString, team_dvar == "g_TeamIcon_Axis" and "clc_icon_axis" or "clc_icon_allies")
+        log("badge " .. tostring(team_dvar) .. " = '" .. tostring(icon) .. "' override '" .. tostring(over) .. "'")
+        if over ~= "" then
+            icon = over
+        end
         local mat = icon ~= "" and try(nil, luiglobals.RegisterMaterial, icon) or nil
         if mat then
             b.icon = LUI.UIImage.new({

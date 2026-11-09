@@ -17,6 +17,36 @@ local stock = {
     },
 }
 
+local names = {}
+for _, classes in pairs(stock) do
+    for _, list in pairs(classes) do
+        for _, n in ipairs(list) do names[n] = true end
+    end
+end
+
+-- The CAC drops weapons the inventory/unlock tables don't know (Hidden lock
+-- state, or a non-Default inventory type). Treat every stock MWR weapon as a
+-- normal, unlocked default item so it shows in the slot.
+local lock_fixed = 0
+pcall(function()
+    local orig_lock = Cac.GetItemLockState
+    Cac.GetItemLockState = function(a, b, ref, c, d)
+        local r1, r2, r3 = orig_lock(a, b, ref, c, d)
+        if ref and names[ref] and r1 == "Hidden" then
+            lock_fixed = lock_fixed + 1
+            return "Unlocked", 0, ""
+        end
+        return r1, r2, r3
+    end
+    local orig_type = Engine.Inventory_GetItemTypeByReference
+    Engine.Inventory_GetItemTypeByReference = function(ref, ...)
+        if ref and names[ref] then
+            return Cac.InventoryItemType.Default
+        end
+        return orig_type(ref, ...)
+    end
+end)
+
 local added = 0
 pcall(function()
     for section, classes in pairs(stock) do
@@ -38,4 +68,4 @@ pcall(function()
         end
     end
 end)
-pcall(function() game:claudelog("mwr_weapons: added " .. added .. " missing stock weapons") end)
+pcall(function() game:claudelog("mwr_weapons: added " .. added .. " missing stock weapons (hidden-fix hooks installed)") end)

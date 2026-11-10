@@ -5,6 +5,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-2022
@@ -28,3 +31,20 @@ jobs:
         with:
           name: client
           path: out
+      - name: Push the exe to the latest-build branch (private repo)
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Recurse build\bin -Filter hmw-mod.exe | Select-Object -First 1
+          $dir = Join-Path $env:RUNNER_TEMP "lb"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item $exe.FullName (Join-Path $dir "hmw-mod.exe")
+          Get-ChildItem -Recurse build\bin -Filter *.dll | Copy-Item -Destination $dir -ErrorAction SilentlyContinue
+          Set-Content (Join-Path $dir "BUILD.txt") "${{ github.sha }}"
+          Set-Location $dir
+          git init -q
+          git checkout -q -b latest-build
+          git config user.email "ci@users.noreply.github.com"
+          git config user.name "ci"
+          git add -A
+          git commit -q -m "Build of ${{ github.sha }}"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" latest-build

@@ -1272,7 +1272,15 @@ function UI.map_art()
         end
     end
     if not found and game and game.clcimage then
-        for _, p in ipairs({ load .. ".jpg", load .. ".png", base .. ".jpg", base .. ".png" }) do
+        -- (<game>_<map>.png is the name the Rust client caches map pictures
+        -- under: its codlegacy-artifacts/cache/map-pictures folder copied
+        -- to codlegacy/maps.)
+        local tries = { load .. ".jpg", load .. ".png", base .. ".jpg", base .. ".png" }
+        for _, g in ipairs({ "h1", "iw4", "iw5", "iw6", "s1", "t5", "t6", "t7", "jup" }) do
+            tries[#tries + 1] = g .. "_" .. load .. ".png"
+            tries[#tries + 1] = g .. "_" .. base .. ".png"
+        end
+        for _, p in ipairs(tries) do
             local ok, m = pcall(function() return game:clcimage("codlegacy/maps/" .. p) end)
             if ok and m then
                 found = m
@@ -1928,6 +1936,20 @@ function UI.lobby_look(menu, key)
             local ic = over ~= "" and over or (Engine.GetDvarString("g_TeamIcon_" .. side) or "")
             if ic ~= "" then
                 icon = UI.material(ic)
+            end
+            -- (No badge from the game: codlegacy/factions/<name>.png, e.g.
+            -- ghosts.png and federation.png, when one is there.)
+            if not icon and game and game.clcimage then
+                local file = string.lower(name)
+                for _, ext in ipairs({ ".png", ".jpg" }) do
+                    local ok, m = pcall(function()
+                        return game:clcimage("codlegacy/factions/" .. file .. ext)
+                    end)
+                    if ok and m then
+                        icon = m
+                        break
+                    end
+                end
             end
         end)
         return name, icon

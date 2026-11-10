@@ -1164,6 +1164,12 @@ local function add_after_build(menu)
     pcall(function()
         local key = tostring(menu.id or menu.type or "?")
         if backdrop_wanted(key) then
+            -- The lobby room is behind our backdrop: put it in its "obscured"
+            -- mode so its soldier stops playing (and making sound) unseen.
+            -- (Create-a-Class pushes its own mode and gives this one back.)
+            pcall(function()
+                Engine.SetDvarInt("virtualLobbyMode", VirtualLobbyModes.LUI_MODE_OBSCURED)
+            end)
             local ok, err = pcall(add_backdrop, menu)
             if not ok then
                 log("backdrop: " .. tostring(err))

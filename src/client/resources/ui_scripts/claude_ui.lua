@@ -901,8 +901,11 @@ local function after_build(menu)
         logged_trees[key] = true
         log("menu '" .. key .. "': realigned " .. count .. " row labels")
         local lines = 0
+        -- (Create-a-Class: the whole tree, to rebuild it as our shell's.)
+        local deep = string.find(key, "Cac") ~= nil
+        local max_lines, max_depth = deep and 600 or 60, deep and 9 or 4
         walk(menu, 0, function(el, depth)
-            if lines < 60 and depth <= 4 then
+            if lines < max_lines and depth <= max_depth then
                 lines = lines + 1
                 log("  tree " .. string.rep("  ", depth) .. tostring(el.id or "-"))
             end

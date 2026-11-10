@@ -820,6 +820,53 @@ local function realign_label(label)
     label:animateToState("default")
 end
 
+-- A row that carries a value as well as its label (MODE: Team Deathmatch,
+-- BOT DIFFICULTY: Regular, ...): the label at the row's left, the value at
+-- its right, as view.rs lays them out (SpaceBetween). Right-aligning both
+-- put them on top of each other.
+local function split_row(texts)
+    local ts = CoD.TextSettings.BodyFont or CoD.TextSettings.TitleFontTiny
+    local h = UI.px(30)
+    local label = nil
+    for _, el in ipairs(texts) do
+        if not label and tostring(el.id or "") == "text_label" then
+            label = el
+        end
+    end
+    label = label or texts[1]
+    local function put(el, is_label)
+        local function st(c, a)
+            local s = {
+                alignment = is_label and LUI.Alignment.Left or LUI.Alignment.Right,
+                font = ts.Font,
+                topAnchor = false,
+                bottomAnchor = false,
+                leftAnchor = is_label,
+                rightAnchor = not is_label,
+                top = -h / 2,
+                bottom = h / 2,
+                width = is_label and UI.px(260) or UI.px(220),
+                red = c.r,
+                green = c.g,
+                blue = c.b,
+                alpha = a,
+            }
+            if is_label then
+                s.left = UI.px(36)
+            else
+                s.right = -UI.px(36)
+            end
+            return s
+        end
+        el:registerAnimationState("default", st(is_label and UI.TEXT or UI.DIM, is_label and 0.82 or 0.9))
+        el:registerAnimationState("focus", st(UI.WHITE, 1))
+        el:animateToState("default")
+    end
+    for _, el in ipairs(texts) do
+        put(el, el == label)
+    end
+end
+
 local function row_words(menu)
     if not menu.list or menu.claude_words then
         return
@@ -979,6 +1026,32 @@ local function after_build(menu)
             log("cac panel: " .. tostring(err))
         end
     end
+    -- The texts of each list row, so a row with a value as well as its label
+    -- is laid out as a pair, not both pushed to the right end.
+    local per_row = {}
+    if menu.list then
+        pcall(function()
+            walk(menu.list, 0, function(el)
+                if el.claude or type(el.setText) ~= "function" or type(el.getText) ~= "function" then
+                    return
+                end
+                local shown = ""
+                pcall(function()
+                    shown = tostring(el:getText() or "")
+                end)
+                if shown == "" then
+                    return
+                end
+                local row = el
+                while row:getParent() and row:getParent() ~= menu.list do
+                    row = row:getParent()
+                end
+                per_row[row] = per_row[row] or {}
+                per_row[row][#per_row[row] + 1] = el
+            end)
+        end)
+    end
+    local split_done = {}
     walk(menu, 0, function(el, depth)
         local id = tostring(el.id or "")
         if id == "text_label" then
@@ -994,11 +1067,28 @@ local function after_build(menu)
                 p = p:getParent()
             end
             if in_list then
-                local ok, err = pcall(realign_label, el)
-                if ok then
-                    count = count + 1
+                local row = el
+                while row:getParent() and row:getParent() ~= menu.list do
+                    row = row:getParent()
+                end
+                local texts = per_row[row]
+                if texts and #texts > 1 then
+                    if not split_done[row] then
+                        split_done[row] = true
+                        local ok, err = pcall(split_row, texts)
+                        if ok then
+                            count = count + 1
+                        else
+                            log("split row: " .. tostring(err))
+                        end
+                    end
                 else
-                    log("realign: " .. tostring(err))
+                    local ok, err = pcall(realign_label, el)
+                    if ok then
+                        count = count + 1
+                    else
+                        log("realign: " .. tostring(err))
+                    end
                 end
             end
         end

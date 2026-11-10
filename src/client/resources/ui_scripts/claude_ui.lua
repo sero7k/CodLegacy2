@@ -776,8 +776,8 @@ local SCREEN_TITLES = {
     mp_main_menu_container = "MAIN MENU",
     menu_xboxlive_container = "MULTIPLAYER  /  MATCH SELECT",
     menu_systemlink_container = "MULTIPLAYER  /  MATCH SELECT",
-    menu_xboxlive_privatelobby_container = "CUSTOM GAME  /  LOBBY",
-    gamesetup_menu_main_container = "CUSTOM GAME  /  SETTINGS",
+    menu_xboxlive_privatelobby_container = "CUSTOM GAME",
+    gamesetup_menu_main_container = "CUSTOM GAME",
     mapsetup_menu_main_container = "CUSTOM GAME  /  SELECT MAP",
     CacMenu_container = "MULTIPLAYER  /  CREATE A CLASS",
     OperatorMenu_container = "MULTIPLAYER  /  BARRACKS",
@@ -1056,6 +1056,12 @@ local function after_build(menu)
     local count = 0
     pcall(add_moved_rows, menu, key)
     pcall(row_words, menu)
+    if UI.lobby_look and (key == "menu_xboxlive_privatelobby_container" or key == "gamesetup_menu_main_container") then
+        local ok, err = pcall(UI.lobby_look, menu, key)
+        if not ok then
+            log("lobby look: " .. tostring(err))
+        end
+    end
     if key == "CacMenu_container" and not menu.claude_cac then
         menu.claude_cac = true
         local ok, err = pcall(build_cac_panel, menu)
@@ -1241,6 +1247,49 @@ local BACKDROP_COUNT = 21
 local BACKDROP_HOLD = 9000
 local BACKDROP_FADE = 900
 
+-- The picture of the map in use (ui_mapname): the game's own loading-screen
+-- or preview material if it has one, else codlegacy/maps/<map>.jpg (or .png)
+-- beside the game. nil when there is none.
+UI.map_art_cache = {}
+function UI.map_art()
+    local load = ""
+    pcall(function() load = Engine.GetDvarString("ui_mapname") or "" end)
+    if load == "" then
+        return nil, load
+    end
+    local hit = UI.map_art_cache[load]
+    if hit ~= nil then
+        return hit or nil, load
+    end
+    local base = string.gsub(load, "^mp_", "")
+    local found = nil
+    for _, n in ipairs({ "preview_" .. load, "loadscreen_" .. load, "preview_" .. base,
+        "loadscreen_" .. base, "loadscreen_mp_" .. base .. "_01" }) do
+        local ok, has = pcall(UI.has_material, n)
+        if ok and has then
+            found = UI.material(n)
+            break
+        end
+    end
+    if not found and game and game.clcimage then
+        for _, p in ipairs({ load .. ".jpg", load .. ".png", base .. ".jpg", base .. ".png" }) do
+            local ok, m = pcall(function() return game:clcimage("codlegacy/maps/" .. p) end)
+            if ok and m then
+                found = m
+                break
+            end
+        end
+    end
+    UI.map_art_cache[load] = found or false
+    log("map art: " .. load .. " -> " .. tostring(found ~= nil))
+    return found, load
+end
+
+local MAP_BACKDROP_MENUS = {
+    menu_xboxlive_privatelobby_container = true,
+    gamesetup_menu_main_container = true,
+}
+
 local function backdrop_wanted(key)
     -- Every front-end screen, as our shell (its screens all sit on the
     -- backdrop and none shows the lobby room; Create-a-Class shows the gun's
@@ -1270,6 +1319,13 @@ end
 
 local function add_backdrop(menu)
     local pics = backdrop_materials()
+    local map_pic = nil
+    if MAP_BACKDROP_MENUS[tostring(menu.id)] then
+        map_pic = UI.map_art()
+    end
+    if map_pic then
+        pics = { map_pic }
+    end
     if #pics == 0 then
         return
     end
@@ -1329,14 +1385,25 @@ local function add_backdrop(menu)
         incoming:animateToState("in", BACKDROP_FADE)
         outgoing:animateToState("out", BACKDROP_FADE)
     end
-    holder:addElement(LUI.UITimer.new(BACKDROP_HOLD, "claude_backdrop_next"))
-    holder:registerEventHandler("claude_backdrop_next", function()
-        pcall(show_next)
-    end)
+    if not map_pic then
+        holder:addElement(LUI.UITimer.new(BACKDROP_HOLD, "claude_backdrop_next"))
+        holder:registerEventHandler("claude_backdrop_next", function()
+            pcall(show_next)
+        end)
+    end
     pcall(function()
         math.randomseed(Engine.GetMilliseconds and Engine.GetMilliseconds() or os.time())
     end)
     pcall(show_next)
+    if map_pic then
+        -- (The map's picture dimmed, as the shell's lobby: the text reads.)
+        holder:addElement(LUI.UIImage.new({
+            topAnchor = true, bottomAnchor = true, leftAnchor = true, rightAnchor = true,
+            top = -20, bottom = 20, left = -20, right = 20,
+            material = UI.material("black") or UI.material("white"),
+            red = 0, green = 0.01, blue = 0.03, alpha = 0.55,
+        }))
+    end
     -- Over the menu's own background art (the main menu's picture), under
     -- its title and rows: just before the title.
     local placed = false
@@ -1388,6 +1455,31 @@ local function sweep_old_look(menu, backdrop)
             local id = tostring(c.id or "")
             if after and not c.claude and c ~= menu.list and not string.find(id, "help")
                 and not string.find(id, "LUITimer") and id ~= "CacMenu_list" then
+                hide(c)
+            end
+            if id == "generic_title" then
+                after = true
+            end
+            c = c:getNextSibling()
+        end
+    end
+    if tostring(menu.id) == "menu_xboxlive_privatelobby_container" then
+        -- Custom lobby: HMW's mode label, map picture and player list go (our
+        -- panels replace them); the rows, hints and title stay.
+        local function holds(el, target)
+            if not target then return false end
+            local found = false
+            pcall(function()
+                walk(el, 0, function(e) if e == target then found = true end end)
+            end)
+            return found
+        end
+        local c = menu:getFirstChild()
+        local after = false
+        while c do
+            local id = tostring(c.id or "")
+            if after and not c.claude and c ~= menu.list and not string.find(id, "help")
+                and not string.find(id, "LUITimer") and not holds(c, menu.list) then
                 hide(c)
             end
             if id == "generic_title" then
@@ -1632,6 +1724,161 @@ local function click_area(parent, st, fn)
     end)
     parent:addElement(area)
     return area
+end
+
+
+-- The Rust shell's custom-game lobby (ghosts.rs): breadcrumb, Q/E tabs, the
+-- map card at the bottom left and the team panels at the right. Coordinates
+-- are on its 1920x1080 screen.
+function UI.lobby_look(menu, key)
+    if menu.claude_lobby then
+        return
+    end
+    menu.claude_lobby = true
+    local function st(x1, y1, x2, y2)
+        return {
+            topAnchor = true, leftAnchor = true, bottomAnchor = false, rightAnchor = false,
+            left = UI.px(x1), top = UI.px(y1), width = UI.px(x2 - x1), height = UI.px(y2 - y1),
+        }
+    end
+    local body = (CoD.TextSettings.BodyFont or CoD.TextSettings.TitleFontTiny).Font
+    local function text(parent, x1, y1, x2, y2, str, color, alpha, align)
+        local t = st(x1, y1, x2, y2)
+        t.font = body
+        t.alignment = align or LUI.Alignment.Left
+        t.color = color
+        t.alpha = alpha or 1
+        local el = LUI.UIText.new(t)
+        el:setText(str)
+        parent:addElement(el)
+        return el
+    end
+    local function box(parent, x1, y1, x2, y2, color, alpha)
+        local t = st(x1, y1, x2, y2)
+        t.material = UI.material("white")
+        t.color = color
+        t.alpha = alpha
+        local el = LUI.UIImage.new(t)
+        parent:addElement(el)
+        return el
+    end
+    local root = LUI.UIElement.new(st(0, 0, 1920, 1080))
+    root.claude = true
+
+    -- Row actions of the lobby's list, to run from the tabs.
+    local function row_action(...)
+        local words = { ... }
+        local found = nil
+        pcall(function()
+            local c0 = menu.list and menu.list:getFirstChild()
+            while c0 and not found do
+                local lbl = nil
+                walk(c0, 0, function(el)
+                    if not lbl and el.id == "text_label" then lbl = el end
+                end)
+                local t = ""
+                pcall(function() t = string.upper(lbl:getText() or "") end)
+                for _, w in ipairs(words) do
+                    if string.find(t, w, 1, true) and c0.properties then
+                        found = c0.properties.button_action_func
+                    end
+                end
+                c0 = c0:getNextSibling()
+            end
+        end)
+        return found
+    end
+
+    -- Breadcrumb above the title.
+    text(root, 100, 14, 900, 40, "MULTIPLAYER  /  CUSTOM GAME", UI.DIM, 0.7)
+
+    -- Tabs: LOBBY | LOADOUTS | SETTINGS.
+    local tabs = { { "LOBBY", nil }, { "LOADOUTS", { "CLASS", "LOADOUT" } }, { "SETTINGS", { "SETTINGS", "SETUP" } } }
+    local x = 100
+    text(root, x, 118, x + 30, 150, "Q", UI.ACCENT_LIFT, 1)
+    x = x + 44
+    for _, tb in ipairs(tabs) do
+        local active = (tb[1] == "LOBBY" and key == "menu_xboxlive_privatelobby_container")
+            or (tb[1] == "SETTINGS" and key == "gamesetup_menu_main_container")
+        local w = 36 + 20 * #tb[1]
+        text(root, x, 118, x + w, 152, tb[1], active and UI.WHITE or UI.DIM, active and 1 or 0.7)
+        if active then
+            box(root, x, 154, x + w - 20, 157, UI.ACCENT, 1)
+        end
+        if tb[2] and not active then
+            local words = tb[2]
+            click_area(root, st(x, 112, x + w, 160), function()
+                local up = table.unpack or unpack
+                local act = row_action(up(words))
+                if act then act(menu, { controller = 0 }) end
+            end)
+        end
+        x = x + w + 24
+    end
+    text(root, x, 118, x + 30, 150, "E", UI.ACCENT_LIFT, 1)
+
+    if key ~= "menu_xboxlive_privatelobby_container" then
+        menu:addElement(root)
+        return
+    end
+
+    -- Map card, bottom left: name tag, picture, bots/ready, mode.
+    local load, mapname, modename = "", "", ""
+    pcall(function() load = Engine.GetDvarString("ui_mapname") or "" end)
+    pcall(function()
+        mapname = Engine.Localize(MapNameToLocalizedMapName(load))
+    end)
+    if mapname == "" or string.sub(mapname, 1, 1) == "@" or mapname == load then
+        mapname = string.upper(string.gsub(string.gsub(load, "^mp_", ""), "_", " "))
+    end
+    pcall(function()
+        local gt = Engine.GetDvarString("ui_gametype") or ""
+        modename = Engine.Localize("MPUI_" .. string.upper(gt) .. "_CAPS")
+        if modename == "" or string.sub(modename, 1, 1) == "@" or string.find(modename, "MPUI_", 1, true) then
+            modename = string.upper(gt)
+        end
+    end)
+    local px1, py1, px2, py2 = 100, 640, 560, 900
+    box(root, px1, py1, px2, py2 + 70, UI.SHADE, 0.55)
+    box(root, px1, py1, px1 + 5, py2 + 70, UI.ACCENT, 1)
+    text(root, px1 + 20, py1 + 8, px2 - 10, py1 + 40, string.upper(mapname), UI.WHITE, 1)
+    local art = UI.map_art()
+    if art then
+        local pic = LUI.UIImage.new(st(px1 + 20, py1 + 48, px2 - 20, py1 + 48 + 220))
+        pic:setImage(art)
+        root:addElement(pic)
+    else
+        box(root, px1 + 20, py1 + 48, px2 - 20, py1 + 48 + 220, UI.PANEL, 0.8)
+    end
+    text(root, px1 + 20, py2 + 30, px2 - 20, py2 + 62, "0 BOTS  \194\183  READY", UI.ACCENT_LIFT, 1)
+    text(root, px1 + 20, py2 + 62, px2 - 20, py2 + 94, string.upper(modename), UI.DIM, 0.85)
+
+    -- Teams, right side.
+    local who = "PLAYER"
+    pcall(function() who = string.upper(Engine.GetUsernameByController(0) or who) end)
+    local function team(y, name, tint, count, you)
+        box(root, 1180, y, 1184, y + 40, tint, 1)
+        text(root, 1200, y + 2, 1800, y + 38, name .. "  \194\183  " .. count, UI.WHITE, 1)
+        local ry = y + 52
+        local rows = you and 1 or 0
+        if you then
+            box(root, 1180, ry, 1820, ry + 52, UI.SHADE, 0.6)
+            box(root, 1180, ry, 1184, ry + 52, UI.ACCENT, 1)
+            text(root, 1204, ry + 8, 1600, ry + 44, who, UI.WHITE, 1)
+            text(root, 1620, ry + 8, 1808, ry + 44, "LEADER", UI.GOLD, 1, LUI.Alignment.Right)
+            ry = ry + 60
+        end
+        for _ = 1, 3 do
+            box(root, 1180, ry, 1820, ry + 44, UI.SHADE, 0.35)
+            text(root, 1204, ry + 6, 1600, ry + 40, "OPEN SLOT", UI.DIM, 0.55)
+            ry = ry + 52
+        end
+        return ry
+    end
+    local ny = team(250, "BLACK OPS", UI.ACCENT, "WAITING 1/9", true)
+    team(ny + 30, "SPETSNAZ", UI.ENEMY, "0/9", false)
+
+    menu:addElement(root)
 end
 
 -- Our custom cards and emblems in a picker of their own (as our shell's

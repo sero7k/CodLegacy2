@@ -1172,6 +1172,99 @@ local function player_info()
     return p
 end
 
+-- Our custom calling cards and emblems (codlegacy/cards, codlegacy/emblems
+-- beside the game): flipbooks, frames stacked top to bottom, played at 12 a
+-- second as in our shell. Chosen with clc_card / clc_emblem (saved); a click
+-- on the banner or the emblem goes to the next one ("" is the game's own).
+local CUSTOM_CARDS = {
+    { "card_above_the_clouds", 19 }, { "card_freedom", 36 }, { "card_awakened_eye", 51 },
+    { "card_the_founder", 60 }, { "card_dread", 60 }, { "card_the_rumbling", 60 },
+    { "card_third_impact", 25 }, { "card_frieren_himmel", 36 }, { "card_himmel", 36 },
+    { "card_stark", 36 }, { "card_campfire", 1 }, { "card_quiet_forest", 24 },
+    { "card_frieren", 28 }, { "card_kittens_look_up", 1 }, { "card_sleepy_paws", 1 },
+    { "card_snuggle", 1 }, { "card_mural", 1 },
+}
+local CUSTOM_EMBLEMS = { { "emblem_legacy", 1 }, { "emblem_berserk", 18 } }
+local FLIP_MS = 83
+
+local function custom_entry(list, name)
+    for i, e in ipairs(list) do
+        if e[1] == name then
+            return e, i
+        end
+    end
+    return nil, 0
+end
+
+local function next_custom(dvar, list)
+    local cur = ""
+    pcall(function()
+        cur = Engine.GetDvarString(dvar) or ""
+    end)
+    local _, i = custom_entry(list, cur)
+    local nxt = list[i + 1] and list[i + 1][1] or ""
+    pcall(function()
+        Engine.SetDvarFromString(dvar, nxt)
+    end)
+    log(dvar .. " = '" .. nxt .. "'")
+end
+
+local function custom_frame(kind, entry, frame)
+    local fh = kind == "cards" and 128 or 256
+    local ok, m = pcall(function()
+        return game:clcimage("codlegacy/" .. kind .. "/" .. entry[1] .. ".png", frame % entry[2], fh)
+    end)
+    return ok and m or nil
+end
+
+-- An image element showing the custom chosen in `dvar` (or `fallback`).
+local function custom_image(el, kind, list, dvar, fallback)
+    local frame, shown = 0, nil
+    local function update()
+        local name = ""
+        pcall(function()
+            name = Engine.GetDvarString(dvar) or ""
+        end)
+        local entry = custom_entry(list, name)
+        if entry then
+            local m = custom_frame(kind, entry, frame)
+            if m then
+                el:setImage(m)
+                el:setAlpha(1)
+                shown = name
+                frame = frame + 1
+                return
+            end
+        end
+        local fb = fallback()
+        if shown ~= "" or fb then
+            if fb then
+                el:setImage(fb)
+                el:setAlpha(1)
+            else
+                el:setAlpha(0)
+            end
+            shown = ""
+        end
+    end
+    el:addElement(LUI.UITimer.new(FLIP_MS, "claude_flip_" .. kind))
+    el:registerEventHandler("claude_flip_" .. kind, function()
+        pcall(update)
+    end)
+    pcall(update)
+end
+
+-- A click area (the banner, the emblem) that runs `fn`.
+local function click_area(parent, st, fn)
+    local area = LUI.UIElement.new(st)
+    area:setHandleMouseButton(true)
+    area:registerEventHandler("leftmouseup", function()
+        pcall(fn)
+    end)
+    parent:addElement(area)
+    return area
+end
+
 local function build_banner(menu)
     local ox, oy = menu:getCurrentGlobalRect()
     ox, oy = ox or 0, oy or 0
@@ -1225,9 +1318,10 @@ local function build_banner(menu)
 
     -- The banner: his calling card, a white rule along its top.
     image(root, 1130, 104, 1708, 206, UI.material("white"), UI.PANEL, 0.9)
-    if p.card then
-        image(root, 1130, 104, 1708, 206, p.card, UI.WHITE, 1)
-    end
+    local card_img = image(root, 1130, 104, 1708, 206, p.card or UI.material("white"), UI.WHITE, p.card and 1 or 0)
+    pcall(custom_image, card_img, "cards", CUSTOM_CARDS, "clc_card", function()
+        return player_info().card
+    end)
     image(root, 1130, 103, 1708, 105, UI.material("white"), UI.WHITE, 0.9)
     t.name = text(root, 1300, 118, 34, string.upper(p.name), bold, UI.WHITE, 1, LUI.Alignment.Right, 260)
     t.level_big = text(root, 1570, 118, 34, p.level, bold, UI.WHITE, 1, LUI.Alignment.Left, 80)
@@ -1238,7 +1332,18 @@ local function build_banner(menu)
     t.bar = image(root, 1139, 193, 1139 + math.max(1, math.floor(561 * p.frac)), 196, UI.material("white"), UI.WHITE, 1)
     -- His emblem beside it.
     image(root, 1717, 104, 1818, 206, UI.material("white"), UI.PANEL, 0.9)
-    image(root, 1717, 104, 1818, 206, p.emblem or p.rank_icon, UI.WHITE, (p.emblem or p.rank_icon) and 1 or 0)
+    local emblem_img = image(root, 1717, 104, 1818, 206, p.emblem or p.rank_icon or UI.material("white"), UI.WHITE, (p.emblem or p.rank_icon) and 1 or 0)
+    pcall(custom_image, emblem_img, "emblems", CUSTOM_EMBLEMS, "clc_emblem", function()
+        local q = player_info()
+        return q.emblem or q.rank_icon
+    end)
+    -- Clicks: the banner changes the card, the emblem the emblem.
+    pcall(click_area, root, box(1130, 104, 1708, 206), function()
+        next_custom("clc_card", CUSTOM_CARDS)
+    end)
+    pcall(click_area, root, box(1717, 104, 1818, 206), function()
+        next_custom("clc_emblem", CUSTOM_EMBLEMS)
+    end)
 
     -- His line in the party.
     text(root, 1176, 236, 20, ">", body, UI.WHITE, 1)

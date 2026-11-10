@@ -409,23 +409,49 @@ namespace ui_scripting
 
 			// game:clcimage("codlegacy/backgrounds/bg01.jpg"): a picture beside the
 			// game as a material for LUI (nil when the file is missing or bad).
-			game_type["clcimage"] = [](const game&, const std::string& path) -> script_value
+			game_type["clcimage"] = [](const game&, const std::string& path, const variadic_args& va) -> script_value
 			{
+				// (Optional: a frame of a flipbook picture, frames stacked top to bottom.)
+				auto frame = -1;
+				auto frame_height = 0;
+				if (va.size() >= 2)
+				{
+					frame = va[0].as<int>();
+					frame_height = va[1].as<int>();
+				}
+				const auto key = frame < 0 ? path : path + "#" + std::to_string(frame) + "@" + std::to_string(frame_height);
+
 				static std::unordered_map<std::string, ::game::Material*> loaded;
-				const auto found = loaded.find(path);
+				const auto found = loaded.find(key);
 				if (found != loaded.end())
 				{
 					return found->second ? script_value(lightuserdata(found->second)) : script_value();
 				}
 
-				std::string data;
-				::game::Material* material = nullptr;
-				if (path.find("..") == std::string::npos && utils::io::read_file(path, &data) && !data.empty())
+				static std::unordered_map<std::string, std::string> files;
+				std::string* data = nullptr;
+				if (path.find("..") == std::string::npos)
 				{
-					material = materials::create_material("clc_img_" + path);
+					auto f = files.find(path);
+					if (f == files.end())
+					{
+						std::string bytes;
+						utils::io::read_file(path, &bytes);
+						f = files.emplace(path, std::move(bytes)).first;
+					}
+					data = &f->second;
+				}
+
+				::game::Material* material = nullptr;
+				if (data && !data->empty())
+				{
+					material = materials::create_material("clc_img_" + key);
 					try
 					{
-						if (!materials::setup_material_image(material, data))
+						const auto ok = frame < 0
+							? materials::setup_material_image(material, *data)
+							: materials::setup_material_image_frame(material, *data, frame, frame_height);
+						if (!ok)
 						{
 							materials::free_material(material);
 							material = nullptr;
@@ -437,8 +463,11 @@ namespace ui_scripting
 						material = nullptr;
 					}
 				}
-				loaded[path] = material;
-				claude_log(std::string("[clcimage] ") + path + (material ? " loaded" : " missing"));
+				loaded[key] = material;
+				if (frame <= 0)
+				{
+					claude_log(std::string("[clcimage] ") + key + (material ? " loaded" : " missing"));
+				}
 				return material ? script_value(lightuserdata(material)) : script_value();
 			};
 

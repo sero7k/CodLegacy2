@@ -722,6 +722,9 @@ namespace stats
 				// `unlockall`: every item/class/loot unlocked, and the level set to
 				// the maximum (the menus' script does the level, on seeing the flag).
 				dvars::register_int("clc_unlockall_run", 0, 0, 1, 0, "Set by the unlockall command");
+				// The player banner's custom calling card / emblem ("" = the game's own).
+				dvars::register_string("clc_card", "", game::DVAR_FLAG_SAVED, "Custom calling card on the player banner");
+				dvars::register_string("clc_emblem", "", game::DVAR_FLAG_SAVED, "Custom emblem on the player banner");
 				command::add("unlockall", [](const command::params&)
 				{
 					command::execute("set cg_unlockall_items 1", false);

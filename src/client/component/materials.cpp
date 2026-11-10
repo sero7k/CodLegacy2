@@ -219,6 +219,41 @@ namespace materials
 		return true;
 	}
 
+	bool setup_material_image_frame(game::Material* material, const std::string& data, int frame, int frame_height)
+	{
+		if (*game::d3d11_device == nullptr)
+		{
+			return false;
+		}
+
+		auto raw_image = utils::image{data};
+		const auto w = raw_image.get_width();
+		const auto h = raw_image.get_height();
+		if (frame_height <= 0 || frame_height > h)
+		{
+			frame_height = h;
+		}
+		const auto frames = h / frame_height;
+		if (frames <= 0)
+		{
+			return false;
+		}
+		frame = ((frame % frames) + frames) % frames;
+
+		const auto image = material->textureTable->u.image;
+		*(int*)&image->mapType = 0x1000003;
+		*(int*)&image->picmip = -1;
+
+		D3D11_SUBRESOURCE_DATA resource_data{};
+		resource_data.SysMemPitch = w * 4;
+		resource_data.SysMemSlicePitch = resource_data.SysMemPitch * frame_height;
+		resource_data.pSysMem = static_cast<const char*>(raw_image.get_buffer()) + static_cast<size_t>(resource_data.SysMemPitch) * frame_height * frame;
+
+		game::Image_Setup(image, w, frame_height, image->depth, image->numElements,
+			image->mapType, DXGI_FORMAT_R8G8B8A8_UNORM, image->name, &resource_data);
+		return true;
+	}
+
 	game::Material* create_material(const std::string& name)
 	{
 		const auto white = game::Material_RegisterHandle("$white");

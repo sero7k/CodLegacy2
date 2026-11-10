@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="42%" r="70%">
+      <stop offset="0" stop-color="#2a2f36"/>
+      <stop offset="1" stop-color="#0b0d10"/>
+    </radialGradient>
+    <linearGradient id="steel" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#d9dde2"/>
+      <stop offset="0.48" stop-color="#8d949c"/>
+      <stop offset="0.52" stop-color="#6c737b"/>
+      <stop offset="1" stop-color="#b7bdc4"/>
+    </linearGradient>
+    <linearGradient id="ember" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffb347"/>
+      <stop offset="1" stop-color="#e2580f"/>
+    </linearGradient>
+  </defs>
+  <rect width="1024" height="1024" rx="96" fill="url(#bg)"/>
+  <!-- the shield -->
+  <path d="M512 92 L840 196 L840 470 C840 676 700 820 512 912 C324 820 184 676 184 470 L184 196 Z" fill="#14171b" stroke="url(#steel)" stroke-width="30" stroke-linejoin="round"/>
+  <path d="M512 150 L786 237 L786 470 C786 645 670 768 512 850 C354 768 238 645 238 470 L238 237 Z" fill="none" stroke="#e2580f" stroke-opacity="0.55" stroke-width="6"/>
+  <!-- the L, cut by a chevron -->
+  <path d="M392 262 L492 262 L492 600 L656 600 L656 700 L392 700 Z" fill="url(#steel)"/>
+  <path d="M392 640 L512 560 L632 640 L632 700 L512 620 L392 700 Z" fill="url(#ember)"/>
+  <!-- three rank stars -->
+  <g fill="url(#ember)">
+    <path transform="translate(600 300) scale(0.9)" d="M0 -40 L11 -12 L40 -12 L17 6 L25 34 L0 17 L-25 34 L-17 6 L-40 -12 L-11 -12 Z"/>
+    <path transform="translate(600 410) scale(0.7)" d="M0 -40 L11 -12 L40 -12 L17 6 L25 34 L0 17 L-25 34 L-17 6 L-40 -12 L-11 -12 Z"/>
+    <path transform="translate(600 500) scale(0.5)" d="M0 -40 L11 -12 L40 -12 L17 6 L25 34 L0 17 L-25 34 L-17 6 L-40 -12 L-11 -12 Z"/>
+  </g>
+</svg>

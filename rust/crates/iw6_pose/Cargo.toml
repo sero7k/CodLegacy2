@@ -1,0 +1,11 @@
+[package]
+name = "iw6_pose"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Ghosts (IW6) skeletons and sampled animation clips: the bone poses of script models (no dependencies)."
+
+[dependencies]
+
+[lints]
+workspace = true

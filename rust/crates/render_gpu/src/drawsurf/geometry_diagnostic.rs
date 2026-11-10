@@ -1,0 +1,4526 @@
+use crate::drawsurf::scene_depth::{SCENE_DEPTH_FORMAT, SceneDepthTexture};
+use super::motion::{self, MOTION_FORMAT, MOTION_PARAMS_BYTES, ViewMotion};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
+
+use bevy::core_pipeline::core_3d::main_opaque_pass_3d;
+use bevy::core_pipeline::{Core3d, Core3dSystems};
+use bevy::mesh::VertexBufferLayout;
+use bevy::prelude::*;
+use bevy::render::RenderStartup;
+use bevy::render::render_resource::binding_types::{
+    sampler, texture_2d, texture_2d_array, texture_cube, texture_cube_array, texture_depth_2d,
+    uniform_buffer, uniform_buffer_sized,
+};
+use bevy::render::render_resource::{
+    AddressMode, BindGroup, BindGroupEntries, BindGroupLayoutDescriptor, BindGroupLayoutEntries,
+    BlendComponent, BlendFactor, BlendOperation, BlendState, Buffer, BufferInitDescriptor, BufferUsages, CachedRenderPipelineId, ColorTargetState,
+    ColorWrites, CompareFunction, DepthBiasState, DepthStencilState, Face, FilterMode,
+    BufferDescriptor, FragmentState, FrontFace,
+    IndexFormat, MipmapFilterMode, MultisampleState, PipelineCache, PrimitiveState,
+    RenderPipelineDescriptor, Sampler, SamplerBindingType, SamplerDescriptor, ShaderStages,
+    SpecializedRenderPipeline, SpecializedRenderPipelines, StoreOp, TextureFormat,
+    TextureSampleType, TextureViewDimension, VertexAttribute, VertexFormat, VertexState,
+    VertexStepMode,
+};
+use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue, ViewQuery};
+use bevy::render::view::{
+    ExtractedView, Msaa, ViewTarget, ViewUniform, ViewUniformOffset, ViewUniforms,
+};
+use bevy::render::{Render, RenderSystems};
+use bevy::shader::{Shader, ShaderDefVal};
+
+use super::gpu_resources::RuntimeUploadedImageRegistry;
+use super::depth_range::{
+    GFX_DEPTH_RANGE_VIEWMODEL, depth_range_type_for_draw, reverse_z_viewport_depth,
+};
+use crate::diag::render_frame_diag::{SharedRenderStages, SharedRenderStagesSlot};
+use render_frame::{
+    FrameProductKind, RetainedDrawItem, RetainedDrawKind, SmodelVertex, WorldVertex,
+};
+use render_material::MaterialGenerationId;
+
+const SHADER_PATH: &str = "embedded://render_gpu/drawsurf/geometry_diagnostic.wgsl";
+
+mod skin;
+mod sun_shadow;
+
+fn geometry_diagnostic_covers(kind: &RetainedDrawKind, key: u64) -> bool {
+    !matches!(
+        kind,
+        RetainedDrawKind::CodeMesh { .. }
+            | RetainedDrawKind::ParticleCloud { .. }
+            | RetainedDrawKind::MarkMesh { .. }
+            | RetainedDrawKind::Glass { .. }
+    ) && depth_range_type_for_draw(kind, key) != GFX_DEPTH_RANGE_VIEWMODEL
+}
+
+struct DiagnosticStamp {
+    started: Instant,
+    slot: Option<Arc<Mutex<SharedRenderStages>>>,
+    pass: u32,
+    draw_n: u32,
+    world_n: u32,
+    smodel_n: u32,
+    xmodel_n: u32,
+}
+
+impl Drop for DiagnosticStamp {
+    fn drop(&mut self) {
+        let Some(slot) = &self.slot else {
+            return;
+        };
+        let Ok(mut guard) = slot.lock() else {
+            return;
+        };
+        guard.diag_ms = Some(self.started.elapsed().as_secs_f32() * 1000.0);
+        guard.diag_pass = Some(self.pass);
+        guard.diag_draw_n = Some(self.draw_n);
+        guard.diag_world_n = Some(self.world_n);
+        guard.diag_smodel_n = Some(self.smodel_n);
+        guard.diag_xmodel_n = Some(self.xmodel_n);
+    }
+}
+
+static NO_DIAGNOSTIC: OnceLock<bool> = OnceLock::new();
+
+pub fn geometry_diagnostic_enabled() -> bool {
+    !*NO_DIAGNOSTIC.get_or_init(|| codlegacy_env::var_os("CODLEGACY_NO_DIAGNOSTIC").is_some())
+}
+
+#[derive(Default)]
+struct DiagnosticDrawScratch {
+    submitted: HashSet<u64>,
+    exec_ready: HashSet<u64>,
+    draws: Vec<(RetainedDrawItem, bool)>,
+    smodel_instances: Vec<DiagnosticSmodelInstance>,
+}
+
+fn diagnostic_would_draw(item: &RetainedDrawItem, ready: bool, submitted: &HashSet<u64>) -> bool {
+    if ready && matches!(item.kind, RetainedDrawKind::World { .. }) {
+        return false;
+    }
+    // bo2mp: MWR's own renderer drew the world and its static models.
+    if super::native_world()
+        && matches!(item.kind, RetainedDrawKind::World { .. } | RetainedDrawKind::Smodel { .. })
+    {
+        return false;
+    }
+    if submitted.contains(&item.key) {
+        return false;
+    }
+    geometry_diagnostic_covers(&item.kind, item.key)
+}
+
+/// bo2zm: frame pacing and prop counts over a window, logged every 5 s.
+#[derive(Default)]
+struct DiagnosticPerf {
+    window_start: Option<Instant>,
+    last_frame: Option<Instant>,
+    frames: u32,
+    worst_ms: f32,
+    props_drawn: u64,
+    /// bo2mp: the draws the opaque ones took.
+    prop_batches: u64,
+    props_culled: u64,
+    props_unseen: u64,
+    /// bo2mp: world surfaces drawn, and the draw calls they took.
+    world_surfaces: u64,
+    world_calls: u64,
+    last_census_at: Option<Instant>,
+}
+
+#[derive(Resource, Clone, Debug, Default)]
+pub struct ExtractedDiagnosticGeometry {
+    pub generation: MaterialGenerationId,
+    pub overlay_gpu_wait: bool,
+    pub world_vertices: Arc<Vec<WorldVertex>>,
+    pub world_indices: Arc<Vec<u32>>,
+    pub world_surface_ranges: Arc<Vec<(u32, u32)>>,
+    pub smodel_vertices: Arc<Vec<SmodelVertex>>,
+    pub smodel_indices: Arc<Vec<u32>>,
+    pub smodel_surface_ranges: Arc<Vec<(u32, u32)>>,
+    pub xmodel_vertices: Arc<Vec<SmodelVertex>>,
+    pub xmodel_indices: Arc<Vec<u32>>,
+    pub xmodel_surface_ranges: Arc<Vec<(u32, u32)>>,
+    pub xmodel_revision: u64,
+    pub g0_world_surfs: Vec<u16>,
+    /// bo2zm: per world surface, its colour map's uploaded image slot
+    /// (`u32::MAX` = none); the fallback draw samples it when present.
+    pub world_surface_color: Arc<Vec<u32>>,
+    /// bo2zm: per world surface, its Black Ops II draw code
+    /// (`asset_core::T6Draw::code`; `u32::MAX` = none).
+    pub world_surface_draw: Arc<Vec<u32>>,
+    /// bo2zm: per world surface, its lightmap page (`u8::MAX` = none).
+    pub world_surface_lightmap: Arc<Vec<u8>>,
+    /// bo2zm: the T6 sun direction and exposure scale, the sun colour, the
+    /// sky's rotation and brightness, the sky's parms, the vision grade, then
+    /// the colour tables drawn (first rows of A and B, A's weight, on).
+    pub t6_lighting: Option<[[f32; 4]; 19]>,
+    /// bo2mp: whether `t6_lighting` is the map's own (a Black Ops II,
+    /// Black Ops or CoD4 world): BO2's bloom and final colour. Under BO2's
+    /// rules a MW2/MW3 world gets `t6_lighting` for the moving things only.
+    pub t6_bloom: bool,
+    /// bo2mp: the map's `sm_sunSampleSizeNear`; 0 = not set.
+    pub t6_sun_sample_size_near: f32,
+    /// bo2zm: Black Ops II props: `[surface, colour slot, draw code,
+    /// instance]` per first-LOD surface of each placement.
+    pub t6_props: Arc<Vec<[u32; 4]>>,
+    /// bo2zm: per prop draw, its normal and specular map slots (shine).
+    pub t6_prop_shine: Arc<Vec<[u32; 3]>>,
+    /// bo2zm: per prop instance, world-from-local columns, light, then
+    /// primary light and its visibility.
+    pub t6_prop_instances: Arc<Vec<[f32; 24]>>,
+    /// bo2zm: what the props were built from (generation, placements, exposure bits).
+    pub t6_props_key: Option<(MaterialGenerationId, usize, u32)>,
+    /// bo2zm: the uploaded slot of the Black Ops II sky's cube map.
+    pub t6_sky_slot: Option<u32>,
+    /// bo2zm: per world surface, its primary light index.
+    pub world_surface_primary: Arc<Vec<u8>>,
+    /// bo2zm: the map's primary lights (four vec4 each).
+    pub t6_lights: Arc<Vec<[f32; 16]>>,
+    /// bo2zm: per world surface, its layer 1 and 2 colour map slots.
+    pub world_surface_layers: Arc<Vec<[u32; 2]>>,
+    /// bo2zm: per world vertex, layer 1 and 2 texcoords (or empty).
+    pub world_layer_uvs: Arc<Vec<[f32; 4]>>,
+    /// bo2zm: per world surface, its normal and specular map slots
+    /// (`u32::MAX` = none) and its reflection probe (the shine).
+    pub world_surface_shine: Arc<Vec<[u32; 3]>>,
+    /// bo2zm: the reflection probes' cube array slot, and per probe its
+    /// `lightingSH`.
+    pub t6_probe_slot: Option<u32>,
+    pub t6_probes: Arc<Vec<[[f32; 4]; 3]>>,
+    /// bo2zm: the world's colour tables (`GfxWorld::lutMaterial`; a Zombies
+    /// map's: a multiplayer map's are in bo2_bloom's final pass).
+    pub t6_lut: Option<Arc<asset_world::T6Lut>>,
+}
+
+/// bo2zm: one Black Ops II thing that moves, drawn by the fallback pass
+/// with the props' pipelines: vertices in its own space, indices, per draw
+/// `[first index, index count, colour slot, draw code, instance]`, and the
+/// instance rows (world-from-local columns, light, primary light,
+/// visibility).
+#[derive(Clone, Debug, Default)]
+pub struct T6DynamicDraw {
+    pub vertices: Vec<SmodelVertex>,
+    pub indices: Vec<u32>,
+    /// (first index, count, colour slot, draw code, instance, normal map
+    /// slot, specular map slot, emissive map slot)
+    pub draws: Vec<[u32; 8]>,
+    pub instances: Vec<[f32; 24]>,
+    /// The vertices and indices written on the render thread instead (the
+    /// live players' ~250k vertices a frame: copied there, not while the
+    /// game waits on extract).
+    pub deferred: Option<T6DeferredFill>,
+    /// bo2mp: and vertices skinned on the graphics card, after the others.
+    pub skinned: Option<T6Skinned>,
+}
+
+/// bo2mp: the moving models skinned on the graphics card, written after
+/// the vertices `vertices` or `deferred` adds (the indices already count
+/// them there): their shapes (sent once and kept on the card), each model
+/// part's bone matrices, and which shape vertices each surface skins.
+#[derive(Clone, Debug, Default)]
+pub struct T6Skinned {
+    pub shapes: Vec<T6SkinShape>,
+    /// Skin matrices (column-major), each part's bones in a row.
+    pub bones: Vec<[f32; 16]>,
+    /// Per drawn surface: (shape, its first vertex in the shape, how many,
+    /// the part's first bone, the part's bone count).
+    pub runs: Vec<[u32; 5]>,
+    /// The vertices the runs add, all told.
+    pub vertices: usize,
+}
+
+/// One shape the card skins from: kept there by what `source` points at
+/// (which it holds on to), filled once with its bind-pose vertices and,
+/// per vertex, its four bones and then its four weights' bits.
+#[derive(Clone)]
+pub struct T6SkinShape {
+    pub source: Arc<dyn std::any::Any + Send + Sync>,
+    pub vertices: usize,
+    pub fill: Arc<dyn Fn(&mut Vec<SmodelVertex>, &mut Vec<[u32; 8]>) + Send + Sync>,
+}
+
+impl std::fmt::Debug for T6SkinShape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "T6SkinShape({} vertices)", self.vertices)
+    }
+}
+
+/// Fills a draw's vertex and index lists (emptied first) from shared,
+/// unchanging data; `vertices` and `indices` are how many it adds.
+#[derive(Clone)]
+pub struct T6DeferredFill {
+    pub vertices: usize,
+    pub indices: usize,
+    /// bo2mp: what the indices are made from (0: not known). The same as
+    /// last frame's and they are not made or sent again: the list's index
+    /// buffer still has them (the live players' ~300k a frame cost ~1 ms).
+    pub indices_key: u64,
+    /// The vertices, and the indices when there is somewhere to put them.
+    pub fill: T6Fill,
+}
+
+pub type T6Fill = Arc<dyn Fn(&mut Vec<SmodelVertex>, Option<&mut Vec<u32>>) + Send + Sync>;
+
+impl std::fmt::Debug for T6DeferredFill {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "T6DeferredFill({} vertices, {} indices)", self.vertices, self.indices)
+    }
+}
+
+/// bo2zm M3: the models that hold their shape (mannequins, perk machines,
+/// the box, wall guns; grenades in flight; bo2mp: guns on the ground,
+/// corpses at rest): their shapes uploaded once, in the chunks they came
+/// in (indices count from the first chunk's first vertex), placed by this
+/// frame's instance rows. Re-sending ~150 models' vertices every frame cost
+/// ~12 ms. A new `epoch` starts the upload over.
+#[derive(Clone, Debug, Default)]
+pub struct T6StaticDraw {
+    pub epoch: u64,
+    pub chunks: Vec<Arc<(Vec<SmodelVertex>, Vec<u32>)>>,
+    pub draws: Vec<[u32; 8]>,
+    pub instances: Vec<[f32; 24]>,
+}
+
+/// bo2zm: Black Ops II things that move, extracted every frame: the
+/// first-person gun and arms. `materials` lists every T6 material's colour
+/// slot and draw code, so pipelines and texture bind groups exist for
+/// whatever a gun or effect draws with.
+#[derive(Resource, Clone, Debug, Default)]
+pub struct ExtractedT6Dynamic {
+    pub generation: MaterialGenerationId,
+    pub materials: Arc<Vec<(u32, u32)>>,
+    pub viewmodel: Option<T6DynamicDraw>,
+    /// Bullet holes and other decal marks, in world space.
+    pub marks: Option<T6DynamicDraw>,
+    /// Projectiles in flight (grenades, rockets), each in its own space.
+    pub missiles: Option<T6DynamicDraw>,
+    /// bo2zm M3: the script models that hold still.
+    pub script_static: Option<T6StaticDraw>,
+    /// Lights effects throw (origin, radius; colour), nearest first.
+    pub dlights: Vec<[f32; 8]>,
+    /// Effect sprites, in world space.
+    pub effects: Option<T6DynamicDraw>,
+    /// Effect sprites drawn with the first-person gun (muzzle flashes).
+    pub viewmodel_effects: Option<T6DynamicDraw>,
+}
+
+/// bo2zm: one uploaded `T6DynamicDraw`: vertex, index and instance
+/// buffers, then the draws.
+type DynamicBuffers = (Buffer, Buffer, Buffer, Vec<[u32; 8]>);
+
+/// The held shapes on the GPU: which gathering, how many chunks of it are
+/// written, and how far into each buffer (bytes); the buffers have room to
+/// grow, so a new chunk is written after the others.
+struct StaticGeometry {
+    epoch: u64,
+    chunks: usize,
+    vertex_bytes: u64,
+    index_bytes: u64,
+    vb: Buffer,
+    ib: Buffer,
+}
+
+/// One per-frame list's buffers (vertex, index, instance), kept from frame
+/// to frame and grown when a frame needs more: new buffers for ~13 MB of
+/// players every frame cost more than writing into the old ones.
+/// bo2mp: and what the index buffer was last made from (its key and
+/// count), holding that fill so the models it names stay where they are.
+#[derive(Default)]
+struct KeptBuffers(
+    [Option<Buffer>; 3],
+    Vec<SmodelVertex>,
+    Vec<u32>,
+    Option<(u64, usize, T6Fill)>,
+);
+
+impl KeptBuffers {
+    /// `bytes` written into buffer `at`, made bigger first when they do not
+    /// fit.
+    fn write(
+        &mut self,
+        device: &RenderDevice,
+        queue: &RenderQueue,
+        label: &str,
+        at: usize,
+        usage: BufferUsages,
+        bytes: &[u8],
+    ) -> Buffer {
+        self.write_in(device, queue, label, at, usage, bytes.len() as u64, bytes)
+    }
+
+    /// The same, in a buffer with room for `need` bytes (bo2mp: the
+    /// card-skinned vertices go after `bytes`).
+    #[allow(clippy::too_many_arguments)]
+    fn write_in(
+        &mut self,
+        device: &RenderDevice,
+        queue: &RenderQueue,
+        label: &str,
+        at: usize,
+        usage: BufferUsages,
+        need: u64,
+        bytes: &[u8],
+    ) -> Buffer {
+        let need = need.max(bytes.len() as u64);
+        if self.0[at]
+            .as_ref()
+            .is_none_or(|b| b.size() < need || !b.usage().contains(usage))
+        {
+            self.0[at] = Some(device.create_buffer(&bevy::render::render_resource::BufferDescriptor {
+                label: Some(label),
+                size: (need + need / 2).max(64 << 10).next_multiple_of(4),
+                usage: usage | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+        let buffer = self.0[at].clone().expect("made above");
+        if !bytes.is_empty() {
+            queue.write_buffer(&buffer, 0, bytes);
+        }
+        buffer
+    }
+}
+
+/// bo2zm: the GPU side of `ExtractedT6Dynamic`.
+#[derive(Resource, Default)]
+struct DiagnosticDynamic {
+    /// marks, viewmodel, missiles, effects, viewmodel effects, held
+    /// shapes' instances.
+    kept: [KeptBuffers; 6],
+    marks: Option<DynamicBuffers>,
+    missiles: Option<DynamicBuffers>,
+    script_static: Option<DynamicBuffers>,
+    /// The held shapes as uploaded so far.
+    script_static_geometry: Option<StaticGeometry>,
+    viewmodel: Option<DynamicBuffers>,
+    effects: Option<DynamicBuffers>,
+    viewmodel_effects: Option<DynamicBuffers>,
+}
+
+fn upload_dynamic_draw(
+    device: &RenderDevice,
+    queue: &RenderQueue,
+    kept: &mut KeptBuffers,
+    label: &str,
+    draw: Option<&T6DynamicDraw>,
+    card_skin: Option<(
+        &skin::SkinPipeline,
+        &mut skin::SkinCache,
+        &mut bevy::render::renderer::PendingCommandBuffers,
+    )>,
+) -> Option<DynamicBuffers> {
+    let draw = draw?;
+    // A deferred list is filled here into this list's own kept room.
+    let mut vertices = std::mem::take(&mut kept.1);
+    let mut indices = std::mem::take(&mut kept.2);
+    // bo2mp: indices made from the same as last frame's are still there.
+    let same_indices = draw.deferred.as_ref().and_then(|d| {
+        let &(key, n, _) = kept.3.as_ref()?;
+        (d.indices_key != 0 && key == d.indices_key && n == d.indices && n > 0)
+            .then(|| kept.0[1].clone())
+            .flatten()
+    });
+    kept.3 = None;
+    let (v, i) = match &draw.deferred {
+        Some(deferred) => {
+            vertices.clear();
+            indices.clear();
+            vertices.reserve(deferred.vertices);
+            let _span = bevy::log::info_span!(target: "codlegacy", "t6 fill", name = label).entered();
+            if same_indices.is_some() {
+                (deferred.fill)(&mut vertices, None);
+            } else {
+                indices.reserve(deferred.indices);
+                (deferred.fill)(&mut vertices, Some(&mut indices));
+            }
+            (vertices.as_slice(), indices.as_slice())
+        }
+        None => (draw.vertices.as_slice(), draw.indices.as_slice()),
+    };
+    let index_n = match (&same_indices, &draw.deferred) {
+        (Some(_), Some(d)) => d.indices,
+        _ => i.len(),
+    };
+    // bo2mp: the card-skinned vertices go after these, written there.
+    let skinned = draw.skinned.as_ref().filter(|s| s.vertices > 0);
+    let skinned_n = skinned.map_or(0, |s| s.vertices);
+    let buffers = ((!v.is_empty() || skinned_n > 0)
+        && index_n > 0
+        && !draw.draws.is_empty()
+        && !draw.instances.is_empty())
+    .then(|| {
+        let _span = bevy::log::info_span!(target: "codlegacy", "t6 write", name = label).entered();
+        let usage = match skinned {
+            Some(_) => BufferUsages::VERTEX | BufferUsages::STORAGE,
+            None => BufferUsages::VERTEX,
+        };
+        let need = ((v.len() + skinned_n) * std::mem::size_of::<SmodelVertex>()) as u64;
+        let vb = kept.write_in(device, queue, label, 0, usage, need, bytemuck::cast_slice(v));
+        let ib = match &same_indices {
+            Some(ib) => ib.clone(),
+            None => kept.write(device, queue, label, 1, BufferUsages::INDEX, bytemuck::cast_slice(i)),
+        };
+        (vb, ib)
+    });
+    let written = v.len() as u32;
+    if buffers.is_some()
+        && let Some(d) = draw.deferred.as_ref().filter(|d| d.indices_key != 0)
+    {
+        kept.3 = Some((d.indices_key, index_n, Arc::clone(&d.fill)));
+    }
+    let index_n = index_n as u64;
+    kept.1 = vertices;
+    kept.2 = indices;
+    let (vb, ib) = buffers?;
+    if let Some(skinned) = skinned
+        && !card_skin.is_some_and(|(pipeline, cache, pending)| {
+            skin::skin_into(device, queue, pending, pipeline, cache, skinned, &vb, written)
+        })
+    {
+        // Their vertices are not there: nothing in this list is drawn.
+        static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+            diag::warn!(
+                World,
+                "{label}: {} card-skinned vertices ({} shapes, {} runs) could not be skinned; list left out",
+                skinned.vertices,
+                skinned.shapes.len(),
+                skinned.runs.len(),
+            );
+        }
+        return None;
+    }
+    let inst = kept.write(
+        device,
+        queue,
+        label,
+        2,
+        BufferUsages::VERTEX,
+        bytemuck::cast_slice(draw.instances.as_slice()),
+    );
+    Some((vb, ib, inst, draws_within(label, &draw.draws, index_n)))
+}
+
+/// A list's draws that stay inside its `indices`: one that reaches past
+/// them fails the graphics checks, and bevy then closes the game (a fast
+/// quality test match, 224 s in). The first few say which list and where.
+fn draws_within(label: &str, draws: &[[u32; 8]], indices: u64) -> Vec<[u32; 8]> {
+    let over = |d: &[u32; 8]| u64::from(d[0]) + u64::from(d[1]) > indices;
+    let Some(first) = draws.iter().find(|d| over(d)) else {
+        return draws.to_vec();
+    };
+    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+        diag::warn!(
+            World,
+            "{label}: {} of {} draws reach past its {indices} indices (first: from {} for {}); left out",
+            draws.iter().filter(|d| over(d)).count(),
+            draws.len(),
+            first[0],
+            first[1],
+        );
+    }
+    draws.iter().filter(|d| !over(d)).copied().collect()
+}
+
+/// A retained draw (`first`, `count`) that stays inside its buffer's
+/// `indices`; the first few that do not are logged under `what`.
+fn retained_within(what: &str, first: u32, count: u32, indices: usize) -> bool {
+    if u64::from(first) + u64::from(count) <= indices as u64 {
+        return true;
+    }
+    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+        diag::warn!(World, "{what} draw from {first} for {count} reaches past its {indices} indices; left out");
+    }
+    false
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct DiagnosticSmodelInstance {
+    world_from_local: [[f32; 4]; 4],
+}
+
+#[derive(Resource, Default)]
+struct DiagnosticGeometry {
+    generation: MaterialGenerationId,
+    world_vertex: Option<Buffer>,
+    world_index: Option<Buffer>,
+    world_surface_ranges: Arc<Vec<(u32, u32)>>,
+    smodel_vertex: Option<Buffer>,
+    smodel_index: Option<Buffer>,
+    smodel_surface_ranges: Arc<Vec<(u32, u32)>>,
+    world_vertex_count: usize,
+    world_index_count: usize,
+    smodel_vertex_count: usize,
+    smodel_index_count: usize,
+    xmodel_vertex: Option<Buffer>,
+    xmodel_index: Option<Buffer>,
+    xmodel_surface_ranges: Arc<Vec<(u32, u32)>>,
+    xmodel_vertex_count: usize,
+    xmodel_index_count: usize,
+    xmodel_revision: u64,
+
+    g0_world_surfs: Vec<u16>,
+    world_surface_color: Arc<Vec<u32>>,
+    world_surface_draw: Arc<Vec<u32>>,
+    world_surface_lightmap: Arc<Vec<u8>>,
+    t6_lighting: Option<[[f32; 4]; 19]>,
+    t6_sun_sample_size_near: f32,
+    t6_props: Arc<Vec<[u32; 4]>>,
+    t6_prop_shine: Arc<Vec<[u32; 3]>>,
+    world_surface_primary: Arc<Vec<u8>>,
+    t6_lights: Arc<Vec<[f32; 16]>>,
+    world_surface_layers: Arc<Vec<[u32; 2]>>,
+    /// bo2zm: per world surface, normal and specular map slots and probe.
+    world_surface_shine: Arc<Vec<[u32; 3]>>,
+    t6_probe_slot: Option<u32>,
+    t6_probes: Arc<Vec<[[f32; 4]; 3]>>,
+    t6_lut: Option<Arc<asset_world::T6Lut>>,
+    /// bo2zm: the world's layer texcoords, parallel to its vertices.
+    world_layer_vertex: Option<Buffer>,
+    world_layer_uvs: Arc<Vec<[f32; 4]>>,
+    /// bo2zm: every textured pipeline the world surfaces and props need.
+    t6_styles: Vec<DiagnosticTess>,
+    /// bo2zm: the blended props' draw order (indices into `t6_props`, by
+    /// sort key).
+    t6_blended_props: Vec<usize>,
+    t6_prop_instances: Arc<Vec<[f32; 24]>>,
+    t6_prop_instance_buffer: Option<Buffer>,
+    /// bo2mp: per prop draw (parallel to `t6_props`), its sphere in the
+    /// world (centre, radius; a negative radius = unknown, always drawn),
+    /// and what it was built from.
+    t6_prop_spheres: Vec<[f32; 4]>,
+    t6_prop_spheres_key: [usize; 5],
+    t6_sky_slot: Option<u32>,
+}
+
+/// bo2zm: one bind group per lightmap page the world surfaces read (page
+/// view, sampler, T6 lighting constants), over the uploaded lightmap views.
+#[derive(Resource, Default)]
+struct DiagnosticWorldLightmaps {
+    generation: MaterialGenerationId,
+    sampler: Option<Sampler>,
+    constants: Option<Buffer>,
+    written: Option<[[f32; 4]; 19]>,
+    bind_groups: HashMap<u8, BindGroup>,
+    /// The sky: its cube map's slot and bind group (cube, sampler, lighting).
+    sky: Option<(u32, BindGroup)>,
+    /// The primary lights uniform (`T6_LIGHTS_BYTES`) and what it holds.
+    lights: Option<Buffer>,
+    lights_written: Option<Arc<Vec<[f32; 16]>>>,
+    /// The world's colour tables (a 1x1 white texel without them) and the
+    /// table they came from.
+    lut: Option<(Option<Arc<asset_world::T6Lut>>, bevy::render::render_resource::TextureView)>,
+    /// Group 2 for surfaces without a lightmap: lighting and lights only.
+    lighting_group: Option<BindGroup>,
+    /// The lights effects throw (`T6_DYN_BYTES`), rewritten every frame.
+    dyn_lights: Option<Buffer>,
+}
+
+/// bo2mp: the wind's direction over the ground, a unit vector (x, y): the
+/// fallback pass's waving cloth and foliage lean and ripple along it.
+/// `BO2MP_WIND_DEG` sets the angle in degrees from +x (default 35).
+fn wind_direction() -> [f32; 2] {
+    static WIND: std::sync::OnceLock<[f32; 2]> = std::sync::OnceLock::new();
+    *WIND.get_or_init(|| {
+        let degrees = std::env::var("BO2MP_WIND_DEG")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite())
+            .unwrap_or(35.0);
+        let (sin, cos) = degrees.to_radians().sin_cos();
+        [cos, sin]
+    })
+}
+
+/// bo2zm: the effect lights uniform: a count, then 16 lights of two vec4.
+const T6_DYN_LIGHTS: usize = 16;
+const T6_DYN_BYTES: u64 = (16 + T6_DYN_LIGHTS * 32) as u64;
+
+/// bo2zm: the primary lights uniform: 256 lights of four vec4 (a surface's
+/// light index is a byte; Die Rise has 214), then the two fog rows.
+const T6_LIGHT_ROWS: usize = 258;
+/// bo2zm: the world lighting uniform (`T6Lighting`): 19 vec4.
+const T6_LIGHTING_BYTES: u64 = 19 * 16;
+const T6_LIGHTS_BYTES: u64 = (T6_LIGHT_ROWS * 64) as u64;
+
+/// bo2zm: Black Ops II draw codes (see `asset_core::T6Draw::code`).
+const T6_BLEND_MASK: u32 = 0x0f;
+const T6_UNLIT: u32 = 0x10;
+const T6_SHADOW_ONLY: u32 = 4;
+const T6_NONE: u32 = u32::MAX;
+/// Draw-code bit: a layered material; its vertex colour is layer weights,
+/// not a tint (lightmapped styles only).
+const T6_LAYERED: u32 = 0x40;
+/// Draw-code bit: alpha tested (opaque styles only).
+const T6_ALPHA_TEST: u32 = 0x80;
+/// Draw-code bits: cull (8..9) and polygon offset (10..11).
+const T6_RASTER_MASK: u32 = 0x0f00;
+
+/// Style bit: the surface reads its lightmap (lit codes only).
+const STYLE_LIGHTMAPPED: u32 = 0x20;
+/// Style bit: a lit lightmapped opaque surface with a normal or specular
+/// map draws with BO2's shine: normal map, gloss highlight, reflection
+/// probe (group 1 bindings 8, 9; group 3).
+const STYLE_SHINE: u32 = 0x08;
+/// The reflection probe table: per probe its `lightingSH`, three vec4.
+const T6_MAX_PROBES: usize = 32;
+const T6_PROBES_BYTES: u64 = (T6_MAX_PROBES * 48) as u64;
+/// Draw-code bits: the unlit colour scale's log2 (12..14), extra layers
+/// 1 and 2 (24..25, 26..27).
+const T6_UNLIT_SCALE_MASK: u32 = 0x7000;
+const T6_LAYER_SHIFT: u32 = 24;
+
+/// The sort key a draw code carries (blended surfaces draw in its order).
+fn t6_sort_key(code: u32) -> u32 {
+    if code == T6_NONE { 0 } else { (code >> 16) & 0x3f }
+}
+
+/// Style bits 18 and 19: how the surface moves (`asset_core::T6Anim`: 1 flow,
+/// 2 fall, 3 cloth), from bits 22 and 23 of its draw code.
+const STYLE_ANIM_SHIFT: u32 = 18;
+const STYLE_ANIM_MASK: u32 = 3 << STYLE_ANIM_SHIFT;
+
+/// A draw code's animation bits, in style position (none for a surface with
+/// no draw).
+fn anim_style(code: u32) -> u32 {
+    if code == T6_NONE {
+        0
+    } else {
+        ((code >> asset_core::T6_ANIM_SHIFT) & 3) << STYLE_ANIM_SHIFT
+    }
+}
+
+/// A style's animation.
+fn style_anim(style: u32) -> asset_core::T6Anim {
+    asset_core::T6Anim::from_bits((style & STYLE_ANIM_MASK) >> STYLE_ANIM_SHIFT)
+}
+
+/// A draw code blends (alpha, add or multiply).
+fn t6_blended(code: u32) -> bool {
+    code != T6_NONE && matches!(code & T6_BLEND_MASK, 1..=3)
+}
+
+/// The pipeline style of a world surface: blend (bits 0..1), unlit (4),
+/// lightmapped (5), layered (6), alpha tested (7), cull (8..9), polygon
+/// offset (10..11). A surface with no BO2 draw is style 0.
+fn world_style(code: u32, lightmapped: bool) -> u32 {
+    if code == T6_NONE {
+        return 0;
+    }
+    let mut style = code & (3 | T6_UNLIT | T6_RASTER_MASK);
+    if code & T6_UNLIT != 0 {
+        style |= code & T6_UNLIT_SCALE_MASK;
+    }
+    if lightmapped && code & T6_UNLIT == 0 {
+        style |= STYLE_LIGHTMAPPED | (code & T6_LAYERED);
+        // Lit lightmapped styles keep the extra layers in bits 12..15.
+        style |= ((code >> T6_LAYER_SHIFT) & 0xf) << 12;
+    }
+    if code & T6_ALPHA_TEST != 0 && code & 3 == 0 {
+        style |= T6_ALPHA_TEST;
+    }
+    // bo2mp: water and emissive flow mark their lit lightmapped style with
+    // bit 2 (free in world styles: the blend keeps bits 0..1), the kind in
+    // the layer bits.
+    if code & T6_WATER != 0 && code & T6_DECAL != T6_DECAL && style & STYLE_LIGHTMAPPED != 0 {
+        style = (style & !STYLE_LAYER_MASK) | STYLE_WATER;
+    }
+    // bo2mp: emissive flow (lava), likewise.
+    if code & T6_FLOW != 0 && style & STYLE_LIGHTMAPPED != 0 && code & T6_UNLIT == 0 {
+        style = (style & !STYLE_LAYER_MASK) | STYLE_FLOW;
+    }
+    // bo2mp: a test layer 1 (`t1c1`): bit 2 with layer 1's kind blend.
+    if code & T6_TEST1 != 0 && style_layers(style) && (style >> 12) & 3 == 1 {
+        style |= STYLE_WORLD_OWN;
+    }
+    // bo2mp: flowing water (any game's): the picture slides. (Cloth waves
+    // vertices of props only.)
+    let anim = anim_style(code);
+    if anim >> STYLE_ANIM_SHIFT != asset_core::T6Anim::Cloth.bits()
+        && !style_water(style)
+        && !style_flow(style)
+    {
+        style |= anim;
+    }
+    style
+}
+
+/// Draw-code bit of a lit code: layer 1 is a test layer (`t1c1`).
+const T6_TEST1: u32 = 0x2000;
+
+/// A style without its extra layers (the base layer alone).
+fn strip_layers(style: u32) -> u32 {
+    if style_layers(style) {
+        style & !(STYLE_LAYER_MASK | STYLE_WORLD_OWN)
+    } else {
+        style
+    }
+}
+
+/// Draw-code bit: BO2's emissive flow (`cod7emissiveflow`: molten lava).
+const T6_FLOW: u32 = 0x8000_0000;
+/// Style bits of a lit lightmapped emissive flow surface.
+const STYLE_FLOW: u32 = STYLE_WORLD_OWN | 0x2000;
+
+/// A lit lightmapped emissive flow style.
+fn style_flow(style: u32) -> bool {
+    style & STYLE_LIGHTMAPPED != 0
+        && style & T6_UNLIT == 0
+        && style & (STYLE_WORLD_OWN | STYLE_LAYER_MASK) == STYLE_FLOW
+}
+
+/// Draw-code bit: BO2's water (`cod7water`, `cod7watershore`).
+const T6_WATER: u32 = 0x4000_0000;
+/// Style bit of a lit lightmapped world surface drawn by a shader of its
+/// own (water: no layer bits; emissive flow: layer bits 0x2000), or of a
+/// layered one whose layer 1 is a test layer (layer 1's kind blend).
+const STYLE_WORLD_OWN: u32 = 0x04;
+/// Style bits of a lit lightmapped water surface.
+const STYLE_WATER: u32 = STYLE_WORLD_OWN;
+
+/// A lit lightmapped water style.
+fn style_water(style: u32) -> bool {
+    style & STYLE_LIGHTMAPPED != 0
+        && style & T6_UNLIT == 0
+        && style & (STYLE_WORLD_OWN | STYLE_LAYER_MASK) == STYLE_WATER
+}
+
+/// Draw-code bit / prop style bit: a BO2 effect technique (props are never
+/// lightmapped, so the bit is free in prop styles).
+const T6_EFFECT: u32 = 0x20;
+/// Draw-code bit / prop style bit: a BO2 particle cloud (bit 15 is free in
+/// both).
+const T6_CLOUD: u32 = 0x8000;
+/// Prop style bit: an effect drawn with soft edges (BO2's zfeather pixel
+/// shaders), reading the scene depth (group 3). Props are never layered,
+/// so the layered bit is free in prop styles.
+const STYLE_SOFT: u32 = 0x40;
+/// Draw-code bit: BO2's objective technique (the box's question marks).
+const T6_OBJECTIVE: u32 = 0x1000_0000;
+/// Prop style bit: an objective surface (bit 2 is free in prop styles: the
+/// blend keeps bits 0..1).
+const STYLE_OBJECTIVE: u32 = 0x04;
+
+/// Draw-code bit: BO2's foliage technique (`treecanopy`): the vertex colour
+/// is wind data and a grid-light scale, not a tint.
+const T6_FOLIAGE: u32 = 0x2000_0000;
+/// Prop style bit: a lit foliage surface (bit 12 is the unlit colour scale,
+/// unused by lit styles).
+const STYLE_FOLIAGE: u32 = 0x1000;
+
+/// Draw-code bits: BO2's projected decal technique (the blood a hit paints
+/// on a zombie): its box paints what lies inside it, from the scene depth.
+/// bo2zm merge: the foliage and water bits together (`asset_core::T6Draw::
+/// code`; no technique is both), tested before either.
+const T6_DECAL: u32 = T6_FOLIAGE | T6_WATER;
+/// Prop style bit: a projected decal (lit); it draws only with the scene
+/// depth (`STYLE_SOFT`, group 3). Above the 16 bits the other styles use.
+const STYLE_DECAL: u32 = 0x1_0000;
+/// Draw-code bits: BO2's ghost technique (Mob's Afterlife ghost hands): the
+/// objective and foliage bits together, tested before either.
+const T6_GHOST: u32 = T6_OBJECTIVE | T6_FOLIAGE;
+/// Prop style bit: a ghost surface (lit).
+const STYLE_GHOST: u32 = 0x2_0000;
+/// Draw-code bit of a Ghosts effect that blends by screen (an additive effect
+/// with it set: `asset_core::T6Draw::screen`).
+const T6_SCREEN: u32 = 0x40;
+/// Prop style bit: a screen-blended effect (INV_DEST_COLOR / ONE: the colour
+/// times its alpha lands only where the frame is dark).
+const STYLE_SCREEN: u32 = 0x10_0000;
+
+/// The pipeline style of a prop surface (never lightmapped or layered).
+fn prop_style(code: u32) -> u32 {
+    if code == T6_NONE {
+        return 0;
+    }
+    let mut style = code & (3 | T6_UNLIT | T6_RASTER_MASK | T6_EFFECT | T6_CLOUD);
+    if code & T6_EFFECT != 0 && code & 3 == 2 && code & T6_SCREEN != 0 {
+        style |= STYLE_SCREEN;
+    }
+    if code & T6_UNLIT != 0 {
+        style |= code & T6_UNLIT_SCALE_MASK;
+    }
+    if code & T6_ALPHA_TEST != 0 && code & 3 == 0 {
+        style |= T6_ALPHA_TEST;
+    }
+    // bo2zm: a ghost or a projected decal is that alone.
+    if code & T6_GHOST == T6_GHOST {
+        if code & T6_UNLIT == 0 {
+            style |= STYLE_GHOST;
+        }
+        return style;
+    }
+    if code & T6_DECAL == T6_DECAL {
+        if code & T6_UNLIT == 0 {
+            style |= STYLE_DECAL;
+        }
+        return style;
+    }
+    if code & T6_OBJECTIVE != 0 {
+        style |= STYLE_OBJECTIVE;
+    }
+    if code & T6_FOLIAGE != 0 && code & T6_UNLIT == 0 {
+        style |= STYLE_FOLIAGE;
+    }
+    if code & T6_FLOW != 0 && code & T6_UNLIT == 0 {
+        style |= STYLE_PROP_FLOW;
+    }
+    if code & T6_TILE != 0 && code & T6_UNLIT == 0 {
+        style |= STYLE_PROP_TILE;
+    }
+    // bo2mp: a tattered flag tests its own alpha (the mixed edge), not the
+    // diffuse's (gloss). A tile blend sets both bits (tile and flag).
+    if code & T6_FLAG != 0 && code & T6_UNLIT == 0 {
+        style = (style & !T6_ALPHA_TEST) | STYLE_PROP_FLAG;
+    }
+    // bo2mp: flowing water slides its picture, a flag or foliage waves its
+    // vertices in the wind (not a cloud sheet, which scrolls itself).
+    if code & T6_CLOUD == 0 {
+        style |= anim_style(code);
+    }
+    style
+}
+
+/// The prop kind among emissive tile, tattered flag and tile blend.
+fn prop_own_kind(style: u32) -> u32 {
+    if style & T6_UNLIT != 0 {
+        0
+    } else {
+        style & (STYLE_PROP_TILE | STYLE_PROP_FLAG)
+    }
+}
+
+/// Draw-code bit of a lit code: BO2's tattered flag (`flag_tatters`).
+const T6_FLAG: u32 = 0x4000;
+/// Prop style bit: a lit tattered flag (bit 6 is the soft bit of effects
+/// only, which are unlit).
+const STYLE_PROP_FLAG: u32 = 0x40;
+
+/// Draw-code bit of a lit code: BO2's emissive tile (`cod7_emissive_tile`;
+/// bit 12 is the unlit colour scale in unlit codes).
+const T6_TILE: u32 = 0x1000;
+/// Prop style bit: a lit emissive tile surface (bit 14, likewise free).
+const STYLE_PROP_TILE: u32 = 0x4000;
+
+/// Prop style bit: a lit emissive flow surface (lava; bit 13 is the unlit
+/// colour scale, unused by lit styles).
+const STYLE_PROP_FLOW: u32 = 0x2000;
+
+/// bo2mp: what the fallback pass has to draw this frame, logged when it
+/// changes: whether world surfaces were left to it, which of Black Ops II's
+/// moving-thing lists arrived (the gun is `viewmodel`, players are in
+/// `missiles` / `held`) and whether their lighting group exists (without
+/// it none of them draws: the map gave no T6 lighting).
+fn note_pass_state(
+    world_draws: usize,
+    geometry: &DiagnosticGeometry,
+    lists: &[Option<&DynamicBuffers>; 6],
+    lighting_group: bool,
+) {
+    use std::sync::Mutex;
+    static LAST: Mutex<Option<[bool; 10]>> = Mutex::new(None);
+    let state = [
+        world_draws > 0,
+        !geometry.t6_props.is_empty(),
+        lists[0].is_some(),
+        lists[1].is_some(),
+        lists[2].is_some(),
+        lists[3].is_some(),
+        lists[4].is_some(),
+        lists[5].is_some(),
+        lighting_group,
+        geometry.t6_lighting.is_some(),
+    ];
+    // Logged when the gun's or the players' lists come or go, or the
+    // lighting changes (world surfaces, marks and effects come and go with
+    // the view; they ride along).
+    let key = [state[2], state[3] || state[4], state[8], state[9]];
+    let Ok(mut last) = LAST.lock() else { return };
+    if last.is_some_and(|l| [l[2], l[3] || l[4], l[8], l[9]] == key) {
+        return;
+    }
+    *last = Some(state);
+    let draws = |l: Option<&DynamicBuffers>| l.map_or(0, |b| b.3.len());
+    diag::info!(
+        Fpv,
+        "bo2 fallback pass: world_left={} props={} viewmodel={} (draws {}) bodies/missiles={} (draws {}) held={} (draws {}) marks={} effects={} vm_effects={} lighting_group={} t6_lighting={}{}",
+        state[0],
+        state[1],
+        state[2],
+        draws(lists[0]),
+        state[3],
+        draws(lists[1]),
+        state[4],
+        draws(lists[2]),
+        state[5],
+        state[6],
+        state[7],
+        state[8],
+        state[9],
+        if !lighting_group && lists.iter().any(Option::is_some) {
+            " — NO LIGHTING GROUP: gun, players and effects are not drawn"
+        } else {
+            ""
+        }
+    );
+}
+
+/// bo2mp: a dynamic draw left out for want of its pipeline or colour map,
+/// the first 32 kinds (always; `CODLEGACY_T6_DRAWLOG` logs every one).
+fn note_dynamic_skip(
+    slot: u32,
+    code: u32,
+    style: u32,
+    pipeline_known: bool,
+    pipeline_ready: bool,
+    texture: bool,
+) {
+    use std::sync::Mutex;
+    static SEEN: Mutex<Vec<(u32, u32, u32, bool, bool, bool)>> = Mutex::new(Vec::new());
+    let key = (slot, code, style, pipeline_known, pipeline_ready, texture);
+    let Ok(mut seen) = SEEN.lock() else { return };
+    if seen.len() >= 32 || seen.contains(&key) {
+        return;
+    }
+    seen.push(key);
+    diag::info!(
+        World,
+        "bo2 dynamic draw skipped: slot {slot} code {code:#x} style {style:#x} pipeline {pipeline_known} ready {pipeline_ready} texture {texture}{}",
+        if slot == u32::MAX { " (material has no colour map)" } else { "" }
+    );
+}
+
+/// bo2mp: a dynamic draw with shine maps that drew plain (colour map only)
+/// instead, once per look (the first 48): why it did not get its shine
+/// group (the probes missing on this map, or a map not uploaded yet).
+fn note_gun_plain(slot: u32, normal: u32, specular: u32, emissive: u32, code: u32, shine_code: bool, textures: &DiagnosticWorldTextures) {
+    use std::sync::Mutex;
+    static SEEN: Mutex<Vec<(u32, u32, u32, u32)>> = Mutex::new(Vec::new());
+    let key = (slot, normal, specular, emissive);
+    let Ok(mut seen) = SEEN.lock() else { return };
+    if seen.len() >= 48 || seen.contains(&key) {
+        return;
+    }
+    seen.push(key);
+    diag::info!(
+        World,
+        "bo2mp dynamic draw without its shine group: colour {slot} normal {normal:#x} specular {specular:#x} aux {emissive:#x} code {code:#x} shine_code {shine_code} probes {} group_built {}",
+        textures.probes.is_some(),
+        textures.shine.contains_key(&key)
+    );
+}
+
+/// bo2mp: a shine key whose map views are not ready (not uploaded, refused
+/// or not 2D), once per key (the first 48).
+fn note_shine_unready(colour: u32, n: u32, s: u32, aux: u32, registry: &RuntimeUploadedImageRegistry) {
+    use std::sync::Mutex;
+    static SEEN: Mutex<Vec<(u32, u32, u32, u32)>> = Mutex::new(Vec::new());
+    let key = (colour, n, s, aux);
+    let Ok(mut seen) = SEEN.lock() else { return };
+    if seen.len() >= 48 || seen.contains(&key) {
+        return;
+    }
+    seen.push(key);
+    let state = |slot: u32| match registry.material_images.get(slot as usize) {
+        _ if slot == u32::MAX => "none".to_owned(),
+        None => format!("slot past the table ({})", registry.material_images.len()),
+        Some(None) => "not uploaded".to_owned(),
+        Some(Some(Err(e))) => format!("refused {e:?}"),
+        Some(Some(Ok(v))) => format!("ready {:?}", v.dimension),
+    };
+    diag::info!(
+        World,
+        "bo2mp shine maps not ready: colour {colour} [{}] normal {n:#x} [{}] specular {s:#x} [{}] aux {aux:#x} [{}]",
+        state(colour),
+        state(n),
+        state(s),
+        state(aux)
+    );
+}
+
+/// bo2zm: one dynamic list (marks, projectiles, effects, the gun) into a
+/// pass: the draws `keep` admits, opaque first, then blended by sort key;
+/// effects with soft edges when `soft` (the scene depth) is given. Returns
+/// the draws made.
+#[allow(clippy::too_many_arguments)]
+fn draw_dynamic_list<'w>(
+    pass: &mut bevy::render::render_phase::TrackedRenderPass<'w>,
+    buffers: Option<&'w DynamicBuffers>,
+    lighting_group: Option<&'w BindGroup>,
+    depth_range: i32,
+    viewport: [f32; 4],
+    keep: &dyn Fn(u32) -> bool,
+    soft: Option<&'w BindGroup>,
+    cache: &'w PipelineCache,
+    pipelines: &HashMap<DiagnosticTess, CachedRenderPipelineId>,
+    world_textures: &'w DiagnosticWorldTextures,
+) -> u32 {
+    let (Some((vb, ib, inst, draws)), Some(lighting_group)) = (buffers, lighting_group) else {
+        return 0;
+    };
+    let [vp_x, vp_y, vp_w, vp_h] = viewport;
+    if vp_w > 0.0 && vp_h > 0.0 {
+        let (depth_min, depth_max) = reverse_z_viewport_depth(depth_range);
+        pass.set_viewport(vp_x, vp_y, vp_w, vp_h, depth_min, depth_max);
+    }
+    pass.set_bind_group(2, lighting_group, &[]);
+    pass.set_vertex_buffer(0, vb.slice(..));
+    pass.set_vertex_buffer(1, inst.slice(..));
+    pass.set_index_buffer(ib.slice(..), IndexFormat::Uint32);
+    let mut order: Vec<usize> = (0..draws.len()).filter(|&i| keep(draws[i][3])).collect();
+    order.sort_by_key(|&i| (t6_blended(draws[i][3]), t6_sort_key(draws[i][3])));
+    // bo2mp: back-to-back draws of one look and placement whose indices
+    // follow on are one draw (marks lit alike share a placement).
+    let mut merged: Vec<[u32; 8]> = Vec::with_capacity(order.len());
+    for i in order {
+        let d = draws[i];
+        if let Some(last) = merged.last_mut()
+            && last[2..] == d[2..]
+            && last[0].checked_add(last[1]) == Some(d[0])
+        {
+            last[1] = last[1].saturating_add(d[1]);
+            continue;
+        }
+        merged.push(d);
+    }
+    let mut bound: Option<DiagnosticTess> = None;
+    let mut bound_slot = None;
+    let mut drawn = 0u32;
+    for [start, count, slot, code, instance, normal, specular, emissive] in merged {
+        if count == 0 || (code != T6_NONE && code & T6_BLEND_MASK >= T6_SHADOW_ONLY) {
+            continue;
+        }
+        let shine_group = (prop_shine_code(code) && (normal != u32::MAX || specular != u32::MAX))
+            .then(|| world_textures.probes.as_ref())
+            .flatten()
+            .and_then(|_| {
+                world_textures
+                    .shine
+                    .get(&(slot, normal, specular, emissive))
+            });
+        if shine_group.is_none() && (normal != u32::MAX || specular != u32::MAX || emissive != u32::MAX) {
+            note_gun_plain(slot, normal, specular, emissive, code, prop_shine_code(code), world_textures);
+        }
+        let soft_here = soft.filter(|_| soft_code(code) || decal_code(code));
+        // A projected decal without the scene depth has nothing to paint
+        // (its box itself is never drawn).
+        if decal_code(code) && soft_here.is_none() {
+            continue;
+        }
+        let style = prop_style(code)
+            | if shine_group.is_some() { STYLE_SHINE } else { 0 }
+            | if soft_here.is_some() { STYLE_SOFT } else { 0 };
+        let key = DiagnosticTess::PropTextured(style);
+        let pipeline = pipelines.get(&key).and_then(|&id| cache.get_render_pipeline(id));
+        let (Some(pipeline), Some(bind_group)) = (
+            pipeline,
+            shine_group.or_else(|| world_textures.bind_groups.get(&slot)),
+        ) else {
+            note_dynamic_skip(
+                slot,
+                code,
+                style,
+                pipelines.contains_key(&key),
+                pipeline.is_some(),
+                world_textures.bind_groups.contains_key(&slot),
+            );
+            // CODLEGACY_T6_DRAWLOG=1: why a draw was left out.
+            static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *LOG.get_or_init(|| codlegacy_env::var_os("CODLEGACY_T6_DRAWLOG").is_some()) {
+                diag::info!(
+                    World,
+                    "bo2zm draw skipped: slot {slot} code {code:#x} style {style:#x} pipeline {} ready {} texture {}",
+                    pipelines.contains_key(&key),
+                    pipeline.is_some(),
+                    world_textures.bind_groups.contains_key(&slot)
+                );
+            }
+            continue;
+        };
+        if bound != Some(key) {
+            pass.set_render_pipeline(pipeline);
+            if shine_group.is_some()
+                && let Some((_, probes)) = world_textures.probes.as_ref()
+            {
+                pass.set_bind_group(3, probes, &[]);
+            }
+            if let Some(soft) = soft_here {
+                pass.set_bind_group(3, soft, &[]);
+            }
+            bound = Some(key);
+        }
+        let slot_key = (slot, shine_group.map(|_| [normal, specular, emissive]));
+        if bound_slot != Some(slot_key) {
+            pass.set_bind_group(1, bind_group, &[]);
+            bound_slot = Some(slot_key);
+        }
+        pass.draw_indexed(start..start.saturating_add(count), 0, instance..instance + 1);
+        crate::diag::gpu_counters::draw(count, 1);
+        drawn += 1;
+    }
+    drawn
+}
+
+/// bo2mp: one draw of opaque props: one surface at `instances`
+/// placements, which sit together in this frame's own placement rows.
+struct PropBatch<'a> {
+    style: u32,
+    slot_key: (u32, Option<[u32; 3]>),
+    pipeline: &'a bevy::render::render_resource::RenderPipeline,
+    bind_group: &'a BindGroup,
+    /// The reflection probes, for a surface with shine.
+    probes: Option<&'a BindGroup>,
+    start: u32,
+    count: u32,
+    instances: std::ops::Range<u32>,
+}
+
+/// bo2mp: the opaque props this view draws, each surface's placements in
+/// one draw (Nuketown drew ~1,450 a frame one placement at a time), sorted
+/// by pipeline and texture so they switch less; `rows` gets the placements
+/// in the order the draws read them. Returns the draws, then how many
+/// props were hidden by distance and how many were out of view.
+fn t6_opaque_prop_batches<'a>(
+    geometry: &DiagnosticGeometry,
+    world_textures: &'a DiagnosticWorldTextures,
+    cache: &'a PipelineCache,
+    pipelines: &HashMap<DiagnosticTess, CachedRenderPipelineId>,
+    view: &ExtractedView,
+    rows: &mut Vec<[f32; 24]>,
+) -> (Vec<PropBatch<'a>>, u32, u32) {
+    // The game's own per-placement draw distance (the fast quality
+    // setting hides props at 60% of it).
+    let eye = view.world_from_view.translation();
+    let cull_scale = if asset_core::t6_fast() { 0.6 } else { 1.0 };
+    let view_planes =
+        t6_view_planes(view.clip_from_view * view.world_from_view.to_matrix().inverse());
+    let (mut culled, mut unseen) = (0u32, 0u32);
+    let mut each: Vec<PropBatch<'a>> = Vec::new();
+    for (i, &[surface, slot, code, instance]) in geometry.t6_props.iter().enumerate() {
+        if t6_blended(code) || (code != T6_NONE && code & T6_BLEND_MASK >= T6_SHADOW_ONLY) {
+            continue;
+        }
+        let Some(row) = geometry.t6_prop_instances.get(instance as usize) else {
+            continue;
+        };
+        if row[22] > 0.0 {
+            let d = Vec3::new(row[12], row[13], row[14]) - eye;
+            let cull = row[22] * cull_scale;
+            if d.length_squared() > cull * cull {
+                culled += 1;
+                continue;
+            }
+        }
+        if let (Some(planes), Some(&[x, y, z, radius])) =
+            (view_planes.as_ref(), geometry.t6_prop_spheres.get(i))
+            && radius >= 0.0
+            && planes
+                .iter()
+                .any(|plane| plane.truncate().dot(Vec3::new(x, y, z)) + plane.w < -radius)
+        {
+            unseen += 1;
+            continue;
+        }
+        let Some(&(start, count)) = geometry.smodel_surface_ranges.get(surface as usize) else {
+            continue;
+        };
+        // Shine: a lit opaque prop with a normal or specular map.
+        let shine = geometry.t6_prop_shine.get(i).copied().unwrap_or([u32::MAX; 3]);
+        let flow = prop_style(code) & (STYLE_PROP_FLOW | STYLE_PROP_TILE) != 0
+            || (prop_style(code) & STYLE_PROP_FLAG != 0 && code & T6_UNLIT == 0);
+        let probes = world_textures.probes.as_ref().map(|(_, probes)| probes);
+        let shine_group = (prop_shine_code(code) && (shine[0] != u32::MAX || shine[1] != u32::MAX))
+            .then_some(probes)
+            .flatten()
+            .and_then(|_| {
+                let aux = if flow { shine[2] } else { u32::MAX };
+                world_textures.shine.get(&(slot, shine[0], shine[1], aux))
+            });
+        let style = prop_style(code) | if shine_group.is_some() { STYLE_SHINE } else { 0 };
+        let pipeline = pipelines
+            .get(&DiagnosticTess::PropTextured(style))
+            .and_then(|&id| cache.get_render_pipeline(id));
+        let (Some(pipeline), Some(bind_group)) =
+            (pipeline, shine_group.or_else(|| world_textures.bind_groups.get(&slot)))
+        else {
+            continue;
+        };
+        if count == 0 || !retained_within("prop", start, count, geometry.smodel_index_count) {
+            continue;
+        }
+        each.push(PropBatch {
+            style,
+            slot_key: (slot, shine_group.map(|_| shine)),
+            pipeline,
+            bind_group,
+            probes: shine_group.and(probes),
+            start,
+            count,
+            instances: instance..instance + 1,
+        });
+    }
+    each.sort_unstable_by_key(|b| (b.style, b.slot_key, b.start, b.count, b.instances.start));
+    let mut batches: Vec<PropBatch<'a>> = Vec::new();
+    for b in each {
+        let at = rows.len() as u32;
+        rows.push(t6_prop_gpu_row(geometry.t6_prop_instances[b.instances.start as usize]));
+        match batches.last_mut() {
+            Some(last)
+                if (last.style, last.slot_key, last.start, last.count)
+                    == (b.style, b.slot_key, b.start, b.count) =>
+            {
+                last.instances.end = at + 1;
+            }
+            _ => batches.push(PropBatch {
+                instances: at..at + 1,
+                ..b
+            }),
+        }
+    }
+    (batches, culled, unseen)
+}
+
+/// bo2zm: an effect code that draws with soft edges in the world (BO2's
+/// zfeather techniques; a material without `featherParms` reads none of
+/// it): blended or added, not a particle cloud.
+fn soft_code(code: u32) -> bool {
+    code != T6_NONE && code & T6_EFFECT != 0 && code & T6_CLOUD == 0 && t6_blended(code)
+}
+
+/// bo2zm 27c: a cloud sheet code (the cloud bit without the effect bit;
+/// Die Rise's `scrolling_zfeather` cloud floor): its texture drifts, and with
+/// the scene depth it fades where what is behind it is near.
+fn sheet_code(code: u32) -> bool {
+    code != T6_NONE && code & T6_CLOUD != 0 && code & T6_EFFECT == 0
+}
+
+/// bo2zm M4 retest 5: a projected decal code (lit, not an effect).
+fn decal_code(code: u32) -> bool {
+    code != T6_NONE
+        && code & T6_DECAL == T6_DECAL
+        && code & T6_GHOST != T6_GHOST
+        && code & T6_UNLIT == 0
+        && code & T6_EFFECT == 0
+}
+
+/// bo2zm: a prop or dynamic code that can draw with shine: lit, opaque or
+/// blended (glass), not an effect, a projected decal or a ghost.
+fn prop_shine_code(code: u32) -> bool {
+    code != T6_NONE
+        && code & T6_UNLIT == 0
+        && code & 3 <= 1
+        && code & T6_EFFECT == 0
+        && code & T6_DECAL != T6_DECAL
+        && code & T6_GHOST != T6_GHOST
+}
+
+/// Style bits of a lit lightmapped style's extra layers (12..15).
+const STYLE_LAYER_MASK: u32 = 0xf000;
+
+/// A style draws extra layers (lit, lightmapped, with layer kinds).
+fn style_layers(style: u32) -> bool {
+    style & STYLE_LIGHTMAPPED != 0
+        && style & T6_UNLIT == 0
+        && style & STYLE_LAYER_MASK != 0
+        && !style_water(style)
+        && !style_flow(style)
+}
+
+/// bo2mp: a layered style with one blend layer (not a test layer) and no
+/// layer 2: it draws with shine, layer 1's specular map in layer 2's place.
+fn style_layer1_spec(style: u32) -> bool {
+    style_layers(style)
+        && (style >> 12) & 3 == 1
+        && (style >> 14) & 3 == 0
+        && style & STYLE_WORLD_OWN == 0
+}
+
+/// Every textured pipeline the codes need: each lit world code with and
+/// without its lightmap, each prop code.
+fn t6_styles(world: &[u32], props: &[[u32; 4]]) -> Vec<DiagnosticTess> {
+    let mut styles = std::collections::BTreeSet::new();
+    for &code in world {
+        if code != T6_NONE && code & T6_BLEND_MASK >= T6_SHADOW_ONLY {
+            continue;
+        }
+        styles.insert(DiagnosticTess::WorldTextured(world_style(code, false)));
+        styles.insert(DiagnosticTess::WorldTextured(world_style(code, true)));
+        // Layered: also the base-layer-only style (layer maps missing).
+        styles.insert(DiagnosticTess::WorldTextured(strip_layers(world_style(
+            code, true,
+        ))));
+        // Opaque lit lightmapped: also with shine.
+        let lit = strip_layers(world_style(code, true));
+        if lit & STYLE_LIGHTMAPPED != 0 && lit & 3 <= 1 {
+            styles.insert(DiagnosticTess::WorldTextured(lit | STYLE_SHINE));
+            // bo2mp: one blend layer too (Downhill's snow over its ice), as
+            // BO2's `lit_sm_*_b1c1n1s1` reads its normal and specular maps.
+            if style_layer1_spec(world_style(code, true)) {
+                styles.insert(DiagnosticTess::WorldTextured(world_style(code, true) | STYLE_SHINE));
+            }
+        }
+        // bo2mp: water and emissive flow draw only with their shine maps
+        // and probes.
+        if style_water(world_style(code, true)) || style_flow(world_style(code, true)) {
+            styles.insert(DiagnosticTess::WorldTextured(
+                world_style(code, true) | STYLE_SHINE,
+            ));
+        }
+    }
+    for draw in props {
+        let code = draw[2];
+        if code != T6_NONE && code & T6_BLEND_MASK >= T6_SHADOW_ONLY {
+            continue;
+        }
+        if prop_shine_code(code) {
+            styles.insert(DiagnosticTess::PropTextured(prop_style(code) | STYLE_SHINE));
+        }
+        styles.insert(DiagnosticTess::PropTextured(prop_style(code)));
+        if sheet_code(code) {
+            styles.insert(DiagnosticTess::PropTextured(prop_style(code) | STYLE_SOFT));
+        }
+    }
+    styles.into_iter().collect()
+}
+
+/// bo2zm: one bind group per colour map slot the world surfaces sample,
+/// over the uploaded material image views; rebuilt when the catalog
+/// generation changes.
+#[derive(Resource, Default)]
+struct DiagnosticWorldTextures {
+    generation: MaterialGenerationId,
+    sampler: Option<Sampler>,
+    /// bo2zm: the anisotropy the sampler was made with (his texture
+    /// filtering).
+    aniso: u16,
+    bind_groups: HashMap<u32, BindGroup>,
+    /// bo2zm: layered surfaces' group 1, by (colour, layer 1, layer 2)
+    /// slots; a missing layer reuses the colour map (its weight is still
+    /// applied, so the layer kind decides whether one is bound).
+    layered: HashMap<(u32, u32, u32), BindGroup>,
+    /// bo2zm: shine surfaces' group 1, by (colour, normal, specular)
+    /// slots; a missing map binds a flat normal / black specular.
+    shine: HashMap<(u32, u32, u32, u32), BindGroup>,
+    /// bo2mp: layered shine surfaces' group 1, by (colour, layer 1, layer
+    /// 2, normal, specular) slots (Downhill's snow over its ice).
+    layered_shine: HashMap<(u32, u32, u32, u32, u32), BindGroup>,
+    /// bo2zm: 1x1 stand-ins: a flat normal, a black specular map.
+    flat_normal: Option<bevy::render::render_resource::TextureView>,
+    no_specular: Option<bevy::render::render_resource::TextureView>,
+    /// bo2zm: group 3 of shine surfaces: the probes' cube array, its
+    /// sampler and their lighting table, for the cube array's slot.
+    probes: Option<(u32, BindGroup)>,
+    probe_table: Option<Buffer>,
+    probe_written: Option<Arc<Vec<[[f32; 4]; 3]>>>,
+}
+
+/// `CODLEGACY_DIAG_CHECKER=1` brings back the normal-coloured checker on surfaces
+/// that fell back to the untextured pass; without it they are neutral grey.
+fn diagnostic_checker_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        codlegacy_env::var("CODLEGACY_DIAG_CHECKER")
+            .is_ok_and(|value| !value.trim().is_empty() && value.trim() != "0")
+    })
+}
+
+#[derive(Resource)]
+struct DiagnosticPipeline {
+    view_layout: BindGroupLayoutDescriptor,
+    texture_layout: BindGroupLayoutDescriptor,
+    lightmap_layout: BindGroupLayoutDescriptor,
+    /// bo2zm: group 2 without a lightmap (bindings 2, 3).
+    lighting_layout: BindGroupLayoutDescriptor,
+    /// bo2zm: group 1 of layered surfaces: colour map, sampler, layer 1
+    /// and 2 colour maps (bindings 0, 1, 6, 7).
+    layered_texture_layout: BindGroupLayoutDescriptor,
+    sky_layout: BindGroupLayoutDescriptor,
+    /// bo2zm: group 1 of shine surfaces: colour map, sampler, normal and
+    /// specular maps (bindings 0, 1, 8, 9).
+    shine_texture_layout: BindGroupLayoutDescriptor,
+    /// bo2mp: group 1 of layered shine surfaces: the layered and shine
+    /// bindings, plus layer 1's specular map (binding 11).
+    layered_shine_texture_layout: BindGroupLayoutDescriptor,
+    /// bo2zm: group 3 of shine surfaces: the reflection probes' cube
+    /// array, its sampler, their lighting table (bindings 0..2).
+    probe_layout: BindGroupLayoutDescriptor,
+    /// bo2zm: group 3 of soft effects: the scene depth (binding 0).
+    soft_layout: BindGroupLayoutDescriptor,
+    shader: Handle<Shader>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct DiagnosticPipelineKey {
+    target: TextureFormat,
+    samples: u32,
+    tess: DiagnosticTess,
+    /// bo2mp: with a motion-vector target as the second colour attachment
+    /// (a temporal upscaler is on; see `motion.rs`).
+    motion: bool,
+    /// bo2mp: into Ghosts' HDR scene (a Ghosts map's frame drawn in stages,
+    /// `iw6_native::char_grade_frame`): linear light in Ghosts' units
+    /// (`IW6_HDR` in the shader).
+    iw6_hdr: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum DiagnosticTess {
+    World,
+    /// bo2zm: world surfaces with a colour map (group 1 = colour map), by
+    /// style (`world_style`).
+    WorldTextured(u32),
+    /// bo2zm: Black Ops II props with a colour map, by style (`prop_style`).
+    PropTextured(u32),
+    /// bo2zm: the Black Ops II sky, a full-screen triangle at the far plane
+    /// sampling its cube map (group 1, bindings 3..5).
+    Sky,
+    Smodel,
+    XModel,
+}
+
+impl SpecializedRenderPipeline for DiagnosticPipeline {
+    type Key = DiagnosticPipelineKey;
+
+    fn specialize(&self, key: Self::Key) -> RenderPipelineDescriptor {
+        // bo2zm: one shader-def list for both stages (the layered
+        // vertex input and the fragment variants read it).
+        let mut defs: Vec<ShaderDefVal> = match key.tess {
+                    DiagnosticTess::WorldTextured(style) | DiagnosticTess::PropTextured(style) => {
+                        // The unlit colour scale (`scaleRGB`), a power of two.
+                        let mut defs = vec![ShaderDefVal::UInt(
+                            "UNLIT_SCALE".into(),
+                            1u32 << ((style >> 12) & 7),
+                        )];
+                        if style & T6_UNLIT != 0 {
+                            defs.push("UNLIT".into());
+                            if style & 3 == 3 {
+                                defs.push("MULTIPLY".into());
+                            }
+                            // bo2zm: an additive unlit surface adds no black
+                            // and fades toward black in fog.
+                            if style & 3 == 2 {
+                                defs.push("ADD".into());
+                            }
+                        }
+                        if style & T6_ALPHA_TEST != 0 {
+                            defs.push("ALPHA_TEST".into());
+                        }
+                        // bo2mp: animated materials, whatever the game.
+                        match style_anim(style) {
+                            asset_core::T6Anim::Flow => {
+                                defs.push("ANIM_UV".into());
+                            }
+                            asset_core::T6Anim::Fall => {
+                                defs.push("ANIM_UV".into());
+                                defs.push("ANIM_FALL".into());
+                            }
+                            asset_core::T6Anim::Cloth
+                                if matches!(key.tess, DiagnosticTess::PropTextured(_)) =>
+                            {
+                                defs.push("CLOTH".into());
+                            }
+                            _ => {}
+                        }
+                        if style & STYLE_LIGHTMAPPED != 0 && style & T6_LAYERED != 0 {
+                            defs.push("UNTINTED".into());
+                        }
+                        if style & STYLE_SHINE != 0 {
+                            defs.push("SHINE".into());
+                            if style_water(style) {
+                                defs.push("WATER".into());
+                            }
+                            if style_flow(style) {
+                                defs.push("FLOW".into());
+                            }
+                        }
+                        if matches!(key.tess, DiagnosticTess::PropTextured(_))
+                            && style & STYLE_OBJECTIVE != 0
+                        {
+                            defs.push("OBJECTIVE".into());
+                        }
+                        if matches!(key.tess, DiagnosticTess::PropTextured(_))
+                            && style & STYLE_GHOST != 0
+                        {
+                            defs.push("GHOST".into());
+                        }
+                        if matches!(key.tess, DiagnosticTess::PropTextured(_))
+                            && style & T6_UNLIT == 0
+                            && style & STYLE_FOLIAGE != 0
+                        {
+                            defs.push("FOLIAGE".into());
+                        }
+                        if matches!(key.tess, DiagnosticTess::PropTextured(_))
+                            && style & T6_UNLIT == 0
+                            && style & STYLE_PROP_FLOW != 0
+                            && style & STYLE_SHINE != 0
+                        {
+                            defs.push("FLOW".into());
+                        }
+                        if matches!(key.tess, DiagnosticTess::PropTextured(_))
+                            && style & (T6_UNLIT | T6_EFFECT) == 0
+                            && style & STYLE_SHINE != 0
+                        {
+                            match prop_own_kind(style) {
+                                STYLE_PROP_TILE => defs.push("TILE".into()),
+                                STYLE_PROP_FLAG => defs.push("FLAG".into()),
+                                0x4040 => defs.push("TILE_BLEND".into()),
+                                _ => {}
+                            }
+                        }
+                        if matches!(key.tess, DiagnosticTess::PropTextured(_))
+                            && style & T6_EFFECT != 0
+                        {
+                            defs.push("EFFECT".into());
+                            match style & 3 {
+                                2 => {
+                                    defs.push("EFFECT_ADD".into());
+                                    if style & STYLE_SCREEN != 0 {
+                                        defs.push("EFFECT_SCREEN".into());
+                                    }
+                                }
+                                3 => defs.push("EFFECT_MULTIPLY".into()),
+                                _ => {}
+                            }
+                            if style & T6_CLOUD != 0 {
+                                defs.push("CLOUD".into());
+                            }
+                            if style & STYLE_SOFT != 0 {
+                                defs.push("SOFT".into());
+                            }
+                        }
+                        // bo2zm 27c: a cloud sheet (unlit, the cloud bit
+                        // without the effect bit).
+                        if matches!(key.tess, DiagnosticTess::PropTextured(_))
+                            && style & T6_CLOUD != 0
+                            && style & T6_EFFECT == 0
+                        {
+                            defs.push("SCROLL".into());
+                            if style & STYLE_SOFT != 0 {
+                                defs.push("SOFT".into());
+                            }
+                        }
+                        // bo2zm: a projected decal (lit) paints from the scene
+                        // depth.
+                        if matches!(key.tess, DiagnosticTess::PropTextured(_))
+                            && style & STYLE_DECAL != 0
+                            && style & STYLE_SOFT != 0
+                            && style & T6_UNLIT == 0
+                        {
+                            defs.push("DECAL".into());
+                            defs.push("SOFT".into());
+                        }
+                        if style_layers(style) {
+                            defs.push("LAYERS".into());
+                            for (k, shift) in [(1, 12), (2, 14)] {
+                                match (style >> shift) & 3 {
+                                    1 if k == 1 && style & STYLE_WORLD_OWN != 0 => {
+                                        defs.push("LAYER1_TEST".into())
+                                    }
+                                    1 => defs.push(format!("LAYER{k}_BLEND").into()),
+                                    2 => defs.push(format!("LAYER{k}_MULTIPLY").into()),
+                                    3 => defs.push(format!("LAYER{k}_ADD").into()),
+                                    _ => {}
+                                }
+                            }
+                            // bo2mp: one blend layer with shine: layer 1's
+                            // specular map rides in layer 2's place.
+                            if style & STYLE_SHINE != 0 && style_layer1_spec(style) {
+                                defs.push("LAYER1_SPEC".into());
+                            }
+                        }
+                        defs
+                    }
+                    // bo2mp: the untextured fallback (a surface whose
+                    // material the exact pass refused, usually for an image
+                    // that did not decode) draws neutral grey; the old
+                    // normal-colour checker is a developer view only.
+                    DiagnosticTess::World | DiagnosticTess::Smodel | DiagnosticTess::XModel
+                        if diagnostic_checker_enabled() =>
+                    {
+                        vec!["DIAG_CHECKER".into()]
+                    }
+                    _ => Vec::new(),
+                };
+        if key.motion {
+            defs.push("MOTION".into());
+        }
+        if key.iw6_hdr {
+            defs.push("IW6_HDR".into());
+            if matches!(key.tess, DiagnosticTess::PropTextured(style) if style & 3 == 0) {
+                defs.push("IW6_HDR_OPAQUE".into());
+            }
+        }
+        // bo2mp: the draws that write depth write motion vectors (and the
+        // sky); blended ones leave the motion of what is behind them.
+        let writes_depth = match key.tess {
+            DiagnosticTess::WorldTextured(style) if style_water(style) => true,
+            DiagnosticTess::WorldTextured(style) | DiagnosticTess::PropTextured(style) => {
+                style & 3 == 0
+            }
+            DiagnosticTess::Sky => false,
+            _ => true,
+        };
+        let motion_write = if writes_depth || key.tess == DiagnosticTess::Sky {
+            ColorWrites::ALL
+        } else {
+            ColorWrites::empty()
+        };
+        RenderPipelineDescriptor {
+            label: Some("iw4_geometry_diagnostic".into()),
+            layout: match key.tess {
+                DiagnosticTess::Sky => vec![self.view_layout.clone(), self.sky_layout.clone()],
+                DiagnosticTess::WorldTextured(style)
+                    if style_layers(style) && style & STYLE_SHINE != 0 =>
+                {
+                    vec![
+                        self.view_layout.clone(),
+                        self.layered_shine_texture_layout.clone(),
+                        self.lightmap_layout.clone(),
+                        self.probe_layout.clone(),
+                    ]
+                }
+                DiagnosticTess::WorldTextured(style) if style_layers(style) => vec![
+                    self.view_layout.clone(),
+                    self.layered_texture_layout.clone(),
+                    self.lightmap_layout.clone(),
+                ],
+                DiagnosticTess::WorldTextured(style) if style & STYLE_SHINE != 0 => vec![
+                    self.view_layout.clone(),
+                    self.shine_texture_layout.clone(),
+                    self.lightmap_layout.clone(),
+                    self.probe_layout.clone(),
+                ],
+                DiagnosticTess::WorldTextured(style) if style & STYLE_LIGHTMAPPED != 0 => vec![
+                    self.view_layout.clone(),
+                    self.texture_layout.clone(),
+                    self.lightmap_layout.clone(),
+                ],
+                DiagnosticTess::PropTextured(style)
+                    if style & STYLE_SOFT != 0
+                        && (style & T6_EFFECT != 0
+                            || style & STYLE_DECAL != 0
+                            || style & T6_CLOUD != 0) =>
+                {
+                    vec![
+                        self.view_layout.clone(),
+                        self.texture_layout.clone(),
+                        self.lighting_layout.clone(),
+                        self.soft_layout.clone(),
+                    ]
+                }
+                DiagnosticTess::PropTextured(style) if style & STYLE_SHINE != 0 => vec![
+                    self.view_layout.clone(),
+                    self.shine_texture_layout.clone(),
+                    self.lighting_layout.clone(),
+                    self.probe_layout.clone(),
+                ],
+                DiagnosticTess::WorldTextured(_) | DiagnosticTess::PropTextured(_) => vec![
+                    self.view_layout.clone(),
+                    self.texture_layout.clone(),
+                    self.lighting_layout.clone(),
+                ],
+                _ => vec![self.view_layout.clone()],
+            },
+            immediate_size: 0,
+            vertex: VertexState {
+                shader: self.shader.clone(),
+                shader_defs: defs.clone(),
+                entry_point: Some(match key.tess {
+                    DiagnosticTess::World | DiagnosticTess::WorldTextured(_) => "vertex".into(),
+                    DiagnosticTess::PropTextured(_) => "vertex_prop".into(),
+                    DiagnosticTess::Sky => "vertex_sky".into(),
+                    DiagnosticTess::Smodel | DiagnosticTess::XModel => "vertex_smodel".into(),
+                }),
+                buffers: match key.tess {
+                    DiagnosticTess::WorldTextured(style) if style_layers(style) => {
+                        vec![world_vertex_layout(), world_layer_vertex_layout()]
+                    }
+                    DiagnosticTess::World | DiagnosticTess::WorldTextured(_) => {
+                        vec![world_vertex_layout()]
+                    }
+                    DiagnosticTess::PropTextured(_) => {
+                        vec![smodel_vertex_layout(), prop_instance_layout()]
+                    }
+                    DiagnosticTess::Sky => Vec::new(),
+                    DiagnosticTess::Smodel | DiagnosticTess::XModel => {
+                        vec![smodel_vertex_layout(), smodel_instance_layout()]
+                    }
+                },
+            },
+            fragment: Some(FragmentState {
+                shader: self.shader.clone(),
+                shader_defs: defs,
+                entry_point: Some(match key.tess {
+                    DiagnosticTess::Sky => "fragment_sky".into(),
+                    DiagnosticTess::PropTextured(_) => "fragment_prop".into(),
+                    DiagnosticTess::WorldTextured(style) if style & STYLE_LIGHTMAPPED != 0 => {
+                        "fragment_lightmapped".into()
+                    }
+                    DiagnosticTess::WorldTextured(_) => "fragment_textured".into(),
+                    _ => "fragment".into(),
+                }),
+                targets: {
+                    let mut targets = vec![Some(ColorTargetState {
+                        format: key.target,
+                        blend: match key.tess {
+                            DiagnosticTess::WorldTextured(code) => t6_blend_state(code),
+                            DiagnosticTess::PropTextured(code) => prop_blend_state(code),
+                            _ => None,
+                        },
+                        // (In Ghosts' HDR scene the alpha is the world's bloom
+                        // mask: a blended draw leaves it; an opaque one writes
+                        // 0, none.)
+                        write_mask: match key.tess {
+                            DiagnosticTess::WorldTextured(code) | DiagnosticTess::PropTextured(code)
+                                if key.iw6_hdr
+                                    && (if matches!(key.tess, DiagnosticTess::PropTextured(_)) {
+                                        prop_blend_state(code)
+                                    } else {
+                                        t6_blend_state(code)
+                                    })
+                                    .is_some() =>
+                            {
+                                ColorWrites::COLOR
+                            }
+                            _ => ColorWrites::ALL,
+                        },
+                    })];
+                    if key.motion {
+                        targets.push(Some(ColorTargetState {
+                            format: MOTION_FORMAT,
+                            blend: None,
+                            write_mask: motion_write,
+                        }));
+                    }
+                    targets
+                },
+            }),
+            // bo2zm: the material's own cull (as the engine maps IW
+            // GFXS_CULL_*: back = wgpu back with clockwise front faces).
+            primitive: PrimitiveState {
+                front_face: FrontFace::Cw,
+                cull_mode: match key.tess {
+                    DiagnosticTess::WorldTextured(style) | DiagnosticTess::PropTextured(style) => {
+                        match (style >> 8) & 3 {
+                            1 => Some(Face::Back),
+                            2 => Some(Face::Front),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                },
+                ..Default::default()
+            },
+            depth_stencil: Some(DepthStencilState {
+                format: SCENE_DEPTH_FORMAT,
+                // bo2mp: water blends here (the game refracts instead) but
+                // stays solid in depth, as the game's: the sky, drawn last
+                // where nothing is, must not cover an open sea.
+                depth_write_enabled: Some(writes_depth),
+                depth_compare: Some(CompareFunction::GreaterEqual),
+                stencil: Default::default(),
+                // bo2zm: decals' polygon offset, the engine's IW defaults
+                // turned for reverse Z.
+                bias: match key.tess {
+                    DiagnosticTess::WorldTextured(style) | DiagnosticTess::PropTextured(style)
+                        if (style >> 10) & 3 != 0 =>
+                    {
+                        let (slope_scale, constant) =
+                            asset_iw4::polygon_offset_wgpu_defaults(u32::from((style >> 10) & 3));
+                        DepthBiasState {
+                            constant: -constant,
+                            slope_scale: -slope_scale,
+                            clamp: 0.0,
+                        }
+                    }
+                    _ => Default::default(),
+                },
+            }),
+            multisample: MultisampleState {
+                count: key.samples,
+                ..Default::default()
+            },
+            zero_initialize_workgroup_memory: false,
+        }
+    }
+}
+
+/// bo2zm: the colour blend for a Black Ops II draw code: alpha blend, add,
+/// or multiply what is behind; opaque has none.
+fn prop_blend_state(style: u32) -> Option<BlendState> {
+    // A screen-blended effect: INV_DEST_COLOR / ONE on the colour (the pixel
+    // shader outputs the colour times its alpha), the alpha kept.
+    if style & STYLE_SCREEN != 0 && style & 3 == 2 && style & T6_EFFECT != 0 {
+        return Some(BlendState {
+            color: BlendComponent {
+                src_factor: BlendFactor::OneMinusDst,
+                dst_factor: BlendFactor::One,
+                operation: BlendOperation::Add,
+            },
+            alpha: BlendComponent {
+                src_factor: BlendFactor::Zero,
+                dst_factor: BlendFactor::One,
+                operation: BlendOperation::Add,
+            },
+        });
+    }
+    t6_blend_state(style)
+}
+
+fn t6_blend_state(code: u32) -> Option<BlendState> {
+    let keep_alpha = BlendComponent {
+        src_factor: BlendFactor::Zero,
+        dst_factor: BlendFactor::One,
+        operation: BlendOperation::Add,
+    };
+    let color = match code & 3 {
+        1 => BlendComponent {
+            src_factor: BlendFactor::SrcAlpha,
+            dst_factor: BlendFactor::OneMinusSrcAlpha,
+            operation: BlendOperation::Add,
+        },
+        2 => BlendComponent {
+            src_factor: BlendFactor::SrcAlpha,
+            dst_factor: BlendFactor::One,
+            operation: BlendOperation::Add,
+        },
+        3 => BlendComponent {
+            src_factor: BlendFactor::Dst,
+            dst_factor: BlendFactor::Zero,
+            operation: BlendOperation::Add,
+        },
+        _ => return None,
+    };
+    Some(BlendState {
+        color,
+        alpha: keep_alpha,
+    })
+}
+
+#[derive(Component)]
+struct DiagnosticViewBindGroup {
+    bind_group: BindGroup,
+    /// bo2mp: the same with the motion flag that gives the first-person gun
+    /// and arms no motion.
+    viewmodel_bind_group: BindGroup,
+    world_pipeline: CachedRenderPipelineId,
+    /// bo2zm: the textured world and prop pipelines, by key.
+    t6_pipelines: HashMap<DiagnosticTess, CachedRenderPipelineId>,
+    sky_pipeline: CachedRenderPipelineId,
+    smodel_pipeline: CachedRenderPipelineId,
+    xmodel_pipeline: CachedRenderPipelineId,
+}
+
+fn world_vertex_layout() -> VertexBufferLayout {
+    VertexBufferLayout {
+        array_stride: size_of::<WorldVertex>() as u64,
+        step_mode: VertexStepMode::Vertex,
+        attributes: vec![
+            VertexAttribute {
+                format: VertexFormat::Float32x3,
+                offset: 0,
+                shader_location: 0,
+            },
+            VertexAttribute {
+                format: VertexFormat::Float32x3,
+                offset: 12,
+                shader_location: 1,
+            },
+            VertexAttribute {
+                format: VertexFormat::Float32x4,
+                offset: 24,
+                shader_location: 2,
+            },
+            VertexAttribute {
+                format: VertexFormat::Float32x4,
+                offset: 40,
+                shader_location: 3,
+            },
+            VertexAttribute {
+                format: VertexFormat::Float32x2,
+                offset: 56,
+                shader_location: 4,
+            },
+            VertexAttribute {
+                format: VertexFormat::Float32x2,
+                offset: 64,
+                shader_location: 5,
+            },
+        ],
+    }
+}
+
+/// bo2zm: a world vertex's layer 1 and 2 texcoords (location 6), from a
+/// second buffer parallel to the world vertices.
+fn world_layer_vertex_layout() -> VertexBufferLayout {
+    VertexBufferLayout {
+        array_stride: 16,
+        step_mode: VertexStepMode::Vertex,
+        attributes: vec![VertexAttribute {
+            format: VertexFormat::Float32x4,
+            offset: 0,
+            shader_location: 6,
+        }],
+    }
+}
+
+fn smodel_vertex_layout() -> VertexBufferLayout {
+    VertexBufferLayout {
+        array_stride: size_of::<SmodelVertex>() as u64,
+        step_mode: VertexStepMode::Vertex,
+        attributes: vec![
+            VertexAttribute {
+                format: VertexFormat::Float32x3,
+                offset: 0,
+                shader_location: 0,
+            },
+            VertexAttribute {
+                format: VertexFormat::Float32x3,
+                offset: 12,
+                shader_location: 1,
+            },
+            VertexAttribute {
+                format: VertexFormat::Float32x4,
+                offset: 24,
+                shader_location: 2,
+            },
+            VertexAttribute {
+                format: VertexFormat::Float32x2,
+                offset: 40,
+                shader_location: 3,
+            },
+        ],
+    }
+}
+
+fn smodel_instance_layout() -> VertexBufferLayout {
+    VertexBufferLayout {
+        array_stride: size_of::<DiagnosticSmodelInstance>() as u64,
+        step_mode: VertexStepMode::Instance,
+        attributes: (0..4)
+            .map(|column| VertexAttribute {
+                format: VertexFormat::Float32x4,
+                offset: u64::from(column) * 16,
+                shader_location: 6 + column,
+            })
+            .collect(),
+    }
+}
+
+/// bo2zm: a prop instance: world-from-local columns (locations 6..9), its
+/// light (location 10), then its primary light and visibility (11).
+fn prop_instance_layout() -> VertexBufferLayout {
+    let mut attributes: Vec<VertexAttribute> = (0..4)
+        .map(|column| VertexAttribute {
+            format: VertexFormat::Float32x4,
+            offset: u64::from(column) * 16,
+            shader_location: 6 + column,
+        })
+        .collect();
+    attributes.push(VertexAttribute {
+        format: VertexFormat::Float32x4,
+        offset: 64,
+        shader_location: 10,
+    });
+    attributes.push(VertexAttribute {
+        format: VertexFormat::Float32x4,
+        offset: 80,
+        shader_location: 11,
+    });
+    VertexBufferLayout {
+        array_stride: 96,
+        step_mode: VertexStepMode::Instance,
+        attributes,
+    }
+}
+
+fn init_pipeline(mut commands: Commands, asset_server: Res<AssetServer>) {
+    commands.insert_resource(DiagnosticPipeline {
+        view_layout: BindGroupLayoutDescriptor::new(
+            "iw4_geometry_diagnostic_view",
+            &BindGroupLayoutEntries::with_indices(
+                ShaderStages::VERTEX_FRAGMENT,
+                (
+                    (0, uniform_buffer::<ViewUniform>(true)),
+                    // bo2mp: the motion parameters (`MOTION` pipelines read
+                    // it; a spare buffer stands in otherwise).
+                    (
+                        1,
+                        uniform_buffer_sized(false, std::num::NonZeroU64::new(MOTION_PARAMS_BYTES)),
+                    ),
+                ),
+            ),
+        ),
+        texture_layout: BindGroupLayoutDescriptor::new(
+            "bo2zm_geometry_diagnostic_colour_map",
+            &BindGroupLayoutEntries::sequential(
+                ShaderStages::FRAGMENT,
+                (
+                    texture_2d(TextureSampleType::Float { filterable: true }),
+                    sampler(SamplerBindingType::Filtering),
+                ),
+            ),
+        ),
+        sky_layout: BindGroupLayoutDescriptor::new(
+            "bo2zm_geometry_diagnostic_sky",
+            &BindGroupLayoutEntries::with_indices(
+                ShaderStages::FRAGMENT,
+                (
+                    (3, texture_cube(TextureSampleType::Float { filterable: true })),
+                    (4, sampler(SamplerBindingType::Filtering)),
+                    (5, uniform_buffer_sized(false, std::num::NonZeroU64::new(T6_LIGHTING_BYTES))),
+                    (
+                        6,
+                        uniform_buffer_sized(false, std::num::NonZeroU64::new(T6_LIGHTS_BYTES)),
+                    ),
+                    (12, texture_2d(TextureSampleType::Float { filterable: true })),
+                    (13, sampler(SamplerBindingType::Filtering)),
+                ),
+            ),
+        ),
+        lightmap_layout: BindGroupLayoutDescriptor::new(
+            "bo2zm_geometry_diagnostic_lightmap",
+            &BindGroupLayoutEntries::sequential(
+                ShaderStages::FRAGMENT,
+                (
+                    texture_2d(TextureSampleType::Float { filterable: true }),
+                    sampler(SamplerBindingType::Filtering),
+                    uniform_buffer_sized(false, std::num::NonZeroU64::new(T6_LIGHTING_BYTES)),
+                    uniform_buffer_sized(false, std::num::NonZeroU64::new(T6_LIGHTS_BYTES)),
+                    uniform_buffer_sized(false, std::num::NonZeroU64::new(T6_DYN_BYTES))
+                        .visibility(ShaderStages::VERTEX_FRAGMENT),
+                    texture_2d_array(TextureSampleType::Depth),
+                    sampler(SamplerBindingType::Comparison),
+                    uniform_buffer_sized(false, std::num::NonZeroU64::new(sun_shadow::PARAMS_BYTES)),
+                    texture_2d(TextureSampleType::Float { filterable: true }),
+                    sampler(SamplerBindingType::Filtering),
+                ),
+            ),
+        ),
+        layered_texture_layout: BindGroupLayoutDescriptor::new(
+            "bo2zm_geometry_diagnostic_layered_colour_maps",
+            &BindGroupLayoutEntries::with_indices(
+                ShaderStages::FRAGMENT,
+                (
+                    (0, texture_2d(TextureSampleType::Float { filterable: true })),
+                    (1, sampler(SamplerBindingType::Filtering)),
+                    (6, texture_2d(TextureSampleType::Float { filterable: true })),
+                    (7, texture_2d(TextureSampleType::Float { filterable: true })),
+                ),
+            ),
+        ),
+        lighting_layout: BindGroupLayoutDescriptor::new(
+            "bo2zm_geometry_diagnostic_lighting",
+            &BindGroupLayoutEntries::with_indices(
+                ShaderStages::FRAGMENT,
+                (
+                    (2, uniform_buffer_sized(false, std::num::NonZeroU64::new(T6_LIGHTING_BYTES))),
+                    (
+                        3,
+                        uniform_buffer_sized(false, std::num::NonZeroU64::new(T6_LIGHTS_BYTES)),
+                    ),
+                    (
+                        4,
+                        // (bo2mp: the vertex stage reads the game time and
+                        // the wind from it: waving cloth.)
+                        uniform_buffer_sized(false, std::num::NonZeroU64::new(T6_DYN_BYTES))
+                            .visibility(ShaderStages::VERTEX_FRAGMENT),
+                    ),
+                    (5, texture_2d_array(TextureSampleType::Depth)),
+                    (6, sampler(SamplerBindingType::Comparison)),
+                    (
+                        7,
+                        uniform_buffer_sized(
+                            false,
+                            std::num::NonZeroU64::new(sun_shadow::PARAMS_BYTES),
+                        ),
+                    ),
+                    (8, texture_2d(TextureSampleType::Float { filterable: true })),
+                    (9, sampler(SamplerBindingType::Filtering)),
+                ),
+            ),
+        ),
+        shine_texture_layout: BindGroupLayoutDescriptor::new(
+            "bo2zm_geometry_diagnostic_shine_maps",
+            &BindGroupLayoutEntries::with_indices(
+                ShaderStages::FRAGMENT,
+                (
+                    (0, texture_2d(TextureSampleType::Float { filterable: true })),
+                    (1, sampler(SamplerBindingType::Filtering)),
+                    (8, texture_2d(TextureSampleType::Float { filterable: true })),
+                    (9, texture_2d(TextureSampleType::Float { filterable: true })),
+                    (
+                        10,
+                        texture_2d(TextureSampleType::Float { filterable: true }),
+                    ),
+                ),
+            ),
+        ),
+        layered_shine_texture_layout: BindGroupLayoutDescriptor::new(
+            "bo2mp_geometry_diagnostic_layered_shine_maps",
+            &BindGroupLayoutEntries::with_indices(
+                ShaderStages::FRAGMENT,
+                (
+                    (0, texture_2d(TextureSampleType::Float { filterable: true })),
+                    (1, sampler(SamplerBindingType::Filtering)),
+                    (6, texture_2d(TextureSampleType::Float { filterable: true })),
+                    (7, texture_2d(TextureSampleType::Float { filterable: true })),
+                    (8, texture_2d(TextureSampleType::Float { filterable: true })),
+                    (9, texture_2d(TextureSampleType::Float { filterable: true })),
+                    (10, texture_2d(TextureSampleType::Float { filterable: true })),
+                    (11, texture_2d(TextureSampleType::Float { filterable: true })),
+                ),
+            ),
+        ),
+        soft_layout: BindGroupLayoutDescriptor::new(
+            "bo2zm_geometry_diagnostic_soft_depth",
+            &BindGroupLayoutEntries::with_indices(ShaderStages::FRAGMENT, ((0, texture_depth_2d()),)),
+        ),
+        probe_layout: BindGroupLayoutDescriptor::new(
+            "bo2zm_geometry_diagnostic_probes",
+            &BindGroupLayoutEntries::with_indices(
+                ShaderStages::FRAGMENT,
+                (
+                    (0, texture_cube_array(TextureSampleType::Float { filterable: true })),
+                    (1, sampler(SamplerBindingType::Filtering)),
+                    (2, uniform_buffer_sized(false, std::num::NonZeroU64::new(T6_PROBES_BYTES))),
+                ),
+            ),
+        ),
+        shader: asset_server.load(SHADER_PATH),
+    });
+}
+
+fn upload_geometry(
+    source: Res<ExtractedDiagnosticGeometry>,
+    mut geometry: ResMut<DiagnosticGeometry>,
+    device: Res<RenderDevice>,
+    mut bloom: ResMut<super::bo2_bloom::Bo2BloomEnabled>,
+) {
+    if !geometry_diagnostic_enabled() {
+        return;
+    }
+    // bo2zm: BO2's bloom and final colour on a Black Ops II map (it has T6
+    // lighting). (`CODLEGACY_T6_NO_BLOOM` turns the bloom off, not the colour.)
+    bloom.0 = source.t6_lighting.is_some() && source.t6_bloom;
+    if source.overlay_gpu_wait {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static SKIPPED: AtomicBool = AtomicBool::new(false);
+        if !SKIPPED.swap(true, Ordering::Relaxed) {
+            diag::info!(
+                World,
+                "geometry diagnostic GPU upload skipped: overlay GPU residency wait"
+            );
+        }
+        return;
+    }
+    let geometry_matches = geometry.world_vertex_count == source.world_vertices.len()
+        && geometry.world_index_count == source.world_indices.len()
+        && geometry.smodel_vertex_count == source.smodel_vertices.len()
+        && geometry.smodel_index_count == source.smodel_indices.len();
+    if geometry.generation == source.generation && geometry_matches {
+        geometry.world_surface_ranges = Arc::clone(&source.world_surface_ranges);
+        geometry.smodel_surface_ranges = Arc::clone(&source.smodel_surface_ranges);
+    } else {
+        geometry.generation = source.generation;
+        geometry.world_vertex = None;
+        geometry.world_index = None;
+        geometry.world_surface_ranges = Arc::new(Vec::new());
+        geometry.smodel_vertex = None;
+        geometry.smodel_index = None;
+        geometry.smodel_surface_ranges = Arc::new(Vec::new());
+        geometry.world_vertex_count = source.world_vertices.len();
+        geometry.world_index_count = source.world_indices.len();
+        geometry.smodel_vertex_count = source.smodel_vertices.len();
+        geometry.smodel_index_count = source.smodel_indices.len();
+        if !source.world_vertices.is_empty() && !source.world_indices.is_empty() {
+            geometry.world_vertex = Some(device.create_buffer_with_data(&BufferInitDescriptor {
+                label: Some("iw4_geometry_diagnostic_world_vb"),
+                contents: bytemuck::cast_slice(source.world_vertices.as_slice()),
+                usage: BufferUsages::VERTEX,
+            }));
+            geometry.world_index = Some(device.create_buffer_with_data(&BufferInitDescriptor {
+                label: Some("iw4_geometry_diagnostic_world_ib"),
+                contents: bytemuck::cast_slice(source.world_indices.as_slice()),
+                usage: BufferUsages::INDEX,
+            }));
+            geometry.world_surface_ranges = Arc::clone(&source.world_surface_ranges);
+        }
+        if !source.smodel_vertices.is_empty() && !source.smodel_indices.is_empty() {
+            geometry.smodel_vertex = Some(device.create_buffer_with_data(&BufferInitDescriptor {
+                label: Some("iw4_geometry_diagnostic_smodel_vb"),
+                contents: bytemuck::cast_slice(source.smodel_vertices.as_slice()),
+                usage: BufferUsages::VERTEX,
+            }));
+            geometry.smodel_index = Some(device.create_buffer_with_data(&BufferInitDescriptor {
+                label: Some("iw4_geometry_diagnostic_smodel_ib"),
+                contents: bytemuck::cast_slice(source.smodel_indices.as_slice()),
+                usage: BufferUsages::INDEX,
+            }));
+            geometry.smodel_surface_ranges = Arc::clone(&source.smodel_surface_ranges);
+        }
+    }
+
+    let xmodel_matches = geometry.xmodel_revision == source.xmodel_revision
+        && geometry.xmodel_vertex_count == source.xmodel_vertices.len()
+        && geometry.xmodel_index_count == source.xmodel_indices.len();
+    if xmodel_matches {
+        geometry.xmodel_surface_ranges = Arc::clone(&source.xmodel_surface_ranges);
+    } else {
+        geometry.xmodel_vertex = None;
+        geometry.xmodel_index = None;
+        geometry.xmodel_surface_ranges = Arc::new(Vec::new());
+        geometry.xmodel_vertex_count = source.xmodel_vertices.len();
+        geometry.xmodel_index_count = source.xmodel_indices.len();
+        geometry.xmodel_revision = source.xmodel_revision;
+        if !source.xmodel_vertices.is_empty() && !source.xmodel_indices.is_empty() {
+            geometry.xmodel_vertex = Some(device.create_buffer_with_data(&BufferInitDescriptor {
+                label: Some("iw4_geometry_diagnostic_xmodel_vb"),
+                contents: bytemuck::cast_slice(source.xmodel_vertices.as_slice()),
+                usage: BufferUsages::VERTEX,
+            }));
+            geometry.xmodel_index = Some(device.create_buffer_with_data(&BufferInitDescriptor {
+                label: Some("iw4_geometry_diagnostic_xmodel_ib"),
+                contents: bytemuck::cast_slice(source.xmodel_indices.as_slice()),
+                usage: BufferUsages::INDEX,
+            }));
+            geometry.xmodel_surface_ranges = Arc::clone(&source.xmodel_surface_ranges);
+        }
+    }
+    geometry.g0_world_surfs.clone_from(&source.g0_world_surfs);
+    geometry.world_surface_color = Arc::clone(&source.world_surface_color);
+    if !Arc::ptr_eq(&geometry.world_surface_draw, &source.world_surface_draw)
+        || !Arc::ptr_eq(&geometry.t6_props, &source.t6_props)
+    {
+        geometry.t6_styles = t6_styles(&source.world_surface_draw, &source.t6_props);
+        let mut blended: Vec<usize> = (0..source.t6_props.len())
+            .filter(|&i| t6_blended(source.t6_props[i][2]))
+            .collect();
+        blended.sort_by_key(|&i| t6_sort_key(source.t6_props[i][2]));
+        geometry.t6_blended_props = blended;
+    }
+    geometry.world_surface_draw = Arc::clone(&source.world_surface_draw);
+    geometry.world_surface_lightmap = Arc::clone(&source.world_surface_lightmap);
+    geometry.t6_lighting = source.t6_lighting;
+    geometry.t6_sun_sample_size_near = source.t6_sun_sample_size_near;
+    geometry.t6_props = Arc::clone(&source.t6_props);
+    geometry.t6_prop_shine = Arc::clone(&source.t6_prop_shine);
+    geometry.world_surface_primary = Arc::clone(&source.world_surface_primary);
+    geometry.world_surface_layers = Arc::clone(&source.world_surface_layers);
+    geometry.world_surface_shine = Arc::clone(&source.world_surface_shine);
+    geometry.t6_probe_slot = source.t6_probe_slot;
+    geometry.t6_probes = Arc::clone(&source.t6_probes);
+    geometry.t6_lut = source.t6_lut.clone();
+    if !Arc::ptr_eq(&geometry.world_layer_uvs, &source.world_layer_uvs) {
+        geometry.world_layer_uvs = Arc::clone(&source.world_layer_uvs);
+        geometry.world_layer_vertex = (!source.world_layer_uvs.is_empty()
+            && source.world_layer_uvs.len() == source.world_vertices.len())
+        .then(|| {
+            device.create_buffer_with_data(&BufferInitDescriptor {
+                label: Some("bo2zm_world_layer_uvs"),
+                contents: bytemuck::cast_slice(source.world_layer_uvs.as_slice()),
+                usage: BufferUsages::VERTEX,
+            })
+        });
+    }
+    geometry.t6_lights = Arc::clone(&source.t6_lights);
+    geometry.t6_sky_slot = source.t6_sky_slot;
+    if !Arc::ptr_eq(&geometry.t6_prop_instances, &source.t6_prop_instances) {
+        geometry.t6_prop_instances = Arc::clone(&source.t6_prop_instances);
+        geometry.t6_prop_instance_buffer = (!source.t6_prop_instances.is_empty()).then(|| {
+            let rows: Vec<[f32; 24]> =
+                source.t6_prop_instances.iter().copied().map(t6_prop_gpu_row).collect();
+            device.create_buffer_with_data(&BufferInitDescriptor {
+                label: Some("bo2zm_prop_instances"),
+                contents: bytemuck::cast_slice(rows.as_slice()),
+                usage: BufferUsages::VERTEX,
+            })
+        });
+    }
+    let spheres_key = [
+        Arc::as_ptr(&source.smodel_vertices) as usize,
+        Arc::as_ptr(&source.smodel_indices) as usize,
+        Arc::as_ptr(&source.smodel_surface_ranges) as usize,
+        Arc::as_ptr(&source.t6_props) as usize,
+        Arc::as_ptr(&source.t6_prop_instances) as usize,
+    ];
+    if geometry.t6_prop_spheres_key != spheres_key {
+        geometry.t6_prop_spheres_key = spheres_key;
+        geometry.t6_prop_spheres = t6_prop_spheres(
+            &source.smodel_vertices,
+            &source.smodel_indices,
+            &source.smodel_surface_ranges,
+            &source.t6_props,
+            &source.t6_prop_instances,
+        );
+    }
+}
+
+/// bo2mp: a map prop's row as the GPU sees it. Slot 22 holds the prop's
+/// cull distance, which only the CPU reads (the distance cull); the shader
+/// reads slot 22 as a gun's camo code (1000 + tiling, 3000/5000 + repeat,
+/// 10000s a special camo), so a prop culled at 1000 or more drew as a camo
+/// (nt_2020's flat gray bus and truck, dark hedges, overflow's purple swirl).
+fn t6_prop_gpu_row(mut row: [f32; 24]) -> [f32; 24] {
+    row[22] = 0.0;
+    row
+}
+
+/// bo2mp: each prop draw's sphere in the world, from its surface's own
+/// vertices and its placement, so the draws outside the view are skipped.
+fn t6_prop_spheres(
+    vertices: &[SmodelVertex],
+    indices: &[u32],
+    ranges: &[(u32, u32)],
+    props: &[[u32; 4]],
+    instances: &[[f32; 24]],
+) -> Vec<[f32; 4]> {
+    const UNKNOWN: [f32; 4] = [0.0, 0.0, 0.0, -1.0];
+    let mut local: Vec<Option<[f32; 4]>> = vec![None; ranges.len()];
+    props
+        .iter()
+        .map(|&[surface, _, _, instance]| {
+            let (Some(&(start, count)), Some(row)) =
+                (ranges.get(surface as usize), instances.get(instance as usize))
+            else {
+                return UNKNOWN;
+            };
+            let sphere = *local[surface as usize].get_or_insert_with(|| {
+                let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+                let end = (start as usize).saturating_add(count as usize).min(indices.len());
+                for &index in indices.get(start as usize..end).unwrap_or(&[]) {
+                    if let Some(vertex) = vertices.get(index as usize) {
+                        let p = Vec3::from(vertex.position);
+                        lo = lo.min(p);
+                        hi = hi.max(p);
+                    }
+                }
+                if lo.x > hi.x {
+                    return UNKNOWN;
+                }
+                let centre = (lo + hi) * 0.5;
+                [centre.x, centre.y, centre.z, (hi - centre).length()]
+            });
+            if sphere[3] < 0.0 {
+                return UNKNOWN;
+            }
+            let world_from_local = Mat4::from_cols_slice(&row[..16]);
+            let centre = world_from_local.transform_point3(Vec3::new(sphere[0], sphere[1], sphere[2]));
+            let scale = world_from_local
+                .x_axis
+                .truncate()
+                .length()
+                .max(world_from_local.y_axis.truncate().length())
+                .max(world_from_local.z_axis.truncate().length());
+            let radius = sphere[3] * scale;
+            if !centre.is_finite() || !radius.is_finite() {
+                return UNKNOWN;
+            }
+            [centre.x, centre.y, centre.z, radius]
+        })
+        .collect()
+}
+
+/// bo2mp: the view's four sides and the plane through the eye, facing in.
+fn t6_view_planes(clip_from_world: Mat4) -> Option<[Vec4; 5]> {
+    let (x, y, w) = (clip_from_world.row(0), clip_from_world.row(1), clip_from_world.row(3));
+    let mut planes = [w + x, w - x, w + y, w - y, w];
+    for plane in &mut planes {
+        let len = plane.truncate().length();
+        if !len.is_finite() || len <= f32::EPSILON {
+            return None;
+        }
+        *plane /= len;
+    }
+    Some(planes)
+}
+
+/// The held shapes' chunks not on the GPU yet, written after the others;
+/// all of them into bigger buffers when they do not fit, or when a new
+/// gathering began.
+fn upload_static_geometry(
+    device: &RenderDevice,
+    queue: &RenderQueue,
+    have: &mut Option<StaticGeometry>,
+    s: &T6StaticDraw,
+) {
+    let vertex_size = std::mem::size_of::<SmodelVertex>() as u64;
+    let bytes = |chunks: &[Arc<(Vec<SmodelVertex>, Vec<u32>)>]| {
+        chunks.iter().fold((0u64, 0u64), |(v, i), c| {
+            (v + c.0.len() as u64 * vertex_size, i + c.1.len() as u64 * 4)
+        })
+    };
+    let (vertex_bytes, index_bytes) = bytes(&s.chunks);
+    let from = match have.as_ref() {
+        Some(g)
+            if g.epoch == s.epoch
+                && g.chunks <= s.chunks.len()
+                && vertex_bytes <= g.vb.size()
+                && index_bytes <= g.ib.size() =>
+        {
+            g.chunks
+        }
+        _ => {
+            // Room for the shapes to double before the next new buffers.
+            let buffer = |usage: BufferUsages, need: u64| {
+                device.create_buffer(&bevy::render::render_resource::BufferDescriptor {
+                    label: Some("bo2zm_script_static"),
+                    size: (need * 2).max(1 << 20).next_multiple_of(4),
+                    usage: usage | BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            };
+            *have = Some(StaticGeometry {
+                epoch: s.epoch,
+                chunks: 0,
+                vertex_bytes: 0,
+                index_bytes: 0,
+                vb: buffer(BufferUsages::VERTEX, vertex_bytes),
+                ib: buffer(BufferUsages::INDEX, index_bytes),
+            });
+            0
+        }
+    };
+    let Some(g) = have.as_mut() else { return };
+    for chunk in &s.chunks[from..] {
+        if !chunk.0.is_empty() {
+            queue.write_buffer(&g.vb, g.vertex_bytes, bytemuck::cast_slice(chunk.0.as_slice()));
+        }
+        if !chunk.1.is_empty() {
+            queue.write_buffer(&g.ib, g.index_bytes, bytemuck::cast_slice(chunk.1.as_slice()));
+        }
+        g.vertex_bytes += chunk.0.len() as u64 * vertex_size;
+        g.index_bytes += chunk.1.len() as u64 * 4;
+    }
+    g.chunks = s.chunks.len();
+}
+
+/// bo2zm: this frame's moving things into GPU buffers.
+fn upload_dynamic(
+    source: Option<Res<ExtractedT6Dynamic>>,
+    mut dynamic: ResMut<DiagnosticDynamic>,
+    device: Res<RenderDevice>,
+    queue: Res<RenderQueue>,
+    skin_pipeline: Option<Res<skin::SkinPipeline>>,
+    mut skin_cache: ResMut<skin::SkinCache>,
+    mut pending: ResMut<bevy::render::renderer::PendingCommandBuffers>,
+) {
+    let source = source.as_deref();
+    let dynamic = &mut *dynamic;
+    if source
+        .and_then(|s| s.missiles.as_ref())
+        .is_none_or(|m| m.skinned.is_none())
+    {
+        skin_cache.idle();
+    }
+    let [marks, viewmodel, missiles, effects, viewmodel_effects, held] = &mut dynamic.kept;
+    dynamic.marks = upload_dynamic_draw(
+        &device,
+        &queue,
+        marks,
+        "bo2zm_marks",
+        source.and_then(|s| s.marks.as_ref()),
+        None,
+    );
+    dynamic.viewmodel = upload_dynamic_draw(
+        &device,
+        &queue,
+        viewmodel,
+        "bo2zm_viewmodel",
+        source.and_then(|s| s.viewmodel.as_ref()),
+        None,
+    );
+    dynamic.missiles = upload_dynamic_draw(
+        &device,
+        &queue,
+        missiles,
+        "bo2zm_missiles",
+        source.and_then(|s| s.missiles.as_ref()),
+        skin_pipeline
+            .as_deref()
+            .map(|p| (p, &mut *skin_cache, &mut *pending)),
+    );
+    dynamic.script_static = match source.and_then(|s| s.script_static.as_ref()) {
+        Some(s) if !s.draws.is_empty() && !s.instances.is_empty() && !s.chunks.is_empty() => {
+            let _span = bevy::log::info_span!(target: "codlegacy", "t6 held upload").entered();
+            upload_static_geometry(&device, &queue, &mut dynamic.script_static_geometry, s);
+            let inst = held.write(
+                &device,
+                &queue,
+                "bo2zm_script_static",
+                2,
+                BufferUsages::VERTEX,
+                bytemuck::cast_slice(s.instances.as_slice()),
+            );
+            dynamic.script_static_geometry.as_ref().map(|g| {
+                let draws = draws_within("bo2zm_script_static", &s.draws, g.index_bytes / 4);
+                (g.vb.clone(), g.ib.clone(), inst, draws)
+            })
+        }
+        _ => None,
+    };
+    dynamic.effects = upload_dynamic_draw(
+        &device,
+        &queue,
+        effects,
+        "bo2zm_effects",
+        source.and_then(|s| s.effects.as_ref()),
+        None,
+    );
+    dynamic.viewmodel_effects = upload_dynamic_draw(
+        &device,
+        &queue,
+        viewmodel_effects,
+        "bo2zm_viewmodel_effects",
+        source.and_then(|s| s.viewmodel_effects.as_ref()),
+        None,
+    );
+    // bo2mp test aid: `CODLEGACY_T6_SKIP_LIST=marks,missiles,static,effects`
+    // leaves those dynamic lists out (bisecting a stray surface).
+    static SKIP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let skip =
+        SKIP.get_or_init(|| codlegacy_env::var("CODLEGACY_T6_SKIP_LIST").unwrap_or_default());
+    for name in skip.split(',') {
+        match name {
+            "marks" => dynamic.marks = None,
+            "missiles" => dynamic.missiles = None,
+            "static" => dynamic.script_static = None,
+            "effects" => dynamic.effects = None,
+            _ => {}
+        }
+    }
+}
+
+/// bo2zm: bind groups for the lightmap pages the world surfaces read, with
+/// the T6 lighting constants; a page whose view has not uploaded yet is
+/// tried again next frame.
+fn prepare_world_lightmaps(
+    pipeline: Option<Res<DiagnosticPipeline>>,
+    geometry: Res<DiagnosticGeometry>,
+    registry: Option<Res<RuntimeUploadedImageRegistry>>,
+    cache: Res<PipelineCache>,
+    device: Res<RenderDevice>,
+    queue: Res<RenderQueue>,
+    mut lightmaps: ResMut<DiagnosticWorldLightmaps>,
+    dynamic_source: Option<Res<ExtractedT6Dynamic>>,
+    shadow: Option<Res<sun_shadow::SunShadow>>,
+) {
+    if !geometry_diagnostic_enabled() {
+        return;
+    }
+    let (Some(pipeline), Some(registry), Some(lighting), Some(shadow)) =
+        (pipeline, registry, geometry.t6_lighting, shadow)
+    else {
+        return;
+    };
+    // bo2zm: the lights effects throw this frame.
+    let dyn_lights = lightmaps
+        .dyn_lights
+        .get_or_insert_with(|| {
+            device.create_buffer_with_data(&BufferInitDescriptor {
+                label: Some("bo2zm_effect_lights"),
+                contents: &[0u8; T6_DYN_BYTES as usize],
+                usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            })
+        })
+        .clone();
+    {
+        let mut table = vec![0.0f32; T6_DYN_BYTES as usize / 4];
+        let lights = dynamic_source.as_ref().map_or(&[][..], |d| d.dlights.as_slice());
+        let n = lights.len().min(T6_DYN_LIGHTS);
+        table[0] = n as f32;
+        // The shaders' game time in seconds (BO2's gameTime): the objective
+        // glow pulses by it.
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        table[1] = (START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64() % 3600.0) as f32;
+        // bo2mp: the wind's direction over the ground (x, y), for waving
+        // cloth and foliage (`BO2MP_WIND_DEG`: degrees from +x; default 35).
+        let wind = wind_direction();
+        table[2] = wind[0];
+        table[3] = wind[1];
+        for (i, light) in lights.iter().take(n).enumerate() {
+            table[4 + i * 8..4 + i * 8 + 8].copy_from_slice(light);
+        }
+        queue.write_buffer(&dyn_lights, 0, bytemuck::cast_slice(&table));
+    }
+    if lightmaps.generation != registry.generation_id {
+        lightmaps.bind_groups.clear();
+        lightmaps.sky = None;
+        lightmaps.lighting_group = None;
+        lightmaps.generation = registry.generation_id;
+    }
+    let constants = lightmaps
+        .constants
+        .get_or_insert_with(|| {
+            device.create_buffer_with_data(&BufferInitDescriptor {
+                label: Some("bo2zm_world_lighting"),
+                contents: bytemuck::cast_slice(&lighting),
+                usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            })
+        })
+        .clone();
+    if lightmaps.written != Some(lighting) {
+        queue.write_buffer(&constants, 0, bytemuck::cast_slice(&lighting));
+        lightmaps.written = Some(lighting);
+    }
+    let lights = lightmaps
+        .lights
+        .get_or_insert_with(|| {
+            device.create_buffer_with_data(&BufferInitDescriptor {
+                label: Some("bo2zm_primary_lights"),
+                contents: &[0u8; T6_LIGHTS_BYTES as usize],
+                usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            })
+        })
+        .clone();
+    if lightmaps
+        .lights_written
+        .as_ref()
+        .is_none_or(|have| !Arc::ptr_eq(have, &geometry.t6_lights))
+    {
+        let mut table = vec![[0.0f32; 16]; T6_LIGHT_ROWS];
+        for (row, light) in table.iter_mut().zip(geometry.t6_lights.iter()) {
+            *row = *light;
+        }
+        queue.write_buffer(&lights, 0, bytemuck::cast_slice(&table));
+        lightmaps.lights_written = Some(Arc::clone(&geometry.t6_lights));
+    }
+    let sampler = lightmaps
+        .sampler
+        .get_or_insert_with(|| {
+            device.create_sampler(&SamplerDescriptor {
+                label: Some("bo2zm_world_lightmap_sampler"),
+                address_mode_u: AddressMode::ClampToEdge,
+                address_mode_v: AddressMode::ClampToEdge,
+                address_mode_w: AddressMode::ClampToEdge,
+                mag_filter: FilterMode::Linear,
+                min_filter: FilterMode::Linear,
+                ..Default::default()
+            })
+        })
+        .clone();
+    // bo2zm: the world's colour tables (read with that sampler, linear and
+    // clamped); every group holding them is remade when the map changes.
+    if lightmaps.lut.as_ref().is_none_or(|(have, _)| match (have, &geometry.t6_lut) {
+        (Some(a), Some(b)) => !Arc::ptr_eq(a, b),
+        (None, None) => false,
+        _ => true,
+    }) {
+        use bevy::render::render_resource::{TextureDescriptor, TextureUsages, TextureViewDescriptor};
+        use bevy::render::render_resource::{Extent3d, TextureDimension};
+        let (width, height, texels) = match geometry.t6_lut.as_deref() {
+            Some(lut) if lut.rgba.len() == (lut.width * lut.height * 4) as usize => {
+                (lut.width, lut.height, lut.rgba.as_slice())
+            }
+            _ => (1, 1, &[255u8, 255, 255, 255][..]),
+        };
+        let texture = device.create_texture_with_data(
+            &queue,
+            &TextureDescriptor {
+                label: Some("bo2zm_world_lut"),
+                size: Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format: TextureFormat::Rgba8Unorm,
+                usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+                view_formats: &[],
+            },
+            bevy::render::render_resource::TextureDataOrder::LayerMajor,
+            texels,
+        );
+        lightmaps.lut = Some((
+            geometry.t6_lut.clone(),
+            texture.create_view(&TextureViewDescriptor::default()),
+        ));
+        lightmaps.bind_groups.clear();
+        lightmaps.sky = None;
+        lightmaps.lighting_group = None;
+    }
+    let Some(lut) = lightmaps.lut.as_ref().map(|(_, view)| view.clone()) else {
+        return;
+    };
+    if lightmaps.lighting_group.is_none() {
+        lightmaps.lighting_group = Some(device.create_bind_group(
+            "bo2zm_world_lighting_only",
+            &cache.get_bind_group_layout(&pipeline.lighting_layout),
+            &BindGroupEntries::with_indices((
+                (2, constants.as_entire_binding()),
+                (3, lights.as_entire_binding()),
+                (4, dyn_lights.as_entire_binding()),
+                (5, &shadow.array),
+                (6, &shadow.sampler),
+                (7, shadow.params.as_entire_binding()),
+                (8, &lut),
+                (9, &sampler),
+            )),
+        ));
+    }
+    if let Some(slot) = geometry.t6_sky_slot
+        && lightmaps.sky.as_ref().is_none_or(|(have, _)| *have != slot)
+        && let Some(Some(Ok(view))) = registry.material_images.get(slot as usize)
+        && view.dimension == TextureViewDimension::Cube
+    {
+        let sky_sampler = device.create_sampler(&SamplerDescriptor {
+            label: Some("bo2zm_sky_sampler"),
+            mag_filter: FilterMode::Linear,
+            min_filter: FilterMode::Linear,
+            mipmap_filter: MipmapFilterMode::Linear,
+            ..Default::default()
+        });
+        let sky = device.create_bind_group(
+            "bo2zm_sky",
+            &cache.get_bind_group_layout(&pipeline.sky_layout),
+            &BindGroupEntries::with_indices((
+                (3, &view.view),
+                (4, &sky_sampler),
+                (5, constants.as_entire_binding()),
+                (6, lights.as_entire_binding()),
+                (12, &lut),
+                (13, &sampler),
+            )),
+        );
+        lightmaps.sky = Some((slot, sky));
+    }
+    let layout = cache.get_bind_group_layout(&pipeline.lightmap_layout);
+    for &page in geometry.world_surface_lightmap.iter() {
+        if page == u8::MAX || lightmaps.bind_groups.contains_key(&page) {
+            continue;
+        }
+        let Some(Some(views)) = registry.lightmaps.get(usize::from(page)) else {
+            continue;
+        };
+        let Ok(view) = views.secondary.as_ref() else {
+            continue;
+        };
+        let bind_group = device.create_bind_group(
+            "bo2zm_world_lightmap",
+            &layout,
+            &BindGroupEntries::sequential((
+                view,
+                &sampler,
+                constants.as_entire_binding(),
+                lights.as_entire_binding(),
+                dyn_lights.as_entire_binding(),
+                &shadow.array,
+                &shadow.sampler,
+                shadow.params.as_entire_binding(),
+                &lut,
+                &sampler,
+            )),
+        );
+        lightmaps.bind_groups.insert(page, bind_group);
+    }
+}
+
+/// bo2zm: bind groups for the colour maps the world surfaces sample, from the
+/// uploaded material images; a slot whose image has not uploaded yet is
+/// tried again next frame.
+fn prepare_world_textures(
+    pipeline: Option<Res<DiagnosticPipeline>>,
+    geometry: Res<DiagnosticGeometry>,
+    registry: Option<Res<RuntimeUploadedImageRegistry>>,
+    cache: Res<PipelineCache>,
+    device: Res<RenderDevice>,
+    queue: Res<RenderQueue>,
+    mut textures: ResMut<DiagnosticWorldTextures>,
+    dynamic: Option<Res<ExtractedT6Dynamic>>,
+) {
+    if !geometry_diagnostic_enabled() {
+        return;
+    }
+    let (Some(pipeline), Some(registry)) = (pipeline, registry) else {
+        return;
+    };
+    // bo2mp: on a map from another game the gun's and players' colour maps
+    // (`dynamic`) may be all there is to bind.
+    if geometry.world_surface_color.iter().all(|&slot| slot == u32::MAX)
+        && geometry.t6_props.is_empty()
+        && dynamic.as_ref().is_none_or(|d| d.materials.is_empty())
+    {
+        return;
+    }
+    if textures.generation != registry.generation_id {
+        textures.bind_groups.clear();
+        textures.layered.clear();
+        textures.shine.clear();
+        textures.layered_shine.clear();
+        textures.probes = None;
+        textures.generation = registry.generation_id;
+    }
+    // bo2zm: his texture filtering row changed: a new sampler, new bind
+    // groups.
+    let aniso = asset_core::t6_aniso().min(if asset_core::t6_fast() { 4 } else { 16 });
+    if textures.aniso != aniso {
+        textures.bind_groups.clear();
+        textures.layered.clear();
+        textures.shine.clear();
+        textures.layered_shine.clear();
+        textures.probes = None;
+        textures.sampler = None;
+        textures.aniso = aniso;
+    }
+    let sampler = textures
+        .sampler
+        .get_or_insert_with(|| {
+            device.create_sampler(&SamplerDescriptor {
+                label: Some("bo2zm_world_colour_sampler"),
+                address_mode_u: AddressMode::Repeat,
+                address_mode_v: AddressMode::Repeat,
+                address_mode_w: AddressMode::Repeat,
+                mag_filter: FilterMode::Linear,
+                min_filter: FilterMode::Linear,
+                mipmap_filter: MipmapFilterMode::Linear,
+                // bo2zm: 16x, 4x at the fast quality setting.
+                // bo2zm: his texture filtering (low 1x, medium 4x, high
+                // 16x), 4x at most at the fast quality setting.
+                anisotropy_clamp: aniso,
+                ..Default::default()
+            })
+        })
+        .clone();
+    let layout = cache.get_bind_group_layout(&pipeline.texture_layout);
+    let prop_slots = geometry.t6_props.iter().map(|draw| draw[1]);
+    // bo2zm: every T6 material's colour map (guns, arms, effects).
+    let dynamic_slots: Vec<u32> = dynamic
+        .as_ref()
+        .map(|d| d.materials.iter().map(|m| m.0).collect())
+        .unwrap_or_default();
+    for slot in geometry
+        .world_surface_color
+        .iter()
+        .copied()
+        .chain(prop_slots)
+        .chain(dynamic_slots)
+    {
+        if slot == u32::MAX || textures.bind_groups.contains_key(&slot) {
+            continue;
+        }
+        let Some(Some(Ok(view))) = registry.material_images.get(slot as usize) else {
+            continue;
+        };
+        if view.dimension != TextureViewDimension::D2 {
+            continue;
+        }
+        let bind_group = device.create_bind_group(
+            "bo2zm_world_colour_map",
+            &layout,
+            // bo2mp: colour maps as sRGB (`UploadedTextureView::colour_view`).
+            &BindGroupEntries::sequential((view.colour_view(), &sampler)),
+        );
+        textures.bind_groups.insert(slot, bind_group);
+    }
+    // Layered surfaces: colour map plus layer 1 and 2 maps.
+    let layered_layout = cache.get_bind_group_layout(&pipeline.layered_texture_layout);
+    let view_of = |slot: u32| match registry.material_images.get(slot as usize) {
+        Some(Some(Ok(view))) if view.dimension == TextureViewDimension::D2 => Some(view.colour_view().clone()),
+        _ => None,
+    };
+    for (i, &slot) in geometry.world_surface_color.iter().enumerate() {
+        let Some(&[l1, l2]) = geometry.world_surface_layers.get(i) else {
+            continue;
+        };
+        if slot == u32::MAX || (l1 == u32::MAX && l2 == u32::MAX) {
+            continue;
+        }
+        let key = (slot, l1, l2);
+        if textures.layered.contains_key(&key) {
+            continue;
+        }
+        let Some(base) = view_of(slot) else { continue };
+        let layer1 = if l1 == u32::MAX { Some(base.clone()) } else { view_of(l1) };
+        let layer2 = if l2 == u32::MAX { Some(base.clone()) } else { view_of(l2) };
+        let (Some(layer1), Some(layer2)) = (layer1, layer2) else {
+            continue;
+        };
+        let bind_group = device.create_bind_group(
+            "bo2zm_world_layered_colour_maps",
+            &layered_layout,
+            &BindGroupEntries::with_indices((
+                (0, &base),
+                (1, &sampler),
+                (6, &layer1),
+                (7, &layer2),
+            )),
+        );
+        textures.layered.insert(key, bind_group);
+    }
+    prepare_world_shine(
+        &pipeline,
+        &geometry,
+        dynamic.as_deref(),
+        &registry,
+        &cache,
+        &device,
+        &queue,
+        &mut textures,
+        &sampler,
+    );
+}
+
+/// bo2zm: the shine surfaces' group 1 (colour, normal, specular maps) and
+/// the probes' group 3.
+#[allow(clippy::too_many_arguments)]
+fn prepare_world_shine(
+    pipeline: &DiagnosticPipeline,
+    geometry: &DiagnosticGeometry,
+    dynamic: Option<&ExtractedT6Dynamic>,
+    registry: &RuntimeUploadedImageRegistry,
+    cache: &PipelineCache,
+    device: &RenderDevice,
+    queue: &RenderQueue,
+    textures: &mut DiagnosticWorldTextures,
+    sampler: &Sampler,
+) {
+    let no_shine = |s: &[u32; 2]| s[0] == u32::MAX && s[1] == u32::MAX;
+    // The gun in his hands, things in flight and moving script models (bo2zm:
+    // the power-ups), and the script models that hold still.
+    let dynamic_shine: Vec<(u32, u32, u32, u32)> = dynamic
+        .into_iter()
+        .flat_map(|d| {
+            [d.viewmodel.as_ref(), d.missiles.as_ref()]
+                .into_iter()
+                .flatten()
+                .flat_map(|draw| draw.draws.iter())
+                .chain(d.script_static.iter().flat_map(|draw| draw.draws.iter()))
+        })
+        .filter(|d| !no_shine(&[d[5], d[6]]))
+        .map(|d| (d[2], d[5], d[6], d[7]))
+        .collect();
+    if geometry.world_surface_shine.iter().all(|s| no_shine(&[s[0], s[1]]))
+        && geometry
+            .t6_prop_shine
+            .iter()
+            .all(|s| no_shine(&[s[0], s[1]]))
+        && dynamic_shine.is_empty()
+    {
+        return;
+    }
+    // 1x1 stand-ins: a flat normal (128/255 reads as 0 after BO2's scale
+    // and bias), a black specular map (no highlight, no reflection).
+    let one_by_one = |label: &'static str, format: TextureFormat, texel: &[u8]| {
+        use bevy::render::render_resource::{TextureDescriptor, TextureUsages, TextureViewDescriptor};
+        use bevy::render::render_resource::{Extent3d, TextureDimension};
+        let texture = device.create_texture_with_data(
+            queue,
+            &TextureDescriptor {
+                label: Some(label),
+                size: Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format,
+                usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+                view_formats: &[],
+            },
+            bevy::render::render_resource::TextureDataOrder::LayerMajor,
+            texel,
+        );
+        texture.create_view(&TextureViewDescriptor::default())
+    };
+    if textures.flat_normal.is_none() {
+        textures.flat_normal = Some(one_by_one("bo2zm_flat_normal", TextureFormat::Rgba8Unorm, &[128, 128, 255, 255]));
+    }
+    if textures.no_specular.is_none() {
+        textures.no_specular = Some(one_by_one("bo2zm_no_specular", TextureFormat::Rgba8Unorm, &[0, 0, 0, 0]));
+    }
+    let view_of = |slot: u32| match registry.material_images.get(slot as usize) {
+        Some(Some(Ok(view))) if view.dimension == TextureViewDimension::D2 => Some(view.view.clone()),
+        _ => None,
+    };
+    let layout = cache.get_bind_group_layout(&pipeline.shine_texture_layout);
+    let world_keys = geometry
+        .world_surface_shine
+        .iter()
+        .zip(geometry.world_surface_color.iter())
+        .enumerate()
+        .map(|(i, (sh, &colour))| {
+            // bo2mp: an emissive flow surface's remap and constants; a
+            // sea's whitewater and shore.
+            let flow = geometry.world_surface_draw.get(i).is_some_and(|&code| {
+                let style = world_style(code, true);
+                style_flow(style) || style_water(style)
+            });
+            let aux = if flow {
+                geometry
+                    .world_surface_layers
+                    .get(i)
+                    .map_or(u32::MAX, |l| l[0])
+            } else {
+                u32::MAX
+            };
+            (colour, sh[0], sh[1], aux)
+        });
+    let prop_keys = geometry
+        .t6_prop_shine
+        .iter()
+        .zip(geometry.t6_props.iter())
+        .map(|(sh, draw)| {
+            let flow = prop_style(draw[2]) & (STYLE_PROP_FLOW | STYLE_PROP_TILE) != 0
+                || (prop_style(draw[2]) & STYLE_PROP_FLAG != 0 && draw[2] & T6_UNLIT == 0);
+            (draw[1], sh[0], sh[1], if flow { sh[2] } else { u32::MAX })
+        });
+    let keys: Vec<(u32, u32, u32, u32)> =
+        world_keys.chain(prop_keys).chain(dynamic_shine).collect();
+    for key in keys {
+        let (colour, n, s, aux) = key;
+        if n == u32::MAX && s == u32::MAX {
+            continue;
+        }
+        if colour == u32::MAX || textures.shine.contains_key(&key) {
+            continue;
+        }
+        // bo2mp: the colour map as sRGB; normal and specular maps as stored.
+        let Some(base) = (match registry.material_images.get(colour as usize) {
+            Some(Some(Ok(view))) if view.dimension == TextureViewDimension::D2 => Some(view.colour_view().clone()),
+            _ => None,
+        }) else {
+            note_shine_unready(colour, key.1, key.2, key.3, registry);
+            continue;
+        };
+        let normal = if n == u32::MAX { textures.flat_normal.clone() } else { view_of(n) };
+        let specular = if s == u32::MAX { textures.no_specular.clone() } else { view_of(s) };
+        let aux = if aux == u32::MAX { textures.no_specular.clone() } else { view_of(aux) };
+        let (Some(normal), Some(specular), Some(aux)) = (normal, specular, aux) else {
+            note_shine_unready(colour, key.1, key.2, key.3, registry);
+            continue;
+        };
+        let bind_group = device.create_bind_group(
+            "bo2zm_world_shine_maps",
+            &layout,
+            &BindGroupEntries::with_indices((
+                (0, &base),
+                (1, sampler),
+                (8, &normal),
+                (9, &specular),
+                (10, &aux),
+            )),
+        );
+        textures.shine.insert(key, bind_group);
+    }
+    // bo2mp: one-blend-layer surfaces: the layered maps, the shine maps and
+    // layer 1's specular map (in layer 2's slot; black without one).
+    let layered_layout = cache.get_bind_group_layout(&pipeline.layered_shine_texture_layout);
+    for (i, (sh, &colour)) in geometry
+        .world_surface_shine
+        .iter()
+        .zip(geometry.world_surface_color.iter())
+        .enumerate()
+    {
+        let (Some(&code), Some(&[l1, l2])) =
+            (geometry.world_surface_draw.get(i), geometry.world_surface_layers.get(i))
+        else {
+            continue;
+        };
+        if !style_layer1_spec(world_style(code, true)) || colour == u32::MAX || l1 == u32::MAX {
+            continue;
+        }
+        let key = (colour, l1, l2, sh[0], sh[1]);
+        if no_shine(&[sh[0], sh[1]]) || textures.layered_shine.contains_key(&key) {
+            continue;
+        }
+        let colour_of = |slot: u32| match registry.material_images.get(slot as usize) {
+            Some(Some(Ok(view))) if view.dimension == TextureViewDimension::D2 => Some(view.colour_view().clone()),
+            _ => None,
+        };
+        let (Some(base), Some(layer1)) = (colour_of(colour), colour_of(l1)) else {
+            continue;
+        };
+        let normal = if sh[0] == u32::MAX { textures.flat_normal.clone() } else { view_of(sh[0]) };
+        let specular = if sh[1] == u32::MAX { textures.no_specular.clone() } else { view_of(sh[1]) };
+        let specular1 = if l2 == u32::MAX { textures.no_specular.clone() } else { view_of(l2) };
+        let (Some(normal), Some(specular), Some(specular1), Some(aux)) =
+            (normal, specular, specular1, textures.no_specular.clone())
+        else {
+            continue;
+        };
+        let bind_group = device.create_bind_group(
+            "bo2mp_world_layered_shine_maps",
+            &layered_layout,
+            &BindGroupEntries::with_indices((
+                (0, &base),
+                (1, sampler),
+                (6, &layer1),
+                (7, &base),
+                (8, &normal),
+                (9, &specular),
+                (10, &aux),
+                (11, &specular1),
+            )),
+        );
+        textures.layered_shine.insert(key, bind_group);
+    }
+    // The probes: their lighting table, then their group.
+    let table = textures
+        .probe_table
+        .get_or_insert_with(|| {
+            device.create_buffer(&bevy::render::render_resource::BufferDescriptor {
+                label: Some("bo2zm_probe_table"),
+                size: T6_PROBES_BYTES,
+                usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        })
+        .clone();
+    if textures
+        .probe_written
+        .as_ref()
+        .is_none_or(|have| !Arc::ptr_eq(have, &geometry.t6_probes))
+    {
+        let mut rows = vec![[0.0f32; 12]; T6_MAX_PROBES];
+        for (row, probe) in rows.iter_mut().zip(geometry.t6_probes.iter()) {
+            for (k, v) in probe.iter().enumerate() {
+                row[k * 4..k * 4 + 4].copy_from_slice(v);
+            }
+        }
+        queue.write_buffer(&table, 0, bytemuck::cast_slice(&rows));
+        textures.probe_written = Some(Arc::clone(&geometry.t6_probes));
+    }
+    if let Some(slot) = geometry.t6_probe_slot
+        && textures.probes.as_ref().is_none_or(|(have, _)| *have != slot)
+        && let Some(Some(Ok(view))) = registry.material_images.get(slot as usize)
+        && view.dimension == TextureViewDimension::CubeArray
+    {
+        let probe_sampler = device.create_sampler(&SamplerDescriptor {
+            label: Some("bo2zm_probe_sampler"),
+            mag_filter: FilterMode::Linear,
+            min_filter: FilterMode::Linear,
+            mipmap_filter: MipmapFilterMode::Linear,
+            ..Default::default()
+        });
+        let group = device.create_bind_group(
+            "bo2zm_probes",
+            &cache.get_bind_group_layout(&pipeline.probe_layout),
+            &BindGroupEntries::with_indices((
+                (0, &view.view),
+                (1, &probe_sampler),
+                (2, table.as_entire_binding()),
+            )),
+        );
+        textures.probes = Some((slot, group));
+    }
+}
+
+fn prepare_views(
+    mut commands: Commands,
+    geometry: Res<DiagnosticGeometry>,
+    dynamic: Option<Res<ExtractedT6Dynamic>>,
+    pipeline: Option<Res<DiagnosticPipeline>>,
+    mut specialized: ResMut<SpecializedRenderPipelines<DiagnosticPipeline>>,
+    cache: Res<PipelineCache>,
+    device: Res<RenderDevice>,
+    uniforms: Res<ViewUniforms>,
+    views: Query<(Entity, &ExtractedView, &Msaa, Option<&ViewMotion>)>,
+    mut spare_motion: Local<Option<Buffer>>,
+) {
+    if !geometry_diagnostic_enabled() {
+        return;
+    }
+    let (Some(pipeline), Some(binding)) = (pipeline, uniforms.uniforms.binding()) else {
+        return;
+    };
+    for (entity, view, msaa, view_motion) in &views {
+        let motion_on = view_motion.is_some();
+        // bo2mp: a Ghosts map's frame drawn in stages: into its HDR scene.
+        let iw6_hdr = super::iw6_native::char_grade_frame(msaa.samples());
+        let target_format = if iw6_hdr { render_iw6::world::SCENE_COLOUR } else { view.target_format };
+        let world_pipeline = specialized.specialize(
+            &cache,
+            &pipeline,
+            DiagnosticPipelineKey {
+                target: target_format,
+                samples: msaa.samples(),
+                motion: motion_on,
+                iw6_hdr,
+                tess: DiagnosticTess::World,
+            },
+        );
+        // bo2zm: the world's and props' styles, plus a prop style for every
+        // T6 material (what guns, arms and effects draw with).
+        let mut styles: std::collections::BTreeSet<DiagnosticTess> =
+            geometry.t6_styles.iter().copied().collect();
+        if let Some(dynamic) = dynamic.as_ref() {
+            for &(_, code) in dynamic.materials.iter() {
+                if code != T6_NONE && code & T6_BLEND_MASK >= T6_SHADOW_ONLY {
+                    continue;
+                }
+                styles.insert(DiagnosticTess::PropTextured(prop_style(code)));
+                if prop_shine_code(code) {
+                    styles.insert(DiagnosticTess::PropTextured(prop_style(code) | STYLE_SHINE));
+                }
+                if soft_code(code) || decal_code(code) {
+                    styles.insert(DiagnosticTess::PropTextured(prop_style(code) | STYLE_SOFT));
+                }
+            }
+        }
+        let t6_pipelines: HashMap<DiagnosticTess, CachedRenderPipelineId> = styles
+            .iter()
+            .map(|&tess| {
+                let id = specialized.specialize(
+                    &cache,
+                    &pipeline,
+                    DiagnosticPipelineKey {
+                        target: target_format,
+                        samples: msaa.samples(),
+                motion: motion_on,
+                iw6_hdr,
+                        tess,
+                    },
+                );
+                (tess, id)
+            })
+            .collect();
+        let smodel_pipeline = specialized.specialize(
+            &cache,
+            &pipeline,
+            DiagnosticPipelineKey {
+                target: target_format,
+                samples: msaa.samples(),
+                motion: motion_on,
+                iw6_hdr,
+                tess: DiagnosticTess::Smodel,
+            },
+        );
+        let xmodel_pipeline = specialized.specialize(
+            &cache,
+            &pipeline,
+            DiagnosticPipelineKey {
+                target: target_format,
+                samples: msaa.samples(),
+                motion: motion_on,
+                iw6_hdr,
+                tess: DiagnosticTess::XModel,
+            },
+        );
+        let sky_pipeline = specialized.specialize(
+            &cache,
+            &pipeline,
+            DiagnosticPipelineKey {
+                target: target_format,
+                samples: msaa.samples(),
+                motion: motion_on,
+                iw6_hdr,
+                tess: DiagnosticTess::Sky,
+            },
+        );
+        // bo2mp: binding 1 is the motion parameters; views without motion
+        // vectors bind a spare buffer no pipeline of theirs reads.
+        let spare = spare_motion
+            .get_or_insert_with(|| {
+                device.create_buffer(&BufferDescriptor {
+                    label: Some("bo2mp_motion_params_spare"),
+                    size: MOTION_PARAMS_BYTES,
+                    usage: BufferUsages::UNIFORM,
+                    mapped_at_creation: false,
+                })
+            })
+            .clone();
+        let view_layout = cache.get_bind_group_layout(&pipeline.view_layout);
+        let view_group = |label, params: &Buffer| {
+            device.create_bind_group(
+                label,
+                &view_layout,
+                &BindGroupEntries::with_indices((
+                    (0, binding.clone()),
+                    (1, params.as_entire_binding()),
+                )),
+            )
+        };
+        let bind_group = view_group(
+            "iw4_geometry_diagnostic_view",
+            view_motion.map_or(&spare, |m| &m.params),
+        );
+        let viewmodel_bind_group = view_group(
+            "bo2mp_geometry_diagnostic_view_viewmodel",
+            view_motion.map_or(&spare, |m| &m.params_viewmodel),
+        );
+        commands.entity(entity).insert(DiagnosticViewBindGroup {
+            bind_group,
+            viewmodel_bind_group,
+            world_pipeline,
+            t6_pipelines,
+            sky_pipeline,
+            smodel_pipeline,
+            xmodel_pipeline,
+        });
+    }
+}
+
+fn draw_geometry_diagnostic(
+    view: ViewQuery<(
+        &ViewTarget,
+        &SceneDepthTexture,
+        &ExtractedView,
+        &ViewUniformOffset,
+        &DiagnosticViewBindGroup,
+        Option<&ViewMotion>,
+        Option<&Msaa>,
+    )>,
+    dynamic: Res<DiagnosticDynamic>,
+    colour_frame: Res<super::PublishedRenderFrame>,
+    geometry: Res<DiagnosticGeometry>,
+    cache: Res<PipelineCache>,
+    device: Res<RenderDevice>,
+    mut context: RenderContext,
+    mut last_census: Local<Option<String>>,
+    mut perf: Local<DiagnosticPerf>,
+    submitted: Option<Res<super::colour_submit::ExactColourSubmitCensus>>,
+    extracted: Option<Res<ExtractedDiagnosticGeometry>>,
+    slot: Option<Res<SharedRenderStagesSlot>>,
+    mut scratch: Local<DiagnosticDrawScratch>,
+    world_textures: Res<DiagnosticWorldTextures>,
+    world_lightmaps: Res<DiagnosticWorldLightmaps>,
+    (diagnostic_pipeline, mut iw6): (
+        Res<DiagnosticPipeline>,
+        Option<ResMut<super::iw6_native::Iw6Native>>,
+    ),
+) {
+    let products = &colour_frame.frame_products;
+    // bo2mp: MWR's own renderer drew the world, props and sky this frame.
+    let h1_native = super::native_world();
+    if extracted
+        .as_ref()
+        .is_some_and(|extracted| extracted.overlay_gpu_wait)
+    {
+        return;
+    }
+    if !geometry_diagnostic_enabled() {
+        return;
+    }
+    let mut stamp = DiagnosticStamp {
+        started: Instant::now(),
+        slot: slot.as_ref().map(|s| Arc::clone(&s.0)),
+        pass: 0,
+        draw_n: 0,
+        world_n: 0,
+        smodel_n: 0,
+        xmodel_n: 0,
+    };
+    scratch.submitted.clear();
+    scratch.exec_ready.clear();
+    scratch.draws.clear();
+
+    if let Some(census) = submitted.as_ref() {
+        scratch
+            .submitted
+            .extend(census.submitted_keys.iter().copied());
+        scratch
+            .exec_ready
+            .extend(census.world_exec_ready_keys.iter().copied());
+    }
+    let colour = products.0.product(FrameProductKind::Colour);
+    let emissive = products.0.product(FrameProductKind::Emissive);
+    let DiagnosticDrawScratch {
+        submitted,
+        exec_ready,
+        draws,
+        smodel_instances,
+    } = &mut *scratch;
+    draws.extend(
+        colour
+            .ordered_draws
+            .iter()
+            .enumerate()
+            .filter_map(|(_, item)| {
+                let ready = exec_ready.contains(&item.key);
+                diagnostic_would_draw(item, ready, submitted).then_some((*item, ready))
+            })
+            .chain(
+                emissive
+                    .ordered_draws
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(_, item)| {
+                        let ready = exec_ready.contains(&item.key);
+                        diagnostic_would_draw(item, ready, submitted).then_some((*item, ready))
+                    }),
+            ),
+    );
+    for &surf in &geometry.g0_world_surfs {
+        let item = RetainedDrawItem {
+            material_id: None,
+            material_rank: 0,
+            key: 0,
+            kind: RetainedDrawKind::world(surf),
+            surface_samplers: Default::default(),
+            camera_region: None,
+        };
+        if diagnostic_would_draw(&item, false, submitted) {
+            draws.push((item, false));
+        }
+    }
+    // bo2mp: Black Ops II's moving things (the first-person gun and arms,
+    // players, grenades, marks, effects) draw only in this pass. On a map
+    // from another game its own path draws the world, and once its
+    // pipelines are built no world surface is left to this pass: returning
+    // then left the gun and every player undrawn (most frames on MW2 maps).
+    let dynamic_lists = [
+        dynamic.viewmodel.as_ref(),
+        dynamic.missiles.as_ref(),
+        dynamic.script_static.as_ref(),
+        dynamic.marks.as_ref(),
+        dynamic.effects.as_ref(),
+        dynamic.viewmodel_effects.as_ref(),
+    ];
+    let has_dynamic = dynamic_lists.iter().any(Option::is_some);
+    note_pass_state(
+        draws.len(),
+        &geometry,
+        &dynamic_lists,
+        world_lightmaps.lighting_group.is_some(),
+    );
+    if draws.is_empty() && geometry.t6_props.is_empty() && geometry.t6_sky_slot.is_none() {
+        if !has_dynamic {
+            return;
+        }
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            diag::info!(
+                Fpv,
+                "bo2 fallback pass: no world surface left to it this frame; running for the gun and players (it used to stop here)"
+            );
+        }
+    }
+    let (target, depth, extracted_view, view_offset, view_bind, view_motion, msaa) = view.into_inner();
+    // bo2mp: a Ghosts map's frame drawn in stages (`iw6_native`): this pass
+    // draws into Ghosts' HDR scene (its pipelines are made for it), its
+    // opaque draws before Ghosts' fog, its effects and the gun after.
+    let staged = super::iw6_native::char_grade_frame(msaa.map_or(1, Msaa::samples));
+    let iw6_scene = if staged {
+        match iw6.as_deref().and_then(super::iw6_native::staged_scene_target) {
+            Some(v) => Some(v),
+            None => return,
+        }
+    } else {
+        None
+    };
+    fn colour_attachment<'a>(
+        target: &'a ViewTarget,
+        hdr: Option<&'a wgpu::TextureView>,
+    ) -> bevy::render::render_resource::RenderPassColorAttachment<'a> {
+        match hdr {
+            Some(view) => bevy::render::render_resource::RenderPassColorAttachment {
+                view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: bevy::render::render_resource::Operations {
+                    load: bevy::render::render_resource::LoadOp::Load,
+                    store: StoreOp::Store,
+                },
+            },
+            None => target.get_color_attachment(),
+        }
+    }
+    let world_pipeline = cache.get_render_pipeline(view_bind.world_pipeline);
+    let t6_pipeline = |tess: DiagnosticTess| {
+        view_bind
+            .t6_pipelines
+            .get(&tess)
+            .and_then(|&id| cache.get_render_pipeline(id))
+    };
+    let sky_pipeline = cache.get_render_pipeline(view_bind.sky_pipeline);
+    let smodel_pipeline = cache.get_render_pipeline(view_bind.smodel_pipeline);
+    let xmodel_pipeline = cache.get_render_pipeline(view_bind.xmodel_pipeline);
+    if world_pipeline.is_none() && smodel_pipeline.is_none() && xmodel_pipeline.is_none() && !has_dynamic {
+        return;
+    }
+    smodel_instances.clear();
+    smodel_instances.extend(draws.iter().map(|(item, _)| match item.kind {
+        RetainedDrawKind::Smodel {
+            world_from_local, ..
+        }
+        | RetainedDrawKind::XModel {
+            world_from_local, ..
+        } => DiagnosticSmodelInstance {
+            world_from_local: world_from_local.to_cols_array_2d(),
+        },
+        _ => DiagnosticSmodelInstance {
+            world_from_local: Mat4::IDENTITY.to_cols_array_2d(),
+        },
+    }));
+    let smodel_instance_buffer = (!smodel_instances.is_empty()).then(|| {
+        device.create_buffer_with_data(&BufferInitDescriptor {
+            label: Some("iw4_geometry_diagnostic_smodel_instances"),
+            contents: bytemuck::cast_slice(smodel_instances.as_slice()),
+            usage: BufferUsages::VERTEX,
+        })
+    });
+    // bo2mp: the opaque props, a surface's placements per draw, from
+    // their own rows this frame.
+    let mut prop_rows = Vec::new();
+    let (prop_batches, mut props_culled, mut props_unseen) = t6_opaque_prop_batches(
+        &geometry,
+        &world_textures,
+        &cache,
+        &view_bind.t6_pipelines,
+        extracted_view,
+        &mut prop_rows,
+    );
+    let prop_rows_buffer = (!prop_rows.is_empty()).then(|| {
+        device.create_buffer_with_data(&BufferInitDescriptor {
+            label: Some("bo2mp_prop_rows"),
+            contents: bytemuck::cast_slice(prop_rows.as_slice()),
+            usage: BufferUsages::VERTEX,
+        })
+    });
+    let mut attachments = vec![Some(colour_attachment(target, iw6_scene.as_ref()))];
+    attachments.extend(view_motion.map(|m| Some(m.attachment())));
+    stamp.pass = 1;
+    // bo2zm: the pass's GPU time (`render/bo2zm_world/elapsed_gpu`), which a
+    // driver's frame cap on a background window does not hide.
+    use bevy::render::diagnostic::RecordDiagnostics;
+    let recorder = context.diagnostic_recorder();
+    let recorder = recorder.as_deref();
+    let gpu_span = recorder.time_span(context.command_encoder(), "bo2zm_world");
+    let mut pass =
+        context.begin_tracked_render_pass(bevy::render::render_resource::RenderPassDescriptor {
+            label: Some("iw4_geometry_diagnostic_pass"),
+            color_attachments: &attachments,
+            depth_stencil_attachment: Some(depth.get_attachment(StoreOp::Store)),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+    pass.set_bind_group(0, &view_bind.bind_group, &[view_offset.offset]);
+    let mut bound_tess = None;
+    let mut bound_texture = None;
+    let mut bound_lightmap = None;
+    let mut bound_depth = None;
+    let surface_draw = |item: &RetainedDrawItem| match item.kind {
+        RetainedDrawKind::World { surf, .. } => geometry
+            .world_surface_draw
+            .get(usize::from(surf))
+            .copied()
+            .unwrap_or(T6_NONE),
+        _ => T6_NONE,
+    };
+    // bo2zm: opaque surfaces first; blended ones after every opaque world
+    // surface and prop, in their materials' sort order (as the game draws
+    // them: decals, then blend layers, then glass).
+    let mut opaque_order: Vec<usize> = (0..draws.len())
+        .filter(|&i| !t6_blended(surface_draw(&draws[i].0)))
+        .collect();
+    // bo2mp: the world comes here one surface per draw (thousands a
+    // frame). Opaque surfaces are drawn by state (draw code, colour map,
+    // lightmap page, primary light), then by where their indices sit, so
+    // the same material's neighbours follow each other and merge into one
+    // draw below (as Black Ops II batches its world by material). Surfaces
+    // with a polygon offset (decals) stay after the rest; props and models
+    // keep their order, first.
+    opaque_order.sort_by_cached_key(|&i| match draws[i].0.kind {
+        RetainedDrawKind::World { surf, .. } => {
+            let s = usize::from(surf);
+            let code = geometry.world_surface_draw.get(s).copied().unwrap_or(T6_NONE);
+            (
+                1 + u8::from(code != T6_NONE && code & 0x0c00 != 0),
+                code,
+                geometry.world_surface_color.get(s).copied().unwrap_or(u32::MAX),
+                geometry.world_surface_lightmap.get(s).copied().unwrap_or(u8::MAX),
+                geometry.world_surface_primary.get(s).copied().unwrap_or(0),
+                geometry.world_surface_ranges.get(s).map_or(u32::MAX, |r| r.0),
+            )
+        }
+        _ => (0, 0, 0, 0, 0, 0),
+    });
+    let mut blended_order: Vec<usize> = (0..draws.len())
+        .filter(|&i| t6_blended(surface_draw(&draws[i].0)))
+        .collect();
+    blended_order.sort_by_key(|&i| t6_sort_key(surface_draw(&draws[i].0)));
+    let viewport = extracted_view.viewport;
+    let vp_x = viewport.x as f32;
+    let vp_y = viewport.y as f32;
+    let vp_w = viewport.z as f32;
+    let vp_h = viewport.w as f32;
+    let mut world_draws = 0u32;
+    let mut smodel_draws = 0u32;
+    let mut xmodel_draws = 0u32;
+    let fx_draws = 0u32;
+    let mut world_skipped = 0u32;
+    let mut smodel_skipped = 0u32;
+    let mut xmodel_skipped = 0u32;
+    let mut fx_skipped = 0u32;
+    let mut prop_draws = 0u32;
+    let mut prop_batch_draws = 0u32;
+    // bo2zm 27c: cloud sheets draw in the effects pass, over the sky and
+    // with soft edges (`CODLEGACY_T6_NO_SOFT`: here, hard-edged).
+    let soft_sheets = codlegacy_env::var_os("CODLEGACY_T6_NO_SOFT").is_none();
+    // bo2zm: world surfaces drawn untextured (diagnostic colours), a few ids.
+    let mut untextured: Vec<u16> = Vec::new();
+    let mut untextured_n = 0u32;
+    // bo2mp: world surfaces drawn back to back with the same state and
+    // touching index ranges go out as one draw: the range waiting to be
+    // drawn, and the draws that went out for world surfaces.
+    let mut pending: Option<(u32, u32, std::ops::Range<u32>)> = None;
+    let mut world_batch_draws = 0u32;
+    macro_rules! flush_world {
+        () => {
+            if let Some((first, end, instances)) = pending.take() {
+                pass.draw_indexed(first..end, 0, instances.clone());
+                crate::diag::gpu_counters::draw(end - first, instances.len() as u32);
+                world_batch_draws += 1;
+            }
+        };
+    }
+    for blended_phase in [false, true] {
+        let order = if blended_phase {
+            &blended_order
+        } else {
+            &opaque_order
+        };
+        for &index in order {
+            let (item, ready) = &draws[index];
+            if *ready && matches!(item.kind, RetainedDrawKind::World { .. }) {
+                continue;
+            }
+            if submitted.contains(&item.key) {
+                continue;
+            }
+            if !geometry_diagnostic_covers(&item.kind, item.key) {
+                xmodel_skipped = xmodel_skipped.saturating_add(1);
+                continue;
+            }
+            if !matches!(item.kind, RetainedDrawKind::World { .. }) {
+                flush_world!();
+            }
+            let (tess, start, count, instances) = match item.kind {
+                RetainedDrawKind::World { surf, .. } => {
+                    let (Some(vertex), Some(index), Some(pipeline), Some(&(start, count))) = (
+                        geometry.world_vertex.as_ref(),
+                        geometry.world_index.as_ref(),
+                        world_pipeline,
+                        geometry.world_surface_ranges.get(usize::from(surf)),
+                    ) else {
+                        world_skipped = world_skipped.saturating_add(1);
+                        continue;
+                    };
+                    let colour_slot = geometry
+                        .world_surface_color
+                        .get(usize::from(surf))
+                        .copied()
+                        .unwrap_or(u32::MAX);
+                    let code = geometry
+                        .world_surface_draw
+                        .get(usize::from(surf))
+                        .copied()
+                        .unwrap_or(T6_NONE);
+                    if code != T6_NONE && code & T6_BLEND_MASK >= T6_SHADOW_ONLY {
+                        world_skipped = world_skipped.saturating_add(1);
+                        continue;
+                    }
+                    let page = geometry
+                        .world_surface_lightmap
+                        .get(usize::from(surf))
+                        .copied()
+                        .unwrap_or(u8::MAX);
+                    let lightmap = (code != T6_NONE && code & T6_UNLIT == 0)
+                        .then(|| world_lightmaps.bind_groups.get(&page))
+                        .flatten()
+                        .map(|g| (g, u16::from(page)))
+                        .or_else(|| {
+                            // bo2mp: emissive flow (lava) has no lightmap (its
+                            // shader reads none), nor has a distant sea; they
+                            // draw in the lightmapped pipeline over the first
+                            // page.
+                            (code != T6_NONE
+                                && code & (T6_FLOW | T6_WATER) != 0
+                                && code & T6_UNLIT == 0)
+                                .then(|| {
+                                    world_lightmaps
+                                        .bind_groups
+                                        .iter()
+                                        .min_by_key(|(k, _)| **k)
+                                        .map(|(k, g)| (g, 0x100 | u16::from(*k)))
+                                })
+                                .flatten()
+                        });
+                    // Group 2: the page's lightmap group, else lighting only.
+                    let group2 = match lightmap {
+                        Some(group) => Some(group),
+                        None => world_lightmaps.lighting_group.as_ref().map(|g| (g, u16::MAX)),
+                    };
+                    let mut style = world_style(code, lightmap.is_some());
+                    // Layered: its colour, layer 1 and 2 maps, else the
+                    // base layer alone.
+                    let layers = geometry
+                        .world_surface_layers
+                        .get(usize::from(surf))
+                        .copied()
+                        .unwrap_or([u32::MAX; 2]);
+                    let layered_group = (style_layers(style) && geometry.world_layer_vertex.is_some())
+                        .then(|| world_textures.layered.get(&(colour_slot, layers[0], layers[1])))
+                        .flatten();
+                    if style_layers(style) && layered_group.is_none() {
+                        style = strip_layers(style);
+                    }
+                    // Shine: an opaque lit lightmapped surface with a normal or
+                    // specular map, when the probes are ready.
+                    let shine = geometry
+                        .world_surface_shine
+                        .get(usize::from(surf))
+                        .copied()
+                        .unwrap_or([u32::MAX; 3]);
+                    let shine_group = (style & STYLE_LIGHTMAPPED != 0
+                        && !style_layers(style)
+                        && style & 3 <= 1
+                        && lightmap.is_some()
+                        && world_textures.probes.is_some())
+                    .then(|| {
+                        // bo2mp: emissive flow (lava) binds its colour remap
+                        // and constants (layer 1's slot) beside its maps; a
+                        // sea its whitewater and shore.
+                        let aux = if style_flow(style) || style_water(style) {
+                            layers[0]
+                        } else {
+                            u32::MAX
+                        };
+                        world_textures.shine.get(&(colour_slot, shine[0], shine[1], aux))
+                    })
+                    .flatten();
+                    // bo2mp: one blend layer: its layered and shine maps
+                    // together (Downhill's snow over its ice).
+                    let layered_shine_group = (layered_group.is_some()
+                        && style_layer1_spec(style)
+                        && style & 3 <= 1
+                        && lightmap.is_some()
+                        && world_textures.probes.is_some())
+                    .then(|| {
+                        world_textures
+                            .layered_shine
+                            .get(&(colour_slot, layers[0], layers[1], shine[0], shine[1]))
+                    })
+                    .flatten();
+                    let shine_group = shine_group.or(layered_shine_group);
+                    if shine_group.is_some() {
+                        style |= STYLE_SHINE;
+                    } else if style_water(style) || style_flow(style) {
+                        // bo2mp: water's colour map holds its constants; it
+                        // waits for its normal maps and the probes.
+                        world_skipped = world_skipped.saturating_add(1);
+                        continue;
+                    }
+                    let key = DiagnosticTess::WorldTextured(style);
+                    let group1 = match (shine_group, layered_group) {
+                        (Some(group), _) => Some(group),
+                        (None, Some(group)) => Some(group),
+                        (None, None) => world_textures.bind_groups.get(&colour_slot),
+                    };
+                    let textured = group1.zip(t6_pipeline(key)).filter(|_| group2.is_some());
+                    let tess = if let Some((bind_group, textured_pipeline)) = textured {
+                        if bound_tess != Some(key) {
+                            flush_world!();
+                            pass.set_render_pipeline(textured_pipeline);
+                            pass.set_vertex_buffer(0, vertex.slice(..));
+                            if style_layers(style)
+                                && let Some(layer_vertex) = geometry.world_layer_vertex.as_ref()
+                            {
+                                pass.set_vertex_buffer(1, layer_vertex.slice(..));
+                            }
+                            pass.set_index_buffer(index.slice(..), IndexFormat::Uint32);
+                            if style & STYLE_SHINE != 0
+                                && let Some((_, probes)) = world_textures.probes.as_ref()
+                            {
+                                pass.set_bind_group(3, probes, &[]);
+                            }
+                            bound_tess = Some(key);
+                            bound_texture = None;
+                            bound_lightmap = None;
+                        }
+                        let texture_key = (
+                            colour_slot,
+                            layered_group.map(|_| layers),
+                            shine_group.map(|_| [shine[0], shine[1], layers[0]]),
+                        );
+                        if bound_texture != Some(texture_key) {
+                            flush_world!();
+                            pass.set_bind_group(1, bind_group, &[]);
+                            bound_texture = Some(texture_key);
+                        }
+                        if let Some((group, id)) = group2
+                            && bound_lightmap != Some(id)
+                        {
+                            flush_world!();
+                            pass.set_bind_group(2, group, &[]);
+                            bound_lightmap = Some(id);
+                        }
+                        key
+                    } else {
+                        untextured_n += 1;
+                        if untextured.len() < 12 {
+                            untextured.push(surf);
+                        }
+                        if bound_tess != Some(DiagnosticTess::World) {
+                            flush_world!();
+                            pass.set_render_pipeline(pipeline);
+                            pass.set_vertex_buffer(0, vertex.slice(..));
+                            pass.set_index_buffer(index.slice(..), IndexFormat::Uint32);
+                            bound_tess = Some(DiagnosticTess::World);
+                        }
+                        DiagnosticTess::World
+                    };
+                    world_draws = world_draws.saturating_add(1);
+                    // The surface's primary light rides in the instance index;
+                    // a shine surface's reflection probe above it (bits 6..).
+                    let light = u32::from(
+                        geometry
+                            .world_surface_primary
+                            .get(usize::from(surf))
+                            .copied()
+                            .unwrap_or(0),
+                    );
+                    // (bo2mp: a CoD4 / World at War map's own probes have
+                    // no lighting table rows: every one of its cubes.)
+                    let probe_cap = if geometry.t6_probes.is_empty() { 1023 } else { T6_MAX_PROBES as u32 - 1 };
+                    let instance = if tess == DiagnosticTess::WorldTextured(style) && style & STYLE_SHINE != 0 {
+                        (light & 63) | (shine[2].min(probe_cap) << 6)
+                    } else {
+                        light
+                    };
+                    (tess, start, count, instance..instance + 1)
+                }
+                RetainedDrawKind::Smodel { surface, .. } => {
+                    let (
+                        Some(vertex),
+                        Some(index_buffer),
+                        Some(instance_buffer),
+                        Some(pipeline),
+                        Some(&(start, count)),
+                    ) = (
+                        geometry.smodel_vertex.as_ref(),
+                        geometry.smodel_index.as_ref(),
+                        smodel_instance_buffer.as_ref(),
+                        smodel_pipeline,
+                        geometry.smodel_surface_ranges.get(surface as usize),
+                    )
+                    else {
+                        smodel_skipped = smodel_skipped.saturating_add(1);
+                        continue;
+                    };
+                    if bound_tess != Some(DiagnosticTess::Smodel) {
+                        pass.set_render_pipeline(pipeline);
+                        pass.set_vertex_buffer(0, vertex.slice(..));
+                        pass.set_vertex_buffer(1, instance_buffer.slice(..));
+                        pass.set_index_buffer(index_buffer.slice(..), IndexFormat::Uint32);
+                        bound_tess = Some(DiagnosticTess::Smodel);
+                    }
+                    smodel_draws = smodel_draws.saturating_add(1);
+                    let instance = u32::try_from(index).unwrap_or(u32::MAX);
+                    (
+                        DiagnosticTess::Smodel,
+                        start,
+                        count,
+                        instance..instance.saturating_add(1),
+                    )
+                }
+                RetainedDrawKind::XModel { surface, .. } => {
+                    let (
+                        Some(vertex),
+                        Some(index_buffer),
+                        Some(instance_buffer),
+                        Some(pipeline),
+                        Some(&(start, count)),
+                    ) = (
+                        geometry.xmodel_vertex.as_ref(),
+                        geometry.xmodel_index.as_ref(),
+                        smodel_instance_buffer.as_ref(),
+                        xmodel_pipeline,
+                        geometry.xmodel_surface_ranges.get(surface as usize),
+                    )
+                    else {
+                        xmodel_skipped = xmodel_skipped.saturating_add(1);
+                        continue;
+                    };
+                    if bound_tess != Some(DiagnosticTess::XModel) {
+                        pass.set_render_pipeline(pipeline);
+                        pass.set_vertex_buffer(0, vertex.slice(..));
+                        pass.set_vertex_buffer(1, instance_buffer.slice(..));
+                        pass.set_index_buffer(index_buffer.slice(..), IndexFormat::Uint32);
+                        bound_tess = Some(DiagnosticTess::XModel);
+                    }
+                    xmodel_draws = xmodel_draws.saturating_add(1);
+                    let instance = u32::try_from(index).unwrap_or(u32::MAX);
+                    (
+                        DiagnosticTess::XModel,
+                        start,
+                        count,
+                        instance..instance.saturating_add(1),
+                    )
+                }
+                RetainedDrawKind::CodeMesh { .. } | RetainedDrawKind::ParticleCloud { .. } => {
+                    fx_skipped = fx_skipped.saturating_add(1);
+                    continue;
+                }
+                RetainedDrawKind::MarkMesh { .. } | RetainedDrawKind::Glass { .. } => {
+                    fx_skipped = fx_skipped.saturating_add(1);
+                    continue;
+                }
+            };
+            if count == 0 {
+                match tess {
+                    DiagnosticTess::World | DiagnosticTess::WorldTextured(_) => {
+                        world_draws = world_draws.saturating_sub(1);
+                        world_skipped = world_skipped.saturating_add(1);
+                    }
+                    DiagnosticTess::Smodel
+                    | DiagnosticTess::PropTextured(_)
+                    | DiagnosticTess::Sky => {
+                        smodel_draws = smodel_draws.saturating_sub(1);
+                        smodel_skipped = smodel_skipped.saturating_add(1);
+                    }
+                    DiagnosticTess::XModel => {
+                        xmodel_draws = xmodel_draws.saturating_sub(1);
+                        xmodel_skipped = xmodel_skipped.saturating_add(1);
+                    }
+                }
+                continue;
+            }
+            if vp_w > 0.0 && vp_h > 0.0 {
+                let (depth_min, depth_max) =
+                    reverse_z_viewport_depth(depth_range_type_for_draw(&item.kind, item.key));
+                if bound_depth != Some((depth_min, depth_max)) {
+                    flush_world!();
+                    pass.set_viewport(vp_x, vp_y, vp_w, vp_h, depth_min, depth_max);
+                    bound_depth = Some((depth_min, depth_max));
+                }
+            }
+            let (what, indices) = match tess {
+                DiagnosticTess::World | DiagnosticTess::WorldTextured(_) => ("world", geometry.world_index_count),
+                DiagnosticTess::XModel => ("xmodel", geometry.xmodel_index_count),
+                _ => ("static model", geometry.smodel_index_count),
+            };
+            if !retained_within(what, start, count, indices) {
+                continue;
+            }
+            let end = start.saturating_add(count);
+            if matches!(tess, DiagnosticTess::World | DiagnosticTess::WorldTextured(_)) {
+                // bo2mp: an opaque surface whose indices follow the waiting
+                // range's, under the same state, joins it. (Blended ones
+                // keep a draw each: their order is their sort key's.)
+                match pending.as_mut() {
+                    Some((_, pending_end, pending_instances))
+                        if !blended_phase && *pending_end == start && *pending_instances == instances =>
+                    {
+                        *pending_end = end;
+                    }
+                    _ => {
+                        flush_world!();
+                        pending = Some((start, end, instances));
+                    }
+                }
+                continue;
+            }
+            pass.draw_indexed(start..end, 0, instances.clone());
+            crate::diag::gpu_counters::draw(end - start, instances.len() as u32);
+        }
+        flush_world!();
+        // bo2zm: Black Ops II props of this phase (blended ones by sort key).
+        if !h1_native
+            && let (Some(vertex), Some(index_buffer), Some(instances), Some(lighting_group)) = (
+            geometry.smodel_vertex.as_ref(),
+            geometry.smodel_index.as_ref(),
+            geometry.t6_prop_instance_buffer.as_ref(),
+            world_lightmaps.lighting_group.as_ref(),
+        ) {
+            let mut bound_prop: Option<DiagnosticTess> = None;
+            pass.set_bind_group(2, lighting_group, &[]);
+            let mut bound_slot = None;
+            if vp_w > 0.0 && vp_h > 0.0 {
+                let (depth_min, depth_max) = reverse_z_viewport_depth(0);
+                pass.set_viewport(vp_x, vp_y, vp_w, vp_h, depth_min, depth_max);
+            }
+            pass.set_vertex_buffer(0, vertex.slice(..));
+            pass.set_index_buffer(index_buffer.slice(..), IndexFormat::Uint32);
+            // bo2mp: the opaque ones, a surface's placements per draw.
+            if let Some(rows) = prop_rows_buffer.as_ref().filter(|_| !blended_phase) {
+                pass.set_vertex_buffer(1, rows.slice(..));
+                for b in &prop_batches {
+                    let key = DiagnosticTess::PropTextured(b.style);
+                    if bound_prop != Some(key) {
+                        pass.set_render_pipeline(b.pipeline);
+                        if let Some(probes) = b.probes {
+                            pass.set_bind_group(3, probes, &[]);
+                        }
+                        bound_prop = Some(key);
+                        bound_slot = None;
+                    }
+                    if bound_slot != Some(b.slot_key) {
+                        pass.set_bind_group(1, b.bind_group, &[]);
+                        bound_slot = Some(b.slot_key);
+                    }
+                    pass.draw_indexed(b.start..b.start.saturating_add(b.count), 0, b.instances.clone());
+                    crate::diag::gpu_counters::draw(b.count, b.instances.len() as u32);
+                    prop_draws = prop_draws.saturating_add(b.instances.len() as u32);
+                    prop_batch_draws += 1;
+                }
+            }
+            pass.set_vertex_buffer(1, instances.slice(..));
+            // The game's own per-placement draw distance (the fast quality
+            // setting hides props at 60% of it).
+            let eye = extracted_view.world_from_view.translation();
+            let cull_scale = if asset_core::t6_fast() { 0.6 } else { 1.0 };
+            let instances_cpu = &geometry.t6_prop_instances;
+            let view_planes = t6_view_planes(
+                extracted_view.clip_from_view
+                    * extracted_view.world_from_view.to_matrix().inverse(),
+            );
+            let props: &[usize] = if blended_phase {
+                &geometry.t6_blended_props
+            } else {
+                &[]
+            };
+            for &i in props {
+                let [surface, slot, code, instance] = geometry.t6_props[i];
+                if code != T6_NONE && code & T6_BLEND_MASK >= T6_SHADOW_ONLY {
+                    continue;
+                }
+                if soft_sheets && sheet_code(code) {
+                    continue;
+                }
+                if let Some(row) = instances_cpu.get(instance as usize)
+                    && row[22] > 0.0
+                {
+                    let d = Vec3::new(row[12], row[13], row[14]) - eye;
+                    let cull = row[22] * cull_scale;
+                    if d.length_squared() > cull * cull {
+                        props_culled += 1;
+                        continue;
+                    }
+                }
+                if let (Some(planes), Some(&[x, y, z, radius])) =
+                    (view_planes.as_ref(), geometry.t6_prop_spheres.get(i))
+                    && radius >= 0.0
+                    && planes
+                        .iter()
+                        .any(|plane| plane.truncate().dot(Vec3::new(x, y, z)) + plane.w < -radius)
+                {
+                    props_unseen += 1;
+                    continue;
+                }
+                let Some(&(start, count)) = geometry.smodel_surface_ranges.get(surface as usize)
+                else {
+                    continue;
+                };
+                // Shine: a lit opaque prop with a normal or specular map.
+                let shine = geometry.t6_prop_shine.get(i).copied().unwrap_or([u32::MAX; 3]);
+                let flow = prop_style(code) & (STYLE_PROP_FLOW | STYLE_PROP_TILE) != 0
+                    || (prop_style(code) & STYLE_PROP_FLAG != 0 && code & T6_UNLIT == 0);
+                let shine_group = (prop_shine_code(code)
+                    && (shine[0] != u32::MAX || shine[1] != u32::MAX))
+                    .then(|| world_textures.probes.as_ref())
+                    .flatten()
+                    .and_then(|_| {
+                        let aux = if flow { shine[2] } else { u32::MAX };
+                        world_textures.shine.get(&(slot, shine[0], shine[1], aux))
+                    });
+                let style = prop_style(code) | if shine_group.is_some() { STYLE_SHINE } else { 0 };
+                let key = DiagnosticTess::PropTextured(style);
+                let (Some(pipeline), Some(bind_group)) = (
+                    t6_pipeline(key),
+                    shine_group.or_else(|| world_textures.bind_groups.get(&slot)),
+                ) else {
+                    continue;
+                };
+                if count == 0 || !retained_within("prop", start, count, geometry.smodel_index_count) {
+                    continue;
+                }
+                if bound_prop != Some(key) {
+                    pass.set_render_pipeline(pipeline);
+                    if shine_group.is_some()
+                        && let Some((_, probes)) = world_textures.probes.as_ref()
+                    {
+                        pass.set_bind_group(3, probes, &[]);
+                    }
+                    bound_prop = Some(key);
+                    bound_slot = None;
+                }
+                let slot_key = (slot, shine_group.map(|_| shine));
+                if bound_slot != Some(slot_key) {
+                    pass.set_bind_group(1, bind_group, &[]);
+                    bound_slot = Some(slot_key);
+                }
+                pass.draw_indexed(start..start.saturating_add(count), 0, instance..instance + 1);
+        crate::diag::gpu_counters::draw(count, 1);
+                prop_draws = prop_draws.saturating_add(1);
+            }
+            // The world draws rebind their buffers, pipeline and viewport.
+            bound_tess = None;
+            bound_texture = None;
+            bound_lightmap = None;
+            bound_depth = None;
+        }
+    }
+    // bo2zm: the sky last, behind everything already drawn.
+    if !h1_native
+        && let (Some(pipeline), Some((_, sky))) = (sky_pipeline, world_lightmaps.sky.as_ref())
+    {
+        if vp_w > 0.0 && vp_h > 0.0 {
+            let (depth_min, depth_max) = reverse_z_viewport_depth(0);
+            pass.set_viewport(vp_x, vp_y, vp_w, vp_h, depth_min, depth_max);
+        }
+        pass.set_render_pipeline(pipeline);
+        pass.set_bind_group(1, sky, &[]);
+        pass.draw(0..3, 0..1);
+    }
+    // bo2zm: effects (over the sky, which only fills what nothing else
+    // covered), then the first-person gun and arms in the viewmodel's depth
+    // range; opaque surfaces first, then blended ones by sort key. The
+    // world's blended effects draw in a pass of their own over a read-only
+    // depth they also read: BO2's zfeather shaders fade a sprite where it
+    // nears what is behind it.
+    let soft_group = device.create_bind_group(
+        "bo2zm_soft_depth",
+        &cache.get_bind_group_layout(&diagnostic_pipeline.soft_layout),
+        &BindGroupEntries::single(depth.view()),
+    );
+    let mut viewmodel_draws = 0u32;
+    viewmodel_draws += draw_dynamic_list(
+        &mut pass,
+        dynamic.marks.as_ref(),
+        world_lightmaps.lighting_group.as_ref(),
+        0,
+        [vp_x, vp_y, vp_w, vp_h],
+        &|_| true,
+        None,
+        &cache,
+        &view_bind.t6_pipelines,
+        &world_textures,
+    );
+    viewmodel_draws += draw_dynamic_list(
+        &mut pass,
+        dynamic.missiles.as_ref(),
+        world_lightmaps.lighting_group.as_ref(),
+        0,
+        [vp_x, vp_y, vp_w, vp_h],
+        &|_| true,
+        None,
+        &cache,
+        &view_bind.t6_pipelines,
+        &world_textures,
+    );
+    viewmodel_draws += draw_dynamic_list(
+        &mut pass,
+        dynamic.script_static.as_ref(),
+        world_lightmaps.lighting_group.as_ref(),
+        0,
+        [vp_x, vp_y, vp_w, vp_h],
+        &|_| true,
+        None,
+        &cache,
+        &view_bind.t6_pipelines,
+        &world_textures,
+    );
+    viewmodel_draws += draw_dynamic_list(
+        &mut pass,
+        dynamic.effects.as_ref(),
+        world_lightmaps.lighting_group.as_ref(),
+        0,
+        [vp_x, vp_y, vp_w, vp_h],
+        &|code| !t6_blended(code),
+        None,
+        &cache,
+        &view_bind.t6_pipelines,
+        &world_textures,
+    );
+    drop(pass);
+    // bo2mp: staged, Ghosts' fog, colorization and blended world surfaces
+    // now (unless the exact pass ran them), over the opaque draws; the
+    // effects and the gun go into the fogged scene.
+    let iw6_fogged = if staged {
+        let fogged = iw6
+            .as_deref_mut()
+            .and_then(|state| super::iw6_native::char_grade_mid(state, context.command_encoder(), depth));
+        if fogged.is_none() {
+            gpu_span.end(context.command_encoder());
+            return;
+        }
+        fogged
+    } else {
+        None
+    };
+    let iw6_fogged: Option<&wgpu::TextureView> = iw6_fogged.as_deref();
+    let mut attachments = vec![Some(colour_attachment(target, iw6_fogged))];
+    attachments.extend(view_motion.map(|m| Some(m.attachment())));
+    let mut pass =
+        context.begin_tracked_render_pass(bevy::render::render_resource::RenderPassDescriptor {
+            label: Some("bo2zm_effects_pass"),
+            color_attachments: &attachments,
+            depth_stencil_attachment: Some(depth.read_only_attachment()),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+    pass.set_bind_group(0, &view_bind.bind_group, &[view_offset.offset]);
+    // bo2zm 27c: Black Ops II's cloud sheets (Die Rise's cloud floor,
+    // `scrolling_zfeather`), by sort key: over the sky, fading where the
+    // scene behind them is near (its depth is read-only here).
+    if soft_sheets
+        && !h1_native
+        && let (Some(vertex), Some(index_buffer), Some(instances), Some(lighting_group)) = (
+            geometry.smodel_vertex.as_ref(),
+            geometry.smodel_index.as_ref(),
+            geometry.t6_prop_instance_buffer.as_ref(),
+            world_lightmaps.lighting_group.as_ref(),
+        )
+    {
+        let eye = extracted_view.world_from_view.translation();
+        let cull_scale = if asset_core::t6_fast() { 0.6 } else { 1.0 };
+        let mut bound = false;
+        for &i in &geometry.t6_blended_props {
+            let [surface, slot, code, instance] = geometry.t6_props[i];
+            if !sheet_code(code) {
+                continue;
+            }
+            if let Some(row) = geometry.t6_prop_instances.get(instance as usize)
+                && row[22] > 0.0
+            {
+                let d = Vec3::new(row[12], row[13], row[14]) - eye;
+                let cull = row[22] * cull_scale;
+                if d.length_squared() > cull * cull {
+                    props_culled += 1;
+                    continue;
+                }
+            }
+            let Some(&(start, count)) = geometry.smodel_surface_ranges.get(surface as usize)
+            else {
+                continue;
+            };
+            let (Some(pipeline), Some(bind_group)) = (
+                t6_pipeline(DiagnosticTess::PropTextured(prop_style(code) | STYLE_SOFT)),
+                world_textures.bind_groups.get(&slot),
+            ) else {
+                continue;
+            };
+            if count == 0 || !retained_within("prop", start, count, geometry.smodel_index_count) {
+                continue;
+            }
+            if !bound {
+                if vp_w > 0.0 && vp_h > 0.0 {
+                    let (depth_min, depth_max) = reverse_z_viewport_depth(0);
+                    pass.set_viewport(vp_x, vp_y, vp_w, vp_h, depth_min, depth_max);
+                }
+                pass.set_bind_group(2, lighting_group, &[]);
+                pass.set_bind_group(3, &soft_group, &[]);
+                pass.set_vertex_buffer(0, vertex.slice(..));
+                pass.set_vertex_buffer(1, instances.slice(..));
+                pass.set_index_buffer(index_buffer.slice(..), IndexFormat::Uint32);
+                bound = true;
+            }
+            pass.set_render_pipeline(pipeline);
+            pass.set_bind_group(1, bind_group, &[]);
+            pass.draw_indexed(start..start.saturating_add(count), 0, instance..instance + 1);
+        crate::diag::gpu_counters::draw(count, 1);
+            prop_draws = prop_draws.saturating_add(1);
+        }
+    }
+    viewmodel_draws += draw_dynamic_list(
+        &mut pass,
+        dynamic.effects.as_ref(),
+        world_lightmaps.lighting_group.as_ref(),
+        0,
+        [vp_x, vp_y, vp_w, vp_h],
+        &t6_blended,
+        // (`CODLEGACY_T6_NO_SOFT`: hard edges, a test aid for comparing.)
+        codlegacy_env::var_os("CODLEGACY_T6_NO_SOFT")
+            .is_none()
+            .then_some(&soft_group),
+        &cache,
+        &view_bind.t6_pipelines,
+        &world_textures,
+    );
+    drop(pass);
+    let mut attachments = vec![Some(colour_attachment(target, iw6_fogged))];
+    attachments.extend(view_motion.map(|m| Some(m.attachment())));
+    let mut pass =
+        context.begin_tracked_render_pass(bevy::render::render_resource::RenderPassDescriptor {
+            label: Some("bo2zm_viewmodel_pass"),
+            color_attachments: &attachments,
+            depth_stencil_attachment: Some(depth.get_attachment(StoreOp::Store)),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+    // (The gun and arms ride the camera: no motion for them.)
+    pass.set_bind_group(0, &view_bind.viewmodel_bind_group, &[view_offset.offset]);
+    viewmodel_draws += draw_dynamic_list(
+        &mut pass,
+        dynamic.viewmodel.as_ref(),
+        world_lightmaps.lighting_group.as_ref(),
+        GFX_DEPTH_RANGE_VIEWMODEL,
+        [vp_x, vp_y, vp_w, vp_h],
+        &|_| true,
+        None,
+        &cache,
+        &view_bind.t6_pipelines,
+        &world_textures,
+    );
+    viewmodel_draws += draw_dynamic_list(
+        &mut pass,
+        dynamic.viewmodel_effects.as_ref(),
+        world_lightmaps.lighting_group.as_ref(),
+        GFX_DEPTH_RANGE_VIEWMODEL,
+        [vp_x, vp_y, vp_w, vp_h],
+        &|_| true,
+        None,
+        &cache,
+        &view_bind.t6_pipelines,
+        &world_textures,
+    );
+    let _ = viewmodel_draws;
+    drop(pass);
+    gpu_span.end(context.command_encoder());
+    smodel_draws = smodel_draws.saturating_add(prop_draws);
+    stamp.draw_n = world_draws
+        .saturating_add(smodel_draws)
+        .saturating_add(xmodel_draws)
+        .saturating_add(fx_draws);
+    stamp.world_n = world_draws;
+    stamp.smodel_n = smodel_draws;
+    stamp.xmodel_n = xmodel_draws;
+    // bo2zm: frames per second, frame time and prop counts every 5 s.
+    let now = Instant::now();
+    if let Some(prev) = perf.last_frame {
+        let ms = now.duration_since(prev).as_secs_f32() * 1000.0;
+        perf.worst_ms = perf.worst_ms.max(ms);
+        // CODLEGACY_PIPELINE_LOG=1: a frame that took over half a second, as it
+        // happens (to line up with what was built or loaded then).
+        static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if ms >= 500.0
+            && *LOG.get_or_init(|| codlegacy_env::var_os("CODLEGACY_PIPELINE_LOG").is_some())
+        {
+            diag::info!(World, "slow frame: {ms:.0} ms");
+        }
+    }
+    perf.last_frame = Some(now);
+    perf.frames += 1;
+    perf.props_drawn += u64::from(prop_draws);
+    perf.prop_batches += u64::from(prop_batch_draws);
+    perf.props_culled += u64::from(props_culled);
+    perf.props_unseen += u64::from(props_unseen);
+    perf.world_surfaces += u64::from(world_draws);
+    perf.world_calls += u64::from(world_batch_draws);
+    let start = *perf.window_start.get_or_insert(now);
+    let span = now.duration_since(start).as_secs_f32();
+    // (`CODLEGACY_PERF_WINDOW=secs`: a shorter window, for tests that must end
+    // before another window takes the foreground.)
+    static WINDOW: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    let window = *WINDOW.get_or_init(|| {
+        codlegacy_env::var("CODLEGACY_PERF_WINDOW")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|v: &f32| *v >= 0.5)
+            .unwrap_or(5.0)
+    });
+    if span >= window && perf.frames > 1 {
+        let n = perf.frames as f32;
+        diag::info!(
+            World,
+            "bo2zm perf: {:.1} fps, {:.2} ms average, {:.2} ms worst; props {:.0} drawn ({:.0} opaque draws), {:.0} hidden by distance, {:.0} out of view per frame; world {:.0} surfaces in {:.0} draws; quality {}",
+            (n - 1.0) / span,
+            span * 1000.0 / (n - 1.0),
+            perf.worst_ms,
+            perf.props_drawn as f32 / n,
+            perf.prop_batches as f32 / n,
+            perf.props_culled as f32 / n,
+            perf.props_unseen as f32 / n,
+            perf.world_surfaces as f32 / n,
+            perf.world_calls as f32 / n,
+            if asset_core::t6_fast() { "fast" } else { "full" }
+        );
+        *perf = DiagnosticPerf {
+            last_census_at: perf.last_census_at,
+            last_frame: perf.last_frame,
+            ..Default::default()
+        };
+    }
+    let g0_queued = geometry.g0_world_surfs.len();
+    let line = format!(
+        "drawsurf geometry diagnostic: world_draws={world_draws} (in {world_batch_draws} draw calls) smodel_draws={smodel_draws} xmodel_draws={xmodel_draws} fx_draws={fx_draws} world_skipped={world_skipped} smodel_skipped={smodel_skipped} xmodel_skipped={xmodel_skipped} fx_skipped={fx_skipped} g0_queued={g0_queued} untextured={untextured_n} {untextured:?}"
+    );
+    // bo2zm: on change, at most every 5 s (it changes most frames);
+    // CODLEGACY_RENDER_LOG=1 only (written on this thread, a slow write held up
+    // the frame).
+    static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let due = *LOG.get_or_init(|| codlegacy_env::var_os("CODLEGACY_RENDER_LOG").is_some())
+        && perf
+        .last_census_at
+        .is_none_or(|at| now.duration_since(at).as_secs_f32() >= 5.0);
+    if last_census.as_ref() != Some(&line) && due {
+        *last_census = Some(line.clone());
+        perf.last_census_at = Some(now);
+        diag::warn!(World, "{line}");
+    }
+}
+
+pub(super) fn register(app: &mut App) {
+    if !geometry_diagnostic_enabled() {
+        return;
+    }
+    bevy::asset::embedded_asset!(app, "geometry_diagnostic.wgsl");
+    bevy::asset::embedded_asset!(app, "t6_sun_shadow.wgsl");
+    super::bo2_bloom::register(app);
+    super::h1_native::register(app);
+    super::iw6_native::register(app);
+    #[cfg(feature = "iw7")]
+    super::iw7_native::register(app);
+    super::t7_native::register(app);
+    super::shared_look::register(app);
+    #[cfg(feature = "jup")]
+    super::jup_native::register(app);
+    super::bo2_afterlife::register(app);
+    super::bo2_dof::register(app);
+    motion::register(app);
+    let Some(render_app) = app.get_sub_app_mut(bevy::render::RenderApp) else {
+        return;
+    };
+    render_app
+        .init_resource::<ExtractedDiagnosticGeometry>()
+        .init_resource::<DiagnosticGeometry>()
+        .init_resource::<DiagnosticWorldTextures>()
+        .init_resource::<DiagnosticWorldLightmaps>()
+        .init_resource::<DiagnosticDynamic>()
+        .init_resource::<skin::SkinCache>()
+        .init_resource::<ExtractedT6Dynamic>()
+        .init_resource::<SpecializedRenderPipelines<DiagnosticPipeline>>()
+        .add_systems(RenderStartup, (init_pipeline, sun_shadow::init, skin::init))
+        .add_systems(
+            Render,
+            (
+                upload_geometry.in_set(RenderSystems::PrepareResources),
+                upload_dynamic.in_set(RenderSystems::PrepareResources),
+                motion::prepare_motion.in_set(RenderSystems::PrepareResources),
+                prepare_views.in_set(RenderSystems::PrepareBindGroups),
+                prepare_world_textures.in_set(RenderSystems::PrepareBindGroups),
+                prepare_world_lightmaps.in_set(RenderSystems::PrepareBindGroups),
+            ),
+        )
+        .add_systems(
+            Core3d,
+            (
+                sun_shadow::draw_sun_shadow
+                    .in_set(Core3dSystems::MainPass)
+                    .before(draw_geometry_diagnostic),
+                motion::clear_motion
+                    .in_set(Core3dSystems::MainPass)
+                    .before(draw_geometry_diagnostic),
+                draw_geometry_diagnostic
+                    .in_set(Core3dSystems::MainPass)
+                    .in_set(super::draw::FallbackDrawSet)
+                    .after(main_opaque_pass_3d)
+                    .after(super::draw::ExactColourDrawSet),
+            ),
+        );
+}

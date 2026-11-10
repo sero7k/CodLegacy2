@@ -1,0 +1,26 @@
+[package]
+name = "render_jup"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Draws Modern Warfare III (2023) and Modern Warfare II (2022) maps the way the game does: its own programs (DXIL lowered to WGSL by dxil_sm6), material records and bindless pictures where the material-to-program mapping is known, its lighting terms and display stage elsewhere."
+
+[dependencies]
+codlegacy_env.workspace = true
+fastfile_jup.workspace = true
+dxil_sm6 = { path = "../dxil_sm6" }
+render_h1.workspace = true
+render_t7.workspace = true
+wgpu = "29"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+glam = "0.32.1"
+bcdec_rs.workspace = true
+
+[dev-dependencies]
+libloading.workspace = true
+png.workspace = true
+naga = { version = "29", features = ["wgsl-in"] }
+
+[lints]
+workspace = true

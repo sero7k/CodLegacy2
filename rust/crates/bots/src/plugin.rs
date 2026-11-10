@@ -1,0 +1,864 @@
+use bevy::ecs::system::SystemParam;
+use bevy::prelude::*;
+use bevy::tasks::{Task, futures_lite::future};
+use net::{
+    AUTHORITY_MS, AuthorityClock, AuthorityWorld, ClientActionInbox, ClientCommandInbox,
+    LocalPresentClient, ReliableEventHub, authority_should_tick, look_angles_from_degrees,
+};
+use sim::{ClientAction, ClientLifecycle, SimWorld, Tick};
+
+use crate::nav::{self, NAV_HULL, NAV_SCHEMA, NODE_HULL, NavGraph, RouteStats};
+use crate::query::{Budgeted, QueryCounters, QuerySubsystem, TraceBudget};
+use crate::roster::{
+    BotAddQueue, BotFireQueue, BotHold, BotRoster, BotTpQueue, BotTpTarget, BotTpWhere,
+    default_class_index,
+};
+use crate::sensor;
+use frame::{
+    AuthoritySet, BotNavigationAsync, BotNavigationReady, ClientSet, HasWorld, MatchTornDown, RuntimeRole,
+};
+
+const VIEW_PITCH_DOWN: f32 = 85.0;
+const TRACE_QUOTA: u32 = 96;
+const ASTAR_QUOTA: u32 = 2048;
+/// Ten seconds of authority ticks between aggregates. Compact enough to leave
+/// in a match, coarse enough not to be a per-query log in the hot path.
+const METER_PERIOD_TICKS: u32 = 200;
+
+#[derive(Resource, Default)]
+struct BotNav {
+    graph: NavGraph,
+    pending: Option<(u64, Task<NavGraph>, Option<asset_transport::StageHandle>)>,
+    /// The version of the scripts' path gates the graph has taken (`sync_gates`).
+    gates_seen: u64,
+}
+
+/// Where the shared quota went and whether pending work actually advanced.
+/// Reported per window; not a per-query trace.
+#[derive(Resource, Default)]
+struct BotMeter {
+    queries: QueryCounters,
+    controller_us: u64,
+    ticks: u32,
+    stuck_peak: usize,
+    live_peak: usize,
+    max_age: u32,
+    max_starved: u32,
+    /// Route totals at the last report, so the line carries this window's work.
+    routes_at_report: RouteStats,
+}
+
+impl BotMeter {
+    fn report(&mut self, totals: RouteStats, bots: usize) {
+        let was = self.routes_at_report;
+        let routes = RouteStats {
+            completed: totals.completed.saturating_sub(was.completed),
+            terminal: totals.terminal.saturating_sub(was.terminal),
+            cancelled: totals.cancelled.saturating_sub(was.cancelled),
+            discarded_attachments: totals
+                .discarded_attachments
+                .saturating_sub(was.discarded_attachments),
+            denied_slices: totals.denied_slices.saturating_sub(was.denied_slices),
+            ..RouteStats::default()
+        };
+        self.routes_at_report = totals;
+        let per = |row: &[u32; QuerySubsystem::COUNT]| {
+            QuerySubsystem::ALL
+                .iter()
+                .map(|s| format!("{}={}", s.label(), row[s.index()]))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        diag::info!(
+            Sim,
+            "bots: window={} bots={bots} attempted[{}] denied[{}] primitives={} \
+             routes done={} terminal={} cancelled={} discarded={} denied_slices={} \
+             age={} starve={} live_peak={} stuck_peak={} controller_us={}",
+            self.ticks,
+            per(&self.queries.attempted),
+            per(&self.queries.denied),
+            self.queries.primitives,
+            routes.completed,
+            routes.terminal,
+            routes.cancelled,
+            routes.discarded_attachments,
+            routes.denied_slices,
+            self.max_age,
+            self.max_starved,
+            self.live_peak,
+            self.stuck_peak,
+            self.controller_us,
+        );
+        self.queries = QueryCounters::ZERO;
+        self.controller_us = 0;
+        self.ticks = 0;
+        self.stuck_peak = 0;
+        self.live_peak = 0;
+        self.max_age = 0;
+        self.max_starved = 0;
+    }
+}
+
+pub struct BotsPlugin;
+
+impl Plugin for BotsPlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<BotRoster>()
+            .init_resource::<BotAddQueue>()
+            .init_resource::<BotHold>()
+            .init_resource::<BotTpQueue>()
+            .init_resource::<BotFireQueue>()
+            .init_resource::<BotNav>()
+            .init_resource::<BotNavigationReady>()
+            .init_resource::<BotNavigationAsync>()
+            .init_resource::<BotMeter>()
+            .add_systems(
+                Update,
+                (
+                    drain_bot_add_queue,
+                    drain_t6_test_clients,
+                    evict_bots_claiming_local_client,
+                    boot_bots,
+                    apply_bot_tp,
+                )
+                    .chain(),
+            )
+            .add_systems(
+                Update,
+                (reset_roster_on_match_torn_down, prepare_navigation)
+                    .chain()
+                    .in_set(ClientSet::Load),
+            )
+            .add_systems(
+                FixedUpdate,
+                (evict_bots_claiming_local_client, think_bots)
+                    .chain()
+                    .in_set(AuthoritySet::Ingress)
+                    .run_if(authority_should_tick),
+            );
+    }
+}
+
+fn reset_roster_on_match_torn_down(
+    mut torn: MessageReader<MatchTornDown>,
+    mut roster: ResMut<BotRoster>,
+    mut nav: ResMut<BotNav>,
+    mut ready: ResMut<BotNavigationReady>,
+) {
+    if torn.read().len() == 0 {
+        return;
+    }
+    *roster = BotRoster::default();
+    sim::lobby_bots::next_lobby();
+    *nav = BotNav::default();
+    ready.0 = false;
+}
+
+/// bo2mp: the next lobby gamertag: the pregame lobby's names in its order
+/// (`sim::lobby_bots`), so the bots play under the names the lobby showed.
+fn next_bot_name() -> String {
+    sim::lobby_bots::next_name()
+}
+
+/// bo2mp: Black Ops II's bot scripts asked for bots (`addtestclient`):
+/// each joins on the client number the scripts already gave it.
+fn drain_t6_test_clients(mut roster: ResMut<BotRoster>, world: Option<ResMut<AuthorityWorld>>) {
+    let Some(mut world) = world else {
+        return;
+    };
+    for n in world.0.take_t6_test_clients() {
+        // bo2mp: bots wear gamertags like a PS3-era lobby (his pick over
+        // BO2's [3arc] names): 1000 made-up names, some with a clan tag.
+        let name = next_bot_name();
+        if roster.add_bot_with_id(sim::ClientId(n), Some(name.clone())) {
+            diag::info!(Sim, "bots: Black Ops II test client {n} joins as {name}");
+        }
+    }
+    for n in world.0.take_t6_bot_leaves() {
+        diag::info!(Sim, "bots: Black Ops II bot {n} asked to leave (kept)");
+    }
+}
+
+fn drain_bot_add_queue(
+    mut queue: ResMut<BotAddQueue>,
+    mut roster: ResMut<BotRoster>,
+    local: Res<LocalPresentClient>,
+    world: Option<Res<AuthorityWorld>>,
+) {
+    let requests = queue.drain();
+    if requests.is_empty() {
+        return;
+    }
+    let mut taken = vec![local.0];
+    if let Some(world) = world.as_ref() {
+        taken.extend(world.0.clients_scoreboard().into_iter().map(|(id, _)| id));
+    }
+    for request in requests {
+        let count = request.count;
+        let added = roster.add_bots(count, &taken, request.dummy);
+        if added.len() < count as usize {
+            diag::warn!(
+                Sim,
+                "bots: add {count} — only {} minted, the roster is full",
+                added.len()
+            );
+        }
+        diag::info!(
+            Sim,
+            "bots: add {count} (dummy={}) → clients {:?}",
+            request.dummy,
+            added.iter().map(|id| id.0).collect::<Vec<_>>()
+        );
+    }
+}
+
+// The link hands the local player its real id during signon, which can land
+// after a bot was already minted. A slot holding that id would make `is_bot`
+// claim the player, so retire it — loudly, because by then it is a bug.
+fn evict_bots_claiming_local_client(mut roster: ResMut<BotRoster>, local: Res<LocalPresentClient>) {
+    if !roster.is_bot(local.0) {
+        return;
+    }
+    roster.bots.retain(|bot| bot.id != local.0);
+    diag::warn!(
+        Sim,
+        "bots: retired the slot on client {} — that id is the local player",
+        local.0.0
+    );
+}
+
+fn boot_bots(
+    mut roster: ResMut<BotRoster>,
+    mut actions: ResMut<ClientActionInbox>,
+    mut request_ids: ResMut<net::ActionRequestIds>,
+    installed: Option<Res<HasWorld>>,
+) {
+    if !installed.is_some_and(|installed| installed.0) {
+        return;
+    }
+    let seed = roster.seed;
+    for bot in &mut roster.bots {
+        if bot.joined {
+            continue;
+        }
+        let index = default_class_index(seed, bot.id, bot.class_picks);
+        let join_id = request_ids.allocate();
+        let class_request = request_ids.allocate();
+        let name_request = request_ids.allocate();
+        let queued = [
+            actions.push(
+                bot.id,
+                ClientAction::JoinMatch {
+                    request_id: join_id,
+                },
+            ),
+            actions.push(
+                bot.id,
+                ClientAction::ChooseDefaultClass {
+                    request_id: class_request,
+                    index,
+                },
+            ),
+            actions.push(
+                bot.id,
+                ClientAction::SetName {
+                    request_id: name_request,
+                    name: entity_iw4::pack_client_state_name(match &bot.name {
+                        Some(name) => name.as_str(),
+                        None if bot.brain.is_none() => "dummy",
+                        None => "bot",
+                    }),
+                },
+            ),
+        ];
+        if let Some(error) = queued.into_iter().find_map(Result::err) {
+            diag::warn!(Sim, "bots: client {} not booted — {error}", bot.id.0);
+            continue;
+        }
+        bot.joined = true;
+        bot.class_picks += 1;
+        diag::info!(
+            Sim,
+            "bots: JoinMatch+changeclass client={} pick={index} request_id={class_request}",
+            bot.id.0,
+        );
+    }
+}
+
+fn apply_bot_tp(
+    mut queue: ResMut<BotTpQueue>,
+    roster: Res<BotRoster>,
+    mut actions: ResMut<ClientActionInbox>,
+    mut request_ids: ResMut<net::ActionRequestIds>,
+    world: Option<Res<AuthorityWorld>>,
+    local: Res<LocalPresentClient>,
+) {
+    let requests = queue.drain();
+    if requests.is_empty() {
+        return;
+    }
+    let Some(world) = world else {
+        return;
+    };
+    let snapshot = world.0.snapshot(Tick(0));
+    let local_ps = snapshot
+        .meta
+        .for_client(local.0)
+        .is_some_and(|m| m.lifecycle == ClientLifecycle::Alive)
+        .then(|| {
+            snapshot
+                .players
+                .iter()
+                .find(|(id, _)| *id == local.0)
+                .map(|(_, ps)| ps)
+        })
+        .flatten();
+    for request in requests {
+        let ids: Vec<sim::ClientId> = match request.target {
+            BotTpTarget::All => roster.bots.iter().map(|b| b.id).collect(),
+            BotTpTarget::Id(id) => {
+                if roster.is_bot(id) {
+                    vec![id]
+                } else {
+                    diag::warn!(Sim, "bots: tp skipped — client {} is not a bot", id.0);
+                    Vec::new()
+                }
+            }
+        };
+        for id in ids {
+            let current = snapshot
+                .players
+                .iter()
+                .find(|(c, _)| *c == id)
+                .map(|(_, ps)| ps.viewangles)
+                .unwrap_or([0.0, 0.0, 0.0]);
+            let (origin, angles) = match request.where_ {
+                BotTpWhere::Absolute { origin, yaw, pitch } => {
+                    let mut angles = current;
+                    if let Some(yaw) = yaw {
+                        angles[1] = yaw;
+                    }
+                    if let Some(pitch) = pitch {
+                        angles[0] = pitch;
+                    }
+                    (origin, angles)
+                }
+                BotTpWhere::Above { height } => {
+                    let Some(ps) = local_ps else {
+                        diag::warn!(Sim, "bots: tp above skipped — local not Alive");
+                        continue;
+                    };
+                    let origin = [ps.origin[0], ps.origin[1], ps.origin[2] + height];
+                    (origin, aim_viewangles(origin, ps.origin))
+                }
+            };
+            let request_id = request_ids.allocate();
+            if let Err(error) = actions.push(
+                id,
+                ClientAction::Move {
+                    request_id,
+                    origin,
+                    angles,
+                },
+            ) {
+                diag::warn!(Sim, "bots: tp client={} not queued — {error}", id.0);
+                continue;
+            }
+            diag::info!(
+                Sim,
+                "bots: tp client={} ({:.1} {:.1} {:.1}) request_id={request_id}",
+                id.0,
+                origin[0],
+                origin[1],
+                origin[2]
+            );
+        }
+    }
+}
+
+#[derive(SystemParam)]
+struct ThinkBots<'w> {
+    clock: Res<'w, AuthorityClock>,
+    world: ResMut<'w, AuthorityWorld>,
+    nav: Res<'w, BotNav>,
+    roster: ResMut<'w, BotRoster>,
+    cmds: ResMut<'w, ClientCommandInbox>,
+    actions: ResMut<'w, ClientActionInbox>,
+    request_ids: ResMut<'w, net::ActionRequestIds>,
+    hold: Res<'w, BotHold>,
+    nav_ready: Res<'w, BotNavigationReady>,
+    fire: ResMut<'w, BotFireQueue>,
+    reliable: ResMut<'w, ReliableEventHub>,
+    meter: ResMut<'w, BotMeter>,
+}
+
+fn think_bots(mut p: ThinkBots) {
+    // A bot has no client reading its reliable channel to ack it, so nothing
+    // else ever drains it — leave this out and match broadcasts (deaths, hit
+    // markers, ...) overflow the queue and the bot gets retired as if its
+    // connection had died.
+    for bot in &p.roster.bots {
+        p.reliable.ack_all(bot.id);
+    }
+    if p.roster.bots.is_empty() {
+        p.fire.drain();
+        return;
+    }
+
+    let snapshot = p.world.0.snapshot(Tick(p.clock.tick.saturating_sub(1)));
+    let fires = p.fire.drain();
+    let mut budget = TraceBudget::new(TRACE_QUOTA);
+    let mut astar = ASTAR_QUOTA;
+    let count = p.roster.bots.len();
+    let start = (p.clock.tick as usize / 2) % count.max(1);
+    let mut controller_us = 0u64;
+    let seed = p.roster.seed;
+    for offset in 0..count {
+        let bot = &mut p.roster.bots[(start + offset) % count];
+        let Some(meta) = snapshot.meta.for_client(bot.id) else {
+            continue;
+        };
+        if meta.lifecycle != ClientLifecycle::Alive {
+            if let Some(brain) = bot.brain.as_mut() {
+                brain.cancel_navigation();
+            }
+            continue;
+        }
+        if bot.class_picked_in != Some(meta.life_sequence) {
+            bot.class_picked_in = Some(meta.life_sequence);
+            let index = default_class_index(seed, bot.id, bot.class_picks);
+            let request_id = p.request_ids.allocate();
+            match p.actions.push(
+                bot.id,
+                ClientAction::ChooseDefaultClass { request_id, index },
+            ) {
+                Ok(()) => bot.class_picks += 1,
+                Err(error) => diag::warn!(
+                    Sim,
+                    "bots: client {} class pick not queued — {error}",
+                    bot.id.0
+                ),
+            }
+        }
+        // A match started before the map's first graph is baked: the bots
+        // stand still until it lands.
+        let waiting = !p.nav_ready.0 && p.nav.graph.is_empty();
+        let mut cmd = if p.hold.0 || bot.brain.is_none() || waiting {
+            let Some((_, ps)) = snapshot.players.iter().find(|(id, _)| *id == bot.id) else {
+                continue;
+            };
+            playerstate_iw4::UserCmd {
+                server_time: p.clock.time_ms,
+                angles: look_angles_from_degrees(std::array::from_fn(|axis| {
+                    ps.viewangles[axis] - ps.delta_angles[axis]
+                })),
+                weapon: ps.weapon as u16,
+                weapon_mapped: ps.weapon as u16,
+                ..playerstate_iw4::UserCmd::default()
+            }
+        } else if let Some(brain) = bot.brain.as_mut() {
+            let mut queried = Budgeted::new(&mut p.world.0, &mut budget);
+            let Some(obs) =
+                sensor::observe_focused(&snapshot, bot.id, &mut queried, brain.focus_target())
+            else {
+                continue;
+            };
+            let started = std::time::Instant::now();
+            let mut cmd = brain.drive_nav(
+                &obs,
+                &mut queried,
+                Some(&p.nav.graph),
+                &mut astar,
+                AUTHORITY_MS,
+            );
+            controller_us += started.elapsed().as_micros() as u64;
+            cmd.server_time = p.clock.time_ms;
+            cmd
+        } else {
+            continue;
+        };
+        if fires.iter().any(|target| match target {
+            BotTpTarget::All => true,
+            BotTpTarget::Id(id) => *id == bot.id,
+        }) {
+            cmd.buttons |= playerstate_iw4::buttons::ATTACK;
+        }
+        p.cmds.push(bot.id, None, cmd, None);
+    }
+    if count == 0 {
+        return;
+    }
+    // Only a bot with a movement task that did not move counts as stuck; a
+    // hold, an interaction or waiting to respawn is not a navigation failure.
+    let tick = p.clock.tick;
+    let mut routes = RouteStats::default();
+    let mut stuck = 0;
+    let mut live = 0;
+    let (mut age, mut starved) = (0, 0);
+    for bot in &p.roster.bots {
+        let Some(brain) = bot.brain.as_ref() else {
+            continue;
+        };
+        let stats = brain.route_stats();
+        routes.completed += stats.completed;
+        routes.terminal += stats.terminal;
+        routes.cancelled += stats.cancelled;
+        routes.discarded_attachments += stats.discarded_attachments;
+        routes.denied_slices += stats.denied_slices;
+        let (bot_age, bot_starved) = brain.route_age();
+        if bot_age != 0 {
+            live += 1;
+        }
+        age = age.max(bot_age);
+        starved = starved.max(bot_starved);
+        stuck += usize::from(brain.stuck(tick));
+    }
+    let meter = &mut p.meter;
+    meter.queries.merge(&budget.counters);
+    meter.controller_us += controller_us;
+    meter.ticks += 1;
+    meter.stuck_peak = meter.stuck_peak.max(stuck);
+    meter.live_peak = meter.live_peak.max(live);
+    meter.max_age = meter.max_age.max(age);
+    meter.max_starved = meter.max_starved.max(starved);
+    if meter.ticks >= METER_PERIOD_TICKS {
+        meter.report(routes, count);
+    }
+}
+
+fn prepare_navigation(
+    world: Option<ResMut<AuthorityWorld>>,
+    installed: Option<Res<HasWorld>>,
+    role: Res<RuntimeRole>,
+    mut nav: ResMut<BotNav>,
+    mut ready: ResMut<BotNavigationReady>,
+    mut nav_async: ResMut<BotNavigationAsync>,
+    load: Option<Res<assets::MapLoadProcess>>,
+) {
+    if !matches!(*role, RuntimeRole::Listen | RuntimeRole::Dedicated) {
+        ready.0 = true;
+        return;
+    }
+    if !installed.is_some_and(|installed| installed.0) {
+        return;
+    }
+    let Some(mut world) = world else {
+        return;
+    };
+    // bo2mp: Black Ops II's scripts route over the path nodes made from the
+    // graph, so a map that needs them still holds the load for the bake.
+    nav_async.0 = nav_async_enabled() && !world.0.t6_needs_path_nodes();
+    ready.0 = refresh_nav(&world.0, &mut nav, load.as_deref());
+    if ready.0 && use_path_nodes(&world.0) {
+        sync_gates(&mut nav);
+    }
+    // bo2mp: a map from another game has no Black Ops II path nodes; BO2's
+    // bots route over the walk graph baked here instead.
+    if ready.0 && !nav.graph.is_empty() && world.0.t6_needs_path_nodes() {
+        let nodes = t6_path_nodes(&nav.graph);
+        world.0.adopt_t6_path_nodes(nodes);
+    }
+}
+
+/// The baked walk graph as Black Ops II path nodes: one plain path node per
+/// graph node, linked to its neighbours by their distance.
+fn t6_path_nodes(graph: &crate::nav::NavGraph) -> Vec<sim::T6PathNode> {
+    let dist = |a: [f32; 3], b: [f32; 3]| ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt();
+    graph
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(i, &origin)| sim::T6PathNode {
+            ty: 1,
+            origin,
+            radius: 32.0,
+            links: graph
+                .adj
+                .get(i)
+                .into_iter()
+                .flatten()
+                .filter_map(|e| Some((e.to, dist(origin, *graph.nodes.get(e.to as usize)?), false)))
+                .collect(),
+            ..Default::default()
+        })
+        .collect()
+}
+
+/// A Ghosts map's scripts close and open its doors to walkers (`disconnectpaths` /
+/// `connectpaths`): the graph's links through each mover's volume follow.
+fn sync_gates(nav: &mut BotNav) {
+    let (version, gates) = asset_world::iw6_path_gates();
+    if version == nav.gates_seen || nav.graph.is_empty() {
+        return;
+    }
+    nav.gates_seen = version;
+    let mut changed = 0;
+    // A restarted match boots its scripts again with no gate set: the old ones open.
+    let stale: Vec<_> = nav.graph.gates.boxes.iter().filter(|b| b.blocked && !gates.iter().any(|g| g.key == b.key)).map(|b| (b.key, b.mins, b.maxs)).collect();
+    for (key, mins, maxs) in stale {
+        changed += usize::from(nav.graph.set_gate(key, mins, maxs, false));
+    }
+    for g in gates.iter() {
+        changed += usize::from(nav.graph.set_gate(g.key, g.mins, g.maxs, g.blocked));
+    }
+    if changed > 0 {
+        diag::info!(Sim, "bots: {changed} of {} doors changed the routes", gates.len());
+    }
+}
+
+fn refresh_nav(world: &SimWorld, nav: &mut BotNav, load: Option<&assets::MapLoadProcess>) -> bool {
+    let digest = world.content_digest();
+    let hull = if use_path_nodes(world) { NODE_HULL } else { NAV_HULL };
+    if nav.graph.digest == digest && nav.graph.schema == NAV_SCHEMA && (nav.graph.hull == hull || nav.graph.hull == NAV_HULL && hull == NODE_HULL) {
+        return true;
+    }
+    if let Some((pending_digest, task, stage)) = nav.pending.as_mut()
+        && *pending_digest == digest
+    {
+        if let Some(graph) = future::block_on(future::poll_once(task)) {
+            nav.graph = graph;
+            nav.gates_seen = 0;
+            // The bake is only navigation once this graph is the one the bots
+            // will read, which is here and not on the worker.
+            if let Some(stage) = stage.take() {
+                // What the walk actually produced: the links bots route over.
+                // Nodes alone say how finely the grid was sampled; edges say
+                // how much of the map turned out to be connected.
+                let edges: usize = nav.graph.adj.iter().map(Vec::len).sum();
+                stage.set_completed(edges as u64);
+                stage.done();
+            }
+            nav.pending = None;
+            return true;
+        }
+        return false;
+    }
+    // A bake is one indivisible walk of the grid, so nothing counts up while it
+    // runs; the edge count is written once, when the graph it produced is the
+    // one the bots read.
+    let stage = load.map(|load| {
+        load.progress
+            .begin(asset_transport::StageId::Navigation, None)
+    });
+    let mut snapshot = world.clone();
+    let generation = nav.graph.generation.wrapping_add(1);
+    nav.pending = Some((
+        digest,
+        assets::load_pool().spawn(async move {
+            let mut graph = navigation_for(&mut snapshot, digest);
+            graph.generation = generation;
+            graph
+        }),
+        stage,
+    ));
+    false
+}
+
+const NAV_CACHE_KIND: &str = "nav";
+
+/// The digest, schema and hull that decide in-memory reuse are the whole key,
+/// so the same map read back from disk is the same graph the walk would bake.
+fn nav_cache_key(digest: u64) -> String {
+    format!("{digest:016x}-{NAV_SCHEMA}-{NAV_HULL:08x}")
+}
+
+/// bo2mp: the bake every build folder shares (a shared kind of the artifact
+/// cache): a new build's first visit to Skyjacked waited 6.1 s on it, a read
+/// back takes 120 ms. The map's content digest hashes its brushes but not its
+/// triangle mesh or static models, which a build's loader may read
+/// differently, so their hash is in the key too. `BO2MP_NAV_SHARED=off` keeps
+/// the bake in the build's own folder.
+const NAV_SHARED_KIND: &str = "navshared";
+
+fn nav_async_enabled() -> bool {
+    !std::env::var("CODLEGACY_NAV_ASYNC").is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false"))
+}
+
+fn nav_shared() -> bool {
+    !std::env::var("BO2MP_NAV_SHARED").is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false"))
+}
+
+fn nav_shared_key(digest: u64, mesh: &sim::SimClipMesh) -> String {
+    format!("{}-{:016x}", nav_cache_key(digest), collision_digest(mesh))
+}
+
+/// The walk's collision beyond the content digest: the triangle mesh's
+/// tables and where each static model stands.
+fn collision_digest(mesh: &sim::SimClipMesh) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mut word = |w: u32| h = (h ^ u64::from(w)).wrapping_mul(0x0000_0100_0000_01b3);
+    let t = &*mesh.tables;
+    word(t.verts.len() as u32);
+    t.verts.iter().flatten().for_each(|v| word(v.to_bits()));
+    word(t.tri_indices.len() as u32);
+    t.tri_indices.iter().for_each(|&i| word(u32::from(i)));
+    t.tri_edge_is_walkable.iter().for_each(|&w| word(u32::from(w)));
+    t.tri_surface_flags.iter().chain(&t.tri_content_flags).for_each(|&f| word(f));
+    word(mesh.static_models.len() as u32);
+    for m in &mesh.static_models {
+        word(m.index);
+        m.name.bytes().for_each(|b| word(u32::from(b)));
+        let s = &m.model;
+        s.origin.iter().chain(s.inv_scaled_axis.iter().flatten()).chain(&s.bounds_mid).chain(&s.bounds_half).for_each(|v| word(v.to_bits()));
+    }
+    h
+}
+
+/// Walking the grid costs seconds of load, and a match teardown drops the graph
+/// with the roster, so the second start of a map would pay it again. Keep the
+/// bake in the artifact cache under its own key and only walk on a miss.
+fn navigation_for(world: &mut SimWorld, digest: u64) -> NavGraph {
+    if use_path_nodes(world) {
+        let started = std::time::Instant::now();
+        let graph = nav::from_path_nodes(&*world, world.iw6_path_nodes(), digest);
+        let edges: usize = graph.adj.iter().map(Vec::len).sum();
+        if edges > 0 {
+            diag::info!(
+                Sim,
+                "bots: navigation from the map's {} path nodes: {edges} links ({} traversals) in {:.1}ms",
+                graph.nodes.len(),
+                graph.adj.iter().flatten().filter(|e| e.kind == nav::TraversalKind::Negotiate).count(),
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+            return graph;
+        }
+        diag::warn!(Sim, "bots: the map's path nodes gave no links; baking the grid instead");
+    }
+    let key = nav_cache_key(digest);
+    let shared = nav_shared().then(|| nav_shared_key(digest, world.clip_mesh()));
+    let read = |kind: &str, key: &str| {
+        assets::cache_get(kind, key)
+            .as_deref()
+            .and_then(NavGraph::cache_decode)
+            .filter(|graph| {
+                graph.digest == digest
+                    && graph.schema == NAV_SCHEMA
+                    && graph.hull == NAV_HULL
+                    // bo2mp: an empty graph is not kept (one baked before the map's
+                    // collision mesh bounded the walk would stay empty for good).
+                    && !graph.nodes.is_empty()
+            })
+    };
+    let found = match shared.as_deref() {
+        Some(shared) => read(NAV_SHARED_KIND, shared).map(|graph| (graph, "shared cache")).or_else(|| {
+            // This build's own bake is this world's: the shared folder takes a copy.
+            let graph = read(NAV_CACHE_KIND, &key)?;
+            if let Err(error) = assets::cache_put(NAV_SHARED_KIND, shared, &graph.cache_encode()) {
+                diag::warn!(Sim, "bots: navigation cache store {shared}: {error}");
+            }
+            Some((graph, "cache"))
+        }),
+        None => read(NAV_CACHE_KIND, &key).map(|graph| (graph, "cache")),
+    };
+    if let Some((graph, from)) = found {
+        diag::info!(
+            Sim,
+            "bots: navigation read from {from}: {} nodes, {} drops{}",
+            graph.nodes.len(),
+            graph.drops,
+            if graph.truncated { ", truncated" } else { "" }
+        );
+        return graph;
+    }
+    let started = std::time::Instant::now();
+    let mut graph = NavGraph::default();
+    bake_navigation(world, &mut graph);
+    diag::info!(
+        Sim,
+        "bots: navigation prepared in {:.1}ms on worker",
+        started.elapsed().as_secs_f64() * 1000.0
+    );
+    if graph.nodes.is_empty() {
+        diag::warn!(Sim, "bots: navigation found no walkable ground (no collision bounds or seeds); not cached");
+    } else {
+        let (kind, key) = shared.map_or((NAV_CACHE_KIND, key), |shared| (NAV_SHARED_KIND, shared));
+        if let Err(error) = assets::cache_put(kind, &key, &graph.cache_encode()) {
+            diag::warn!(Sim, "bots: navigation cache store {key}: {error}");
+        }
+    }
+    graph
+}
+
+/// A Ghosts map routes its bots over the map's own path nodes (`BO2MP_IW6_BOT_NAV=grid` bakes
+/// the walk grid as every other map does).
+fn use_path_nodes(world: &SimWorld) -> bool {
+    !world.iw6_path_nodes().is_empty() && !std::env::var("BO2MP_IW6_BOT_NAV").is_ok_and(|v| v.trim().eq_ignore_ascii_case("grid"))
+}
+
+fn bake_navigation(world: &mut SimWorld, graph: &mut NavGraph) {
+    let digest = world.content_digest();
+    if graph.digest == digest && graph.schema == NAV_SCHEMA && graph.hull == NAV_HULL {
+        return;
+    }
+    let generation = graph.generation.wrapping_add(1);
+    let mut seeds = world.authored_spawn_origins();
+    seeds.extend(
+        world
+            .objectives
+            .compass
+            .iter()
+            .map(|objective| objective.origin),
+    );
+    // bo2mp: the world's collision is its brushes and its triangle mesh
+    // together: a map that collides through triangles alone (Infinite
+    // Warfare's: its only brushes are its brush models' boxes, about their
+    // own origins) is bounded by its mesh.
+    let world_bounds = match (nav::brush_bounds(world.clip_brushes()), nav::mesh_bounds(&world.clip_mesh().tables.verts)) {
+        (Some(a), Some(b)) => Some((std::array::from_fn(|k| a.0[k].min(b.0[k])), std::array::from_fn(|k| a.1[k].max(b.1[k])))),
+        (a, b) => a.or(b),
+    };
+    let bounds = world_bounds.and_then(|w| nav::playable_bounds_within(w, &seeds));
+    let Some(bounds) = bounds else {
+        *graph = NavGraph {
+            generation,
+            digest,
+            schema: NAV_SCHEMA,
+            hull: NAV_HULL,
+            ..NavGraph::default()
+        };
+        return;
+    };
+    *graph = nav::bake_seeded(world, bounds, digest, &seeds);
+    graph.generation = generation;
+}
+
+fn aim_viewangles(from: [f32; 3], target: [f32; 3]) -> [f32; 3] {
+    let dir = [
+        target[0] - from[0],
+        target[1] - from[1],
+        target[2] - from[2],
+    ];
+    if dir[0] == 0.0 && dir[1] == 0.0 {
+        let pitch = if dir[2] < 0.0 {
+            VIEW_PITCH_DOWN
+        } else {
+            -VIEW_PITCH_DOWN
+        };
+        return [pitch, 0.0, 0.0];
+    }
+    let mut angles = math_iw4::vect_to_angles(dir);
+    angles[0] = math_iw4::angle_normalize_360(angles[0]);
+    angles[1] = math_iw4::angle_normalize_360(angles[1]);
+    if angles[0] > 180.0 {
+        angles[0] -= 360.0;
+    }
+    angles[0] = angles[0].clamp(-VIEW_PITCH_DOWN, VIEW_PITCH_DOWN);
+    angles
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_nav_key_follows_the_collision() {
+        let mesh = sim::SimClipMesh::default();
+        let key = nav_shared_key(7, &mesh);
+        assert!(key.starts_with(&nav_cache_key(7)));
+        assert_eq!(key, nav_shared_key(7, &mesh.clone()));
+        let mut moved = mesh.clone();
+        std::sync::Arc::make_mut(&mut moved.tables).verts.push([1.0, 2.0, 3.0]);
+        assert_ne!(key, nav_shared_key(7, &moved));
+        assert_ne!(key, nav_shared_key(8, &mesh));
+    }
+}

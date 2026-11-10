@@ -1,0 +1,2081 @@
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use sim::{ClientId, SimBrush};
+
+use crate::observation::ModeObjective;
+use crate::query::{HullTrace, QueryResult, QuerySubsystem, SightSample, WalkSample, WorldQuery};
+
+pub const NAV_SCHEMA: u32 = 8;
+pub const GRID_IN: f32 = 48.0;
+pub const SNAP_IN: f32 = 256.0;
+pub const STEP_Z_IN: f32 = 18.0;
+const DROP_Z_MAX: f32 = 192.0;
+/// Stand-hull walk bake: grid, snap, step height. Part of the cache key.
+pub const NAV_HULL: u32 = ((GRID_IN as u32) << 16) ^ ((SNAP_IN as u32) << 8) ^ (STEP_Z_IN as u32);
+pub const EXPAND_CAP: u32 = 2048;
+pub const SEED_PAD_IN: f32 = 768.0;
+const DEDUPE_IN: f32 = 8.0;
+const COLUMN_CAP: usize = 65536;
+// Prefer completing a route within the shared quota over finding the shortest route.
+const HEURISTIC_WEIGHT: f32 = 1.5;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathError {
+    EmptyGraph,
+    NoStartSupport,
+    NoGoalSupport,
+    IncompleteGraph,
+    Unreachable,
+    BudgetExhausted { expanded: u32 },
+    GraphChanged,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TraversalKind {
+    Walk,
+    Drop,
+    BreakGlass,
+    /// A traversal the map authored (a Ghosts `Begin` -> `End` node pair: jump, climb, vault).
+    Negotiate,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NavEdge {
+    pub to: u16,
+    pub cost: f32,
+    pub kind: TraversalKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RouteStep {
+    pub entry: [f32; 3],
+    pub position: [f32; 3],
+    pub kind: TraversalKind,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct NavGraph {
+    pub generation: u64,
+    pub truncated: bool,
+    pub digest: u64,
+    pub schema: u32,
+    pub hull: u32,
+    pub nodes: Vec<[f32; 3]>,
+    pub component: Vec<u16>,
+    pub adj: Vec<Vec<NavEdge>>,
+    pub drops: u32,
+    pub component_links: Vec<Vec<u16>>,
+    /// Doors and other movers whose volume closes the links through it (`connectpaths` /
+    /// `disconnectpaths`); empty on a graph with none.
+    pub gates: Gates,
+}
+
+/// The volumes of movers that open and close routes, and the graph's links as they stand with
+/// every gate open.
+#[derive(Clone, Debug, Default)]
+pub struct Gates {
+    pub boxes: Vec<GateBox>,
+    /// `adj` with no gate closed (kept from the first gate on).
+    pub full_adj: Vec<Vec<NavEdge>>,
+}
+
+/// One mover's volume: closed (`blocked`), the links whose walk crosses it do not exist.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GateBox {
+    pub key: u32,
+    pub mins: [f32; 3],
+    pub maxs: [f32; 3],
+    pub blocked: bool,
+    /// The links through the volume: (from node, index in `full_adj[from]`).
+    pub links: Vec<(u16, u16)>,
+}
+
+/// How far the walking hull reaches to each side of a node's centre line.
+const GATE_REACH_IN: f32 = 15.0;
+
+/// Does the segment `a`..`b` cross the box (slab test)?
+fn segment_in_box(a: [f32; 3], b: [f32; 3], mins: [f32; 3], maxs: [f32; 3]) -> bool {
+    let (mut t0, mut t1) = (0.0f32, 1.0f32);
+    for k in 0..3 {
+        let d = b[k] - a[k];
+        if d.abs() < 1e-6 {
+            if a[k] < mins[k] || a[k] > maxs[k] {
+                return false;
+            }
+            continue;
+        }
+        let (mut n, mut f) = ((mins[k] - a[k]) / d, (maxs[k] - a[k]) / d);
+        if n > f {
+            std::mem::swap(&mut n, &mut f);
+        }
+        t0 = t0.max(n);
+        t1 = t1.min(f);
+        if t0 > t1 {
+            return false;
+        }
+    }
+    true
+}
+
+impl NavGraph {
+    /// A mover's volume, closed (`blocked`) or open: `disconnectpaths` / `connectpaths` on a
+    /// brush entity unlink / relink the path nodes' links inside its volume. Returns whether any
+    /// route changed (the graph's generation then moves, which makes walking bots re-plan).
+    pub fn set_gate(&mut self, key: u32, mins: [f32; 3], maxs: [f32; 3], blocked: bool) -> bool {
+        if self.gates.full_adj.is_empty() {
+            self.gates.full_adj = self.adj.clone();
+        }
+        // The walking hull's width to each side, and a capsule's height up and down.
+        let wide = [mins[0] - GATE_REACH_IN, mins[1] - GATE_REACH_IN, mins[2] - NODE_CENTER_IN];
+        let tall = [maxs[0] + GATE_REACH_IN, maxs[1] + GATE_REACH_IN, maxs[2] + NODE_CENTER_IN];
+        let existing = self.gates.boxes.iter().position(|g| g.key == key);
+        if let Some(g) = existing.map(|i| &self.gates.boxes[i])
+            && g.mins == mins
+            && g.maxs == maxs
+            && g.blocked == blocked
+        {
+            return false;
+        }
+        let mut links = Vec::new();
+        for (a, edges) in self.gates.full_adj.iter().enumerate() {
+            for (n, e) in edges.iter().enumerate() {
+                // The node's centre is the capsule's middle, a hull's half height above the feet.
+                let up = |p: [f32; 3]| [p[0], p[1], p[2] + NODE_CENTER_IN];
+                if segment_in_box(up(self.nodes[a]), up(self.nodes[e.to as usize]), wide, tall) {
+                    links.push((a as u16, n as u16));
+                }
+            }
+        }
+        let gate = GateBox { key, mins, maxs, blocked, links };
+        match existing {
+            Some(i) => self.gates.boxes[i] = gate,
+            None => self.gates.boxes.push(gate),
+        }
+        self.apply_gates();
+        true
+    }
+
+    /// The links as the gates leave them, and the components over them.
+    fn apply_gates(&mut self) {
+        let mut adj = self.gates.full_adj.clone();
+        let mut gone: Vec<(u16, u16)> =
+            self.gates.boxes.iter().filter(|g| g.blocked).flat_map(|g| g.links.iter().copied()).collect();
+        gone.sort_unstable_by(|a, b| b.cmp(a));
+        gone.dedup();
+        for (a, n) in gone {
+            adj[a as usize].remove(n as usize);
+        }
+        self.adj = adj;
+        self.component = label_components(self.nodes.len(), &self.adj);
+        self.component_links = vec![Vec::new(); self.component.iter().copied().max().map_or(0, |c| c as usize + 1)];
+        for (i, edges) in self.adj.iter().enumerate() {
+            for edge in edges {
+                let (a, b) = (self.component[i], self.component[edge.to as usize]);
+                if a != b && !self.component_links[a as usize].contains(&b) {
+                    self.component_links[a as usize].push(b);
+                }
+            }
+        }
+        self.generation = self.generation.wrapping_add(1);
+    }
+}
+
+/// Layout tag for the blob below. The bake's own [`NAV_SCHEMA`] and
+/// [`NAV_HULL`] travel inside it, so only a change to the packing itself
+/// belongs here.
+const CACHE_MAGIC: u32 = 0x5641_4e30;
+const CACHE_FORMAT: u32 = 1;
+
+impl TraversalKind {
+    fn tag(self) -> u8 {
+        match self {
+            Self::Walk => 0,
+            Self::Drop => 1,
+            Self::BreakGlass => 2,
+            Self::Negotiate => 3,
+        }
+    }
+
+    fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            0 => Some(Self::Walk),
+            1 => Some(Self::Drop),
+            2 => Some(Self::BreakGlass),
+            3 => Some(Self::Negotiate),
+            _ => None,
+        }
+    }
+}
+
+impl NavGraph {
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
+    /// The graph is a flat table of nodes and edges, so it stores as one blob.
+    /// `component` and `adj` are one row per node, so their lengths are implied.
+    /// `generation` is per-run bookkeeping and stays out.
+    pub fn cache_encode(&self) -> Vec<u8> {
+        let edges = self.adj.iter().map(Vec::len).sum::<usize>();
+        let mut out = Vec::with_capacity(40 + self.nodes.len() * 18 + edges * 7);
+        out.extend_from_slice(&CACHE_MAGIC.to_le_bytes());
+        out.extend_from_slice(&CACHE_FORMAT.to_le_bytes());
+        out.extend_from_slice(&self.digest.to_le_bytes());
+        out.extend_from_slice(&self.schema.to_le_bytes());
+        out.extend_from_slice(&self.hull.to_le_bytes());
+        out.extend_from_slice(&self.drops.to_le_bytes());
+        out.push(u8::from(self.truncated));
+        out.extend_from_slice(&(self.nodes.len() as u32).to_le_bytes());
+        for node in &self.nodes {
+            for value in node {
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        for component in &self.component {
+            out.extend_from_slice(&component.to_le_bytes());
+        }
+        for edges in &self.adj {
+            out.extend_from_slice(&(edges.len() as u32).to_le_bytes());
+            for edge in edges {
+                out.extend_from_slice(&edge.to.to_le_bytes());
+                out.extend_from_slice(&edge.cost.to_le_bytes());
+                out.push(edge.kind.tag());
+            }
+        }
+        out.extend_from_slice(&(self.component_links.len() as u32).to_le_bytes());
+        for links in &self.component_links {
+            out.extend_from_slice(&(links.len() as u32).to_le_bytes());
+            for link in links {
+                out.extend_from_slice(&link.to_le_bytes());
+            }
+        }
+        out
+    }
+
+    /// A blob from disk is only as good as it reads back: a short, truncated or
+    /// out-of-range one is a miss, not a graph the router would index past.
+    pub fn cache_decode(blob: &[u8]) -> Option<Self> {
+        let mut at = 0usize;
+        if word(blob, &mut at)? != CACHE_MAGIC || word(blob, &mut at)? != CACHE_FORMAT {
+            return None;
+        }
+        let digest = long(blob, &mut at)?;
+        let schema = word(blob, &mut at)?;
+        let hull = word(blob, &mut at)?;
+        let drops = word(blob, &mut at)?;
+        let truncated = match byte(blob, &mut at)? {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
+        let count = word(blob, &mut at)? as usize;
+        if count > u16::MAX as usize {
+            return None;
+        }
+        let mut nodes = Vec::with_capacity(count);
+        for _ in 0..count {
+            nodes.push([
+                float(blob, &mut at)?,
+                float(blob, &mut at)?,
+                float(blob, &mut at)?,
+            ]);
+        }
+        let mut component = Vec::with_capacity(count);
+        for _ in 0..count {
+            component.push(half(blob, &mut at)?);
+        }
+        let mut adj = Vec::with_capacity(count);
+        for _ in 0..count {
+            let edges = word(blob, &mut at)? as usize;
+            let mut row = Vec::with_capacity(edges.min(count));
+            for _ in 0..edges {
+                let to = half(blob, &mut at)?;
+                let cost = float(blob, &mut at)?;
+                let kind = TraversalKind::from_tag(byte(blob, &mut at)?)?;
+                if to as usize >= count || !cost.is_finite() {
+                    return None;
+                }
+                row.push(NavEdge { to, cost, kind });
+            }
+            adj.push(row);
+        }
+        // Component ids are only ever compared, never used as an index, so they
+        // need no bound; the links between them are indexed, so they do.
+        let groups = word(blob, &mut at)? as usize;
+        let mut component_links = Vec::with_capacity(groups.min(count + 1));
+        for _ in 0..groups {
+            let links = word(blob, &mut at)? as usize;
+            let mut row = Vec::with_capacity(links.min(groups));
+            for _ in 0..links {
+                let link = half(blob, &mut at)?;
+                if link as usize >= groups {
+                    return None;
+                }
+                row.push(link);
+            }
+            component_links.push(row);
+        }
+        (at == blob.len() && nodes.iter().flatten().all(|v| v.is_finite())).then_some(Self {
+            generation: 0,
+            truncated,
+            digest,
+            schema,
+            hull,
+            nodes,
+            component,
+            adj,
+            drops,
+            component_links,
+            gates: Gates::default(),
+        })
+    }
+}
+
+fn take<'a>(blob: &'a [u8], at: &mut usize, len: usize) -> Option<&'a [u8]> {
+    let end = at.checked_add(len)?;
+    let slice = blob.get(*at..end)?;
+    *at = end;
+    Some(slice)
+}
+
+fn byte(blob: &[u8], at: &mut usize) -> Option<u8> {
+    take(blob, at, 1).map(|bytes| bytes[0])
+}
+
+fn half(blob: &[u8], at: &mut usize) -> Option<u16> {
+    Some(u16::from_le_bytes(take(blob, at, 2)?.try_into().ok()?))
+}
+
+fn word(blob: &[u8], at: &mut usize) -> Option<u32> {
+    Some(u32::from_le_bytes(take(blob, at, 4)?.try_into().ok()?))
+}
+
+fn float(blob: &[u8], at: &mut usize) -> Option<f32> {
+    Some(f32::from_le_bytes(take(blob, at, 4)?.try_into().ok()?))
+}
+
+fn long(blob: &[u8], at: &mut usize) -> Option<u64> {
+    Some(u64::from_le_bytes(take(blob, at, 8)?.try_into().ok()?))
+}
+
+pub fn brush_bounds(brushes: &[SimBrush]) -> Option<([f32; 3], [f32; 3])> {
+    let mut mins = [f32::MAX; 3];
+    let mut maxs = [f32::MIN; 3];
+    let mut any = false;
+    for brush in brushes {
+        let Some((bmin, bmax)) = aabb_of(brush) else {
+            continue;
+        };
+        any = true;
+        for i in 0..3 {
+            mins[i] = mins[i].min(bmin[i]);
+            maxs[i] = maxs[i].max(bmax[i]);
+        }
+    }
+    any.then_some((mins, maxs))
+}
+
+pub fn playable_bounds(brushes: &[SimBrush], seeds: &[[f32; 3]]) -> Option<([f32; 3], [f32; 3])> {
+    playable_bounds_within(brush_bounds(brushes)?, seeds)
+}
+
+/// bo2mp: the bounds of a collision mesh's vertices (a map that collides
+/// through triangles only: Infinite Warfare's), None when it has none.
+pub fn mesh_bounds(verts: &[[f32; 3]]) -> Option<([f32; 3], [f32; 3])> {
+    let mut mins = [f32::MAX; 3];
+    let mut maxs = [f32::MIN; 3];
+    let mut any = false;
+    for v in verts.iter().filter(|v| v.iter().all(|c| c.is_finite())) {
+        any = true;
+        for i in 0..3 {
+            mins[i] = mins[i].min(v[i]);
+            maxs[i] = maxs[i].max(v[i]);
+        }
+    }
+    any.then_some((mins, maxs))
+}
+
+/// The walkable bounds: the spawn seeds' bounds, padded, inside the
+/// world's collision bounds (`world`).
+pub fn playable_bounds_within(world: ([f32; 3], [f32; 3]), seeds: &[[f32; 3]]) -> Option<([f32; 3], [f32; 3])> {
+    let (bmins, bmaxs) = world;
+    if seeds.is_empty() {
+        return Some((bmins, bmaxs));
+    }
+    let mut mins = [f32::MAX; 3];
+    let mut maxs = [f32::MIN; 3];
+    for seed in seeds {
+        for i in 0..3 {
+            mins[i] = mins[i].min(seed[i]);
+            maxs[i] = maxs[i].max(seed[i]);
+        }
+    }
+    mins[0] -= SEED_PAD_IN;
+    mins[1] -= SEED_PAD_IN;
+    mins[2] -= 128.0;
+    maxs[0] += SEED_PAD_IN;
+    maxs[1] += SEED_PAD_IN;
+    maxs[2] += 256.0;
+    Some((
+        [
+            mins[0].max(bmins[0]),
+            mins[1].max(bmins[1]),
+            mins[2].max(bmins[2]),
+        ],
+        [
+            maxs[0].min(bmaxs[0]),
+            maxs[1].min(bmaxs[1]),
+            maxs[2].min(bmaxs[2]),
+        ],
+    ))
+}
+
+fn aabb_of(brush: &SimBrush) -> Option<([f32; 3], [f32; 3])> {
+    let mut mins = [f32::MAX; 3];
+    let mut maxs = [f32::MIN; 3];
+    let mut axes = [false; 3];
+    for plane in &brush.planes {
+        let axis = if plane[0].abs() > 0.9 {
+            0
+        } else if plane[1].abs() > 0.9 {
+            1
+        } else if plane[2].abs() > 0.9 {
+            2
+        } else {
+            continue;
+        };
+        axes[axis] = true;
+        let dist = plane[3] / plane[axis];
+        if plane[axis] > 0.0 {
+            maxs[axis] = maxs[axis].max(dist);
+        } else {
+            mins[axis] = mins[axis].min(dist);
+        }
+    }
+    (axes[0] && axes[1] && axes[2]).then_some((mins, maxs))
+}
+
+pub fn bake(world: &impl BakeTraces, bounds: ([f32; 3], [f32; 3]), digest: u64) -> NavGraph {
+    bake_seeded(world, bounds, digest, &[])
+}
+
+pub trait BakeTraces: Sync {
+    fn bake_hull(&self, start: [f32; 3], end: [f32; 3]) -> HullTrace;
+    fn bake_navigation(&self, start: [f32; 3], end: [f32; 3]) -> HullTrace;
+}
+
+struct Baker<'a, W>(&'a W);
+
+impl<W: BakeTraces> WorldQuery for Baker<'_, W> {
+    fn sight_ray(&mut self, _: [f32; 3], _: [f32; 3], _: ClientId) -> QueryResult<SightSample> {
+        Ok(SightSample::Unknown)
+    }
+
+    fn shot_ray(&mut self, _: [f32; 3], _: [f32; 3], _: ClientId) -> QueryResult<SightSample> {
+        Ok(SightSample::Unknown)
+    }
+
+    fn hull_trace(&mut self, start: [f32; 3], end: [f32; 3]) -> QueryResult<HullTrace> {
+        Ok(self.0.bake_hull(start, end))
+    }
+
+    fn navigation_trace(&mut self, start: [f32; 3], end: [f32; 3]) -> QueryResult<HullTrace> {
+        Ok(self.0.bake_navigation(start, end))
+    }
+}
+
+/// Results come back in index order, so a parallel pass merges as the serial loop would.
+fn par_map<T: Send>(len: usize, work: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    const CHUNK: usize = 64;
+    let lanes = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(len.div_ceil(CHUNK))
+        .max(1);
+    let next = AtomicUsize::new(0);
+    let mut done: Vec<(usize, T)> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..lanes)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut out = Vec::new();
+                    loop {
+                        let start = next.fetch_add(CHUNK, Ordering::Relaxed);
+                        if start >= len {
+                            return out;
+                        }
+                        out.extend((start..(start + CHUNK).min(len)).map(|i| (i, work(i))));
+                    }
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|worker| {
+                worker
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+            .collect()
+    });
+    done.sort_unstable_by_key(|(i, _)| *i);
+    done.into_iter().map(|(_, value)| value).collect()
+}
+
+struct Floor {
+    feet: [f32; 3],
+    standable: bool,
+    boundary: bool,
+}
+
+/// Which floors become nodes is the merge's decision: dedupe depends on the columns merged before.
+fn column_floors(
+    world: &mut impl WorldQuery,
+    at: [f32; 3],
+    z_top: f32,
+    z_bot: f32,
+    find_boundary: bool,
+) -> Vec<Floor> {
+    let step = GRID_IN;
+    let mut floors = Vec::new();
+    let mut top = z_top;
+    while top > z_bot && floors.len() < u16::MAX as usize {
+        let Ok(drop) = world.navigation_trace([at[0], at[1], top], [at[0], at[1], z_bot]) else {
+            break;
+        };
+        if drop.startsolid {
+            top -= 32.0;
+            continue;
+        }
+        if drop.fraction >= 1.0 {
+            break;
+        }
+        let feet = drop.endpos;
+        let Ok(stand) = world.navigation_trace(feet, feet) else {
+            break;
+        };
+        let standable = drop.normal[2] >= 0.7 && !stand.startsolid;
+        let boundary = find_boundary
+            && standable
+            && [(-step, 0.0), (step, 0.0), (0.0, -step), (0.0, step)]
+                .into_iter()
+                .any(|(dx, dy)| {
+                    let Ok(hit) = world.navigation_trace(
+                        [feet[0] + dx, feet[1] + dy, feet[2] + STEP_Z_IN],
+                        [feet[0] + dx, feet[1] + dy, feet[2] - STEP_Z_IN],
+                    ) else {
+                        return false;
+                    };
+                    hit.startsolid || hit.fraction >= 1.0 || hit.normal[2] < 0.7
+                });
+        floors.push(Floor {
+            feet,
+            standable,
+            boundary,
+        });
+        top = feet[2] - 32.0;
+    }
+    floors
+}
+
+fn merge_column(nodes: &mut Vec<[f32; 3]>, dedupe: &mut Buckets, floors: &[Floor]) -> bool {
+    let before = nodes.len();
+    let mut boundary = false;
+    for floor in floors {
+        if nodes.len() >= u16::MAX as usize {
+            break;
+        }
+        let feet = floor.feet;
+        if floor.standable
+            && !neighbors(dedupe, feet, DEDUPE_IN).into_iter().any(|i| {
+                dist_xy(nodes[i], feet) < DEDUPE_IN && (nodes[i][2] - feet[2]).abs() < DEDUPE_IN
+            })
+        {
+            dedupe
+                .entry(cell(feet, DEDUPE_IN))
+                .or_default()
+                .push(nodes.len());
+            nodes.push(feet);
+            boundary |= floor.boundary;
+        }
+    }
+    boundary || nodes.len() == before
+}
+
+fn sample_columns(
+    world: &impl BakeTraces,
+    positions: &[[f32; 3]],
+    (z_top, z_bot): (f32, f32),
+    find_boundary: bool,
+    nodes: &mut Vec<[f32; 3]>,
+    dedupe: &mut Buckets,
+    columns: &mut usize,
+    mut boundary: impl FnMut([f32; 3]),
+) -> bool {
+    const BATCH: usize = 4096;
+    for batch in positions.chunks(BATCH) {
+        let floors = par_map(batch.len(), |i| {
+            column_floors(&mut Baker(world), batch[i], z_top, z_bot, find_boundary)
+        });
+        for (at, floors) in batch.iter().zip(&floors) {
+            if *columns >= COLUMN_CAP || nodes.len() >= u16::MAX as usize {
+                return false;
+            }
+            let edge = merge_column(nodes, dedupe, floors);
+            *columns += 1;
+            if edge {
+                boundary(*at);
+            }
+        }
+    }
+    true
+}
+
+pub fn bake_seeded(
+    world: &impl BakeTraces,
+    bounds: ([f32; 3], [f32; 3]),
+    digest: u64,
+    seeds: &[[f32; 3]],
+) -> NavGraph {
+    let (mins, maxs) = bounds;
+    let step = GRID_IN;
+    let mut nodes = Vec::new();
+    let z_top = maxs[2] + 72.0;
+    let z_bot = mins[2] - 8.0;
+    let mut dedupe = Buckets::new();
+    for seed in seeds {
+        let floors = column_floors(&mut Baker(world), *seed, seed[2] + STEP_Z_IN, z_bot, false);
+        merge_column(&mut nodes, &mut dedupe, &floors);
+    }
+    // Stable world-space tiles keep a distant bounds change from shifting doors
+    // between samples. Multi-source breadth-first order gives every seed coverage
+    // before spending the remaining column quota on distant geometry.
+    const TILE_CELLS: i32 = 8;
+    let tile_size = step * TILE_CELLS as f32;
+    let lo = cell(mins, tile_size);
+    let hi = cell(maxs, tile_size);
+    let mut queue = std::collections::VecDeque::new();
+    let mut tiles = BTreeSet::new();
+    for seed in seeds.iter().chain(std::iter::once(&mins)) {
+        let (x, y) = cell(*seed, tile_size);
+        let tile = (x.clamp(lo.0, hi.0), y.clamp(lo.1, hi.1));
+        if tiles.insert(tile) {
+            queue.push_back(tile);
+        }
+    }
+    let mut scan = Vec::new();
+    while let Some((tx, ty)) = queue.pop_front() {
+        for ix in 0..TILE_CELLS {
+            for iy in 0..TILE_CELLS {
+                let x = (tx * TILE_CELLS + ix) as f32 * step;
+                let y = (ty * TILE_CELLS + iy) as f32 * step;
+                if x < mins[0] || x > maxs[0] || y < mins[1] || y > maxs[1] {
+                    continue;
+                }
+                scan.push([x, y, 0.0]);
+            }
+        }
+        for (dx, dy) in [(-1, 0), (0, -1), (0, 1), (1, 0)] {
+            let next = (tx + dx, ty + dy);
+            if next.0 >= lo.0
+                && next.0 <= hi.0
+                && next.1 >= lo.1
+                && next.1 <= hi.1
+                && tiles.insert(next)
+            {
+                queue.push_back(next);
+            }
+        }
+    }
+    let mut columns = 0;
+    let mut refinements = Vec::new();
+    let mut truncated = !sample_columns(
+        world,
+        &scan,
+        (z_top, z_bot),
+        true,
+        &mut nodes,
+        &mut dedupe,
+        &mut columns,
+        |at| refinements.push([at[0], at[1]]),
+    );
+    // Finish base coverage before refinement can consume the node/column cap.
+    // Refine in the same seed-first tile order, with the remaining bake budget.
+    if !truncated {
+        let mut sampled = BTreeSet::new();
+        let mut refine = Vec::new();
+        for [x, y] in refinements {
+            for dx in [-0.5, 0.5] {
+                for dy in [-0.5, 0.5] {
+                    let at = [x + dx * step, y + dy * step, 0.0];
+                    if at[0] < mins[0]
+                        || at[0] > maxs[0]
+                        || at[1] < mins[1]
+                        || at[1] > maxs[1]
+                        || !sampled.insert(cell(at, step * 0.5))
+                    {
+                        continue;
+                    }
+                    refine.push(at);
+                }
+            }
+        }
+        truncated = !sample_columns(
+            world,
+            &refine,
+            (z_top, z_bot),
+            false,
+            &mut nodes,
+            &mut dedupe,
+            &mut columns,
+            |_| {},
+        );
+    }
+    let n = nodes.len();
+    let buckets = node_buckets(&nodes, step);
+    let mut adj = par_map(n, |i| {
+        let mut probe = Baker(world);
+        let mut edges = Vec::new();
+        for j in neighbors(&buckets, nodes[i], step) {
+            if i == j {
+                continue;
+            }
+            let a = nodes[i];
+            let b = nodes[j];
+            let planar = dist_xy(a, b);
+            if planar > step * 2.3 || planar < 1.0 {
+                continue;
+            }
+            let dz = (a[2] - b[2]).abs();
+            if dz > STEP_Z_IN.max(planar * 0.75) {
+                continue;
+            }
+            let kind = match supported_walk(&mut probe, a, b) {
+                Ok(WalkSample::Clear) => TraversalKind::Walk,
+                Ok(WalkSample::BreakGlass) => TraversalKind::BreakGlass,
+                _ => continue,
+            };
+            edges.push(NavEdge {
+                to: j as u16,
+                cost: planar
+                    + dz
+                    + if kind == TraversalKind::BreakGlass {
+                        96.0
+                    } else {
+                        0.0
+                    },
+                kind,
+            });
+        }
+        edges
+    });
+    let component = label_components(n, &adj);
+    let drops = link_drops(world, &nodes, &mut adj, &buckets, step);
+    let mut component_links = vec![
+        Vec::new();
+        component
+            .iter()
+            .copied()
+            .max()
+            .map_or(0, |c| c as usize + 1)
+    ];
+    for (i, edges) in adj.iter().enumerate() {
+        for edge in edges {
+            let j = edge.to;
+            let a = component[i];
+            let b = component[j as usize];
+            if a != b && !component_links[a as usize].contains(&b) {
+                component_links[a as usize].push(b);
+            }
+        }
+    }
+    NavGraph {
+        generation: 0,
+        truncated,
+        digest,
+        schema: NAV_SCHEMA,
+        hull: NAV_HULL,
+        nodes,
+        component,
+        adj,
+        drops,
+        component_links,
+        gates: Gates::default(),
+    }
+}
+
+/// Part of the cache key and the freshness test of a graph built from a map's own path nodes.
+pub const NODE_HULL: u32 = 0x4e4f_4445;
+/// How far a node looks for neighbours to link (the authored spacing: median nearest neighbour
+/// 50, farthest 128 on mp_frag). INFERRED: the engine's link rule is in its compile tool, and the
+/// zone's links are not in the install.
+pub const NODE_LINK_RADIUS_IN: f32 = 160.0;
+/// At most this many nearest neighbours are tested per node.
+pub const NODE_LINK_NEIGHBORS: usize = 14;
+/// The height of a path node's origin above the floor it stands on.
+pub const NODE_CENTER_IN: f32 = 36.0;
+/// Extra cost of an authored traversal (a jump or climb is slower than walking its length).
+const NEGOTIATE_PENALTY_IN: f32 = 48.0;
+
+/// Traversal animations that read the same both ways (a window, a gap, a wall, a ladder, a step:
+/// the way back is the same move). The others, `jump_up*` / `jump_down*`, are one way: the map
+/// authors a second pair for the way back when it wants one.
+/// INFERRED from the names.
+fn animation_is_symmetric(animscript: &str) -> bool {
+    ["window_over", "jump_across", "wall_hop", "ladder", "step"].iter().any(|p| animscript.starts_with(p))
+}
+
+/// The route graph of a Ghosts map from its own path nodes (`fastfile_iw6::pathnode`): one graph
+/// node per path node (every type, so cover nodes are places bots can route to), a `Walk` edge
+/// between near nodes whose straight walk the collision supports, and a `Negotiate` edge for each
+/// authored `Begin` -> `End` traversal. The node set and the traversals are the map's; the
+/// walk links are rebuilt here because the zone's own links are not in the install.
+pub fn from_path_nodes(world: &impl BakeTraces, path: &[asset_world::Iw6PathNode], digest: u64) -> NavGraph {
+    let count = path.len().min(usize::from(u16::MAX));
+    let path = &path[..count];
+    let own_links = path.iter().any(|n| !n.links.is_empty());
+    // An editor origin (the map's `node_*` entity) is the standing capsule's centre (the exe's
+    // nearest-node test seats the 36-high half-extent capsule 36 above it; measured on mp_frag:
+    // the floor lies 36 below 40 percent of the path nodes and 24..64 below nearly all), so the
+    // feet are below it. The path data's own origin is the seat the compiler gave the node.
+    let seat = if own_links { 0.0 } else { NODE_CENTER_IN };
+    let nodes: Vec<[f32; 3]> = par_map(count, |i| {
+        let o = path[i].origin;
+        let feet = [o[0], o[1], o[2] - seat];
+        let t = world.bake_hull([feet[0], feet[1], feet[2] + 18.0], [feet[0], feet[1], feet[2] - 24.0]);
+        if !t.startsolid && t.fraction < 1.0 && t.normal[2] >= 0.7 { t.endpos } else { feet }
+    });
+    let cell_size = NODE_LINK_RADIUS_IN;
+    let buckets = node_buckets(&nodes, cell_size);
+    // The map's own path data gives the links (the engine's: walks and traversals, with its cost);
+    // nothing is rebuilt then. `BO2MP_IW6_PATHDATA=0` never hands them over.
+    let mut adj: Vec<Vec<NavEdge>> = if own_links {
+        path.iter()
+            .map(|n| {
+                n.links
+                    .iter()
+                    .filter(|l| (l.to as usize) < count)
+                    .map(|l| NavEdge {
+                        to: l.to as u16,
+                        cost: if l.negotiation { l.cost.max(1.0) + NEGOTIATE_PENALTY_IN } else { l.cost.max(1.0) },
+                        kind: if l.negotiation { TraversalKind::Negotiate } else { TraversalKind::Walk },
+                    })
+                    .collect()
+            })
+            .collect()
+    } else {
+        par_map(count, |i| {
+        let mut probe = Baker(world);
+        let a = nodes[i];
+        let mut near: Vec<(f32, usize)> = neighbors(&buckets, a, cell_size)
+            .into_iter()
+            .filter(|&j| j != i)
+            .map(|j| (dist_xy(a, nodes[j]), j))
+            .filter(|&(d, j)| d <= NODE_LINK_RADIUS_IN && d >= 1.0 && (nodes[j][2] - a[2]).abs() <= STEP_Z_IN.max(d * 0.75))
+            .collect();
+        near.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
+        near.truncate(NODE_LINK_NEIGHBORS);
+        let mut edges = Vec::new();
+        for (planar, j) in near {
+            let b = nodes[j];
+            let kind = match supported_walk(&mut probe, a, b) {
+                Ok(WalkSample::Clear) => TraversalKind::Walk,
+                Ok(WalkSample::BreakGlass) => TraversalKind::BreakGlass,
+                _ => continue,
+            };
+            edges.push(NavEdge {
+                to: j as u16,
+                cost: planar + (a[2] - b[2]).abs() + if kind == TraversalKind::BreakGlass { 96.0 } else { 0.0 },
+                kind,
+            });
+        }
+        edges
+    })
+    };
+    for (i, n) in path.iter().enumerate().filter(|_| !own_links) {
+        let Some(end) = n.negotiation_end.map(|e| e as usize).filter(|&e| e < count) else {
+            continue;
+        };
+        let mut add = |from: usize, to: usize| {
+            if adj[from].iter().any(|e| e.to as usize == to) {
+                return;
+            }
+            let cost = distance(nodes[from], nodes[to]) + NEGOTIATE_PENALTY_IN;
+            adj[from].push(NavEdge { to: to as u16, cost, kind: TraversalKind::Negotiate });
+        };
+        add(i, end);
+        if animation_is_symmetric(&n.animscript) {
+            add(end, i);
+        }
+    }
+    let component = label_components(count, &adj);
+    let mut component_links = vec![Vec::new(); component.iter().copied().max().map_or(0, |c| c as usize + 1)];
+    for (i, edges) in adj.iter().enumerate() {
+        for edge in edges {
+            let (a, b) = (component[i], component[edge.to as usize]);
+            if a != b && !component_links[a as usize].contains(&b) {
+                component_links[a as usize].push(b);
+            }
+        }
+    }
+    NavGraph {
+        generation: 0,
+        truncated: false,
+        digest,
+        schema: NAV_SCHEMA,
+        hull: NODE_HULL,
+        nodes,
+        component,
+        adj,
+        drops: 0,
+        component_links,
+        gates: Gates::default(),
+    }
+}
+
+fn dist_xy(a: [f32; 3], b: [f32; 3]) -> f32 {
+    let dx = a[0] - b[0];
+    let dy = a[1] - b[1];
+    (dx * dx + dy * dy).sqrt()
+}
+
+fn link_drops(
+    world: &impl BakeTraces,
+    nodes: &[[f32; 3]],
+    adj: &mut [Vec<NavEdge>],
+    buckets: &Buckets,
+    step: f32,
+) -> u32 {
+    let planar_max = step * 2.0;
+    let walks: &[Vec<NavEdge>] = adj;
+    let found = par_map(nodes.len(), |i| {
+        let mut probe = Baker(world);
+        let mut out = Vec::new();
+        for j in neighbors(buckets, nodes[i], step) {
+            if i == j {
+                continue;
+            }
+            let a = nodes[i];
+            let b = nodes[j];
+            let planar = dist_xy(a, b);
+            if planar > planar_max || planar < 1.0 {
+                continue;
+            }
+            let dz = a[2] - b[2];
+            if dz <= STEP_Z_IN || dz > DROP_Z_MAX {
+                continue;
+            }
+            if walks[i].iter().any(|e| e.to as usize == j) {
+                continue;
+            }
+            let Ok(horiz) = probe.hull_trace([a[0], a[1], a[2] + 2.0], [b[0], b[1], a[2] + 2.0])
+            else {
+                continue;
+            };
+            if horiz.startsolid || horiz.fraction < 1.0 {
+                continue;
+            }
+            let from = [b[0], b[1], a[2] + 2.0];
+            let Ok(land) = probe.hull_trace(from, [from[0], from[1], b[2] - 8.0]) else {
+                continue;
+            };
+            if land.startsolid || land.normal[2] < 0.7 || land.fraction >= 1.0 {
+                continue;
+            }
+            if dist_xy(land.endpos, b) > DEDUPE_IN {
+                continue;
+            }
+            if (land.endpos[2] - b[2]).abs() > STEP_Z_IN {
+                continue;
+            }
+            out.push(NavEdge {
+                to: j as u16,
+                cost: planar + dz,
+                kind: TraversalKind::Drop,
+            });
+        }
+        out
+    });
+    let mut drops = 0u32;
+    for (edges, found) in adj.iter_mut().zip(found) {
+        drops += found.len() as u32;
+        edges.extend(found);
+    }
+    drops
+}
+
+fn label_components(n: usize, adj: &[Vec<NavEdge>]) -> Vec<u16> {
+    let mut links = vec![Vec::new(); n];
+    for (i, edges) in adj.iter().enumerate() {
+        for e in edges {
+            links[i].push(e.to as usize);
+            links[e.to as usize].push(i);
+        }
+    }
+    let mut component = vec![u16::MAX; n];
+    let mut next = 0u16;
+    for start in 0..n {
+        if component[start] != u16::MAX {
+            continue;
+        }
+        let mut stack = vec![start];
+        component[start] = next;
+        while let Some(i) = stack.pop() {
+            for &j in &links[i] {
+                if component[j] == u16::MAX {
+                    component[j] = next;
+                    stack.push(j);
+                }
+            }
+        }
+        next = next.saturating_add(1);
+    }
+    component
+}
+
+pub fn nearest_within(graph: &NavGraph, feet: [f32; 3], max_dist: f32) -> Option<u16> {
+    let max_d2 = max_dist * max_dist;
+    let mut best: Option<(u16, f32)> = None;
+    for (i, pos) in graph.nodes.iter().enumerate() {
+        let dx = pos[0] - feet[0];
+        let dy = pos[1] - feet[1];
+        let dz = pos[2] - feet[2];
+        let d2 = dx * dx + dy * dy + dz * dz;
+        if d2 > max_d2 {
+            continue;
+        }
+        // Prefer the current floor over a shelf or roof directly overhead.
+        let score = d2 + 3.0 * dz * dz;
+        if best.is_none_or(|(_, bd)| score < bd) {
+            best = Some((i as u16, score));
+        }
+    }
+    best.map(|(id, _)| id)
+}
+
+pub fn roam_node(graph: &NavGraph, from: [f32; 3], salt: u32) -> Option<[f32; 3]> {
+    let start = nearest_within(graph, from, SNAP_IN)?;
+    let comp = graph.component[start as usize];
+    let mut best: Option<(u32, [f32; 3])> = None;
+    let mut fallback = None;
+    for (i, pos) in graph.nodes.iter().enumerate() {
+        if graph.component[i] != comp {
+            continue;
+        }
+        let planar = dist_xy(*pos, from);
+        if planar > 8.0 && fallback.is_none() {
+            fallback = Some(*pos);
+        }
+        if !(128.0..=1024.0).contains(&planar) {
+            continue;
+        }
+        let mut h = (i as u32).wrapping_add(salt.wrapping_mul(0x9E37_79B1));
+        h = (h ^ (h >> 16)).wrapping_mul(0x85eb_ca6b);
+        h = (h ^ (h >> 13)).wrapping_mul(0xc2b2_ae35);
+        h ^= h >> 16;
+        if best.is_none_or(|(best_h, _)| h >= best_h) {
+            best = Some((h, *pos));
+        }
+    }
+    best.map(|(_, pos)| pos).or(fallback)
+}
+
+/// Baked supports that could serve as firing positions against a threat at
+/// `at`: real graph nodes inside the weapon's band, ordered by how well they fit
+/// that band and how little travel they cost from `from`, capped at `max`.
+///
+/// Component membership is a cheap filter, not a promise that a directed route
+/// exists — Drop and BreakGlass edges are one-way, so the caller still routes.
+/// Height is the node's own; nothing here invents a position in free space.
+pub fn firing_supports(
+    graph: &NavGraph,
+    from: [f32; 3],
+    at: [f32; 3],
+    hold: f32,
+    max: usize,
+) -> Vec<[f32; 3]> {
+    if max == 0 {
+        return Vec::new();
+    }
+    let Some(start) = nearest_within(graph, from, SNAP_IN) else {
+        return Vec::new();
+    };
+    let comp = graph.component[start as usize];
+    // A band around the weapon's hold range: closer than half of it gives up the
+    // weapon's advantage, further than it starts to miss.
+    let near = (hold * 0.5).max(48.0);
+    let far = hold * 1.25;
+    // One support per sector around the threat. Scoring alone would crowd the
+    // set onto the side the bot already stands on, which is the side whose line
+    // of fire has just failed.
+    let mut sectors: Vec<Option<(f32, [f32; 3])>> = vec![None; max];
+    for (i, pos) in graph.nodes.iter().enumerate() {
+        if graph.component[i] != comp {
+            continue;
+        }
+        let range = dist_xy(*pos, at);
+        if !(near..=far).contains(&range) {
+            continue;
+        }
+        let bearing = (pos[1] - at[1]).atan2(pos[0] - at[0]) + core::f32::consts::PI;
+        let sector = ((bearing / core::f32::consts::TAU * max as f32) as usize).min(max - 1);
+        // Prefer the band's own distance, then the shortest approach. Travel is
+        // scored in the same units so neither term can drown the other.
+        let score = (range - hold).abs() + 0.5 * dist_xy(*pos, from) + 2.0 * (pos[2] - at[2]).abs();
+        if sectors[sector].is_none_or(|(best, _)| score < best) {
+            sectors[sector] = Some((score, *pos));
+        }
+    }
+    let mut picked: Vec<(f32, [f32; 3])> = sectors.into_iter().flatten().collect();
+    picked.sort_by(|a, b| a.0.total_cmp(&b.0));
+    picked.into_iter().map(|(_, pos)| pos).collect()
+}
+
+/// Graph-only query for topology diagnostics; runtime callers use `find_route`
+/// to validate connectors and interaction volumes against collision.
+pub fn find_path(
+    graph: &NavGraph,
+    start_feet: [f32; 3],
+    goal_feet: [f32; 3],
+    expand_budget: &mut u32,
+) -> Result<Vec<RouteStep>, PathError> {
+    if graph.nodes.is_empty() {
+        return Err(if graph.truncated {
+            PathError::IncompleteGraph
+        } else {
+            PathError::EmptyGraph
+        });
+    }
+    let start = nearest_within(graph, start_feet, SNAP_IN).ok_or(PathError::Unreachable)?;
+    let goal = nearest_within(graph, goal_feet, SNAP_IN).ok_or(PathError::Unreachable)?;
+    search(graph, &[(start, 0.0)], &[goal], expand_budget)
+}
+
+/// Connect the actual feet position to several locally reachable graph supports.
+/// Objective queries accept every support in the authoritative interaction volume.
+pub fn find_route(
+    world: &mut impl WorldQuery,
+    graph: &NavGraph,
+    from: [f32; 3],
+    to: [f32; 3],
+    objective: Option<ModeObjective>,
+    budget: &mut u32,
+) -> Result<Vec<RouteStep>, PathError> {
+    find_route_resumable(
+        world,
+        graph,
+        from,
+        to,
+        objective,
+        budget,
+        &mut RouteWork::default(),
+    )
+}
+
+/// What the request has already finished. Everything before the current phase
+/// stays valid while the key holds, so a denied tick repeats no query.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RoutePhase {
+    DirectApproach,
+    StartAttachments,
+    GoalAttachments,
+    Search,
+    ValidateEntry,
+    ValidateGoal,
+}
+
+/// The request identity. Geometry-dependent work survives while this holds;
+/// live state is still rechecked before a result is used.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RouteKey {
+    graph: (u64, u64, u32, u32),
+    to: [f32; 3],
+    objective: Option<(u32, u32, crate::observation::ObjectiveAction, [f32; 3], f32)>,
+    from: [f32; 3],
+}
+
+impl RouteKey {
+    fn new(
+        graph: &NavGraph,
+        from: [f32; 3],
+        to: [f32; 3],
+        objective: Option<ModeObjective>,
+    ) -> Self {
+        Self {
+            graph: graph_key(graph),
+            to,
+            objective: objective.map(|o| (o.id, o.round, o.action, o.origin, o.radius)),
+            from,
+        }
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        self.graph == other.graph
+            && self.to == other.to
+            && self.objective == other.objective
+            && distance(self.from, other.from) <= GRID_IN
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RouteRequest {
+    key: RouteKey,
+    objective: Option<ModeObjective>,
+    phase: RoutePhase,
+    probe: Option<SupportProbe>,
+    start_candidates: Vec<(u16, f32)>,
+    start_cursor: usize,
+    starts: Vec<(u16, f32)>,
+    goal_candidates: Vec<u16>,
+    goal_cursor: usize,
+    goals: Vec<u16>,
+    goal_kinds: BTreeMap<u16, TraversalKind>,
+    search: Option<RouteSearch>,
+    path: Vec<RouteStep>,
+    age_slices: u32,
+    starved_slices: u32,
+}
+
+impl RouteRequest {
+    fn begin(key: RouteKey, objective: Option<ModeObjective>) -> Self {
+        Self {
+            key,
+            objective,
+            phase: RoutePhase::DirectApproach,
+            probe: None,
+            start_candidates: Vec::new(),
+            start_cursor: 0,
+            starts: Vec::new(),
+            goal_candidates: Vec::new(),
+            goal_cursor: 0,
+            goals: Vec::new(),
+            goal_kinds: BTreeMap::new(),
+            search: None,
+            path: Vec::new(),
+            age_slices: 0,
+            starved_slices: 0,
+        }
+    }
+
+    /// Everything a granted query can move. Equal marks mean the slice bought
+    /// nothing, which is what starvation counts.
+    fn progress_mark(&self) -> (RoutePhase, usize, usize, usize, usize, u32, usize, u32) {
+        (
+            self.phase,
+            self.start_cursor,
+            self.starts.len(),
+            self.goal_cursor,
+            self.goals.len(),
+            self.search.as_ref().map_or(0, |s| s.expanded),
+            self.path.len(),
+            self.probe.as_ref().map_or(0, |p| p.done),
+        )
+    }
+
+    /// Connector work a cancelled request throws away and a reissue must redo.
+    fn holds_attachments(&self) -> bool {
+        self.start_cursor > 0 || !self.starts.is_empty() || !self.goals.is_empty()
+    }
+
+    fn expanded(&self) -> u32 {
+        self.search.as_ref().map_or(0, |s| s.expanded)
+    }
+
+    fn deferred(&self) -> PathError {
+        PathError::BudgetExhausted {
+            expanded: self.expanded(),
+        }
+    }
+
+    /// A live clearance check follows the bot: a probe started somewhere else is
+    /// restarted rather than resumed against geometry it never looked at.
+    fn probe_for(&mut self, a: [f32; 3], b: [f32; 3]) -> &mut SupportProbe {
+        if self.probe.is_none_or(|probe| probe.a != a || probe.b != b) {
+            self.probe = Some(SupportProbe::begin(a, b));
+        }
+        self.probe.as_mut().expect("probe just installed")
+    }
+
+    /// One bounded slice of service. `Ok` completes the request; a
+    /// `BudgetExhausted` error leaves every finished phase in place. `live` is
+    /// where the bot stands now, which the checks against live state use; the
+    /// candidate set stays the one the request was opened with.
+    fn advance(
+        &mut self,
+        world: &mut impl WorldQuery,
+        graph: &NavGraph,
+        budget: &mut u32,
+        live: [f32; 3],
+    ) -> Result<Vec<RouteStep>, PathError> {
+        let from = self.key.from;
+        let to = self.key.to;
+        let objective = self.objective;
+        if self.phase == RoutePhase::DirectApproach {
+            // Nearby destinations need no graph detour when the complete approach
+            // is supported. Keep the same collision/glass contract as baked edges.
+            if distance(live, to) <= GRID_IN * 2.0
+                && objective.is_none_or(|obj| world.objective_contains(obj, to))
+            {
+                match self.probe_for(live, to).advance(world) {
+                    Err(_) => return Err(self.deferred()),
+                    Ok(WalkSample::Clear) => {
+                        return Ok(vec![RouteStep {
+                            entry: live,
+                            position: to,
+                            kind: TraversalKind::Walk,
+                        }]);
+                    }
+                    Ok(WalkSample::BreakGlass) => {
+                        return Ok(vec![RouteStep {
+                            entry: live,
+                            position: to,
+                            kind: TraversalKind::BreakGlass,
+                        }]);
+                    }
+                    Ok(WalkSample::Blocked) => {}
+                }
+            }
+            self.probe = None;
+            self.phase = RoutePhase::StartAttachments;
+            self.start_candidates = near_nodes(graph, from);
+        }
+        if self.phase == RoutePhase::StartAttachments {
+            while self.start_cursor < self.start_candidates.len() && self.starts.len() < 4 {
+                let (id, cost) = self.start_candidates[self.start_cursor];
+                let node = graph.nodes[id as usize];
+                match self.probe_for(from, node).advance(world) {
+                    Err(_) => return Err(self.deferred()),
+                    Ok(WalkSample::Clear | WalkSample::BreakGlass) => self.starts.push((id, cost)),
+                    Ok(WalkSample::Blocked) => {}
+                }
+                self.probe = None;
+                self.start_cursor += 1;
+            }
+            if self.starts.is_empty() {
+                // Nothing baked near this position is a coverage answer. Baked
+                // nodes that every supported walk refused are a collision answer
+                // about this moment — the hull mask includes other clients — and
+                // reporting that as `IncompleteGraph` put it in the terminal
+                // memo, where it answered the bot for the life of the graph
+                // instead of being probed again.
+                return Err(if self.start_candidates.is_empty() && graph.truncated {
+                    PathError::IncompleteGraph
+                } else {
+                    PathError::NoStartSupport
+                });
+            }
+            self.phase = RoutePhase::GoalAttachments;
+            if let Some(obj) = objective {
+                for (i, p) in graph.nodes.iter().enumerate() {
+                    if world.objective_contains(obj, *p) {
+                        self.goals.push(i as u16);
+                    }
+                }
+            } else {
+                self.goal_candidates = near_nodes(graph, to)
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect();
+            }
+        }
+        if self.phase == RoutePhase::GoalAttachments {
+            while objective.is_none()
+                && self.goal_cursor < self.goal_candidates.len()
+                && self.goals.len() < 4
+            {
+                let id = self.goal_candidates[self.goal_cursor];
+                let node = graph.nodes[id as usize];
+                match self.probe_for(node, to).advance(world) {
+                    Err(_) => return Err(self.deferred()),
+                    Ok(sample @ (WalkSample::Clear | WalkSample::BreakGlass)) => {
+                        self.goals.push(id);
+                        self.goal_kinds.insert(
+                            id,
+                            if sample == WalkSample::BreakGlass {
+                                TraversalKind::BreakGlass
+                            } else {
+                                TraversalKind::Walk
+                            },
+                        );
+                    }
+                    Ok(WalkSample::Blocked) => {}
+                }
+                self.probe = None;
+                self.goal_cursor += 1;
+            }
+            if self.goals.is_empty() {
+                // An objective's goals are the baked nodes inside its volume, so
+                // an empty set is coverage. A plain destination is attached by
+                // probing, which is the same live collision question as the
+                // start side.
+                let unbaked = objective.is_some() || self.goal_candidates.is_empty();
+                return Err(if unbaked && graph.truncated {
+                    PathError::IncompleteGraph
+                } else {
+                    PathError::NoGoalSupport
+                });
+            }
+            self.phase = RoutePhase::Search;
+        }
+        if self.phase == RoutePhase::Search {
+            let starts = &self.starts;
+            let goals = &self.goals;
+            let search = self
+                .search
+                .get_or_insert_with(|| RouteSearch::begin(graph, starts, goals));
+            self.path = search.advance(graph, budget)?;
+            self.phase = RoutePhase::ValidateEntry;
+        }
+        // The completed route waits here for collision quota; A* does not rerun.
+        if self.phase == RoutePhase::ValidateEntry {
+            if let Some(first) = self.path.first().copied() {
+                let kind = match self.probe_for(live, first.position).advance(world) {
+                    Err(_) => return Err(self.deferred()),
+                    Ok(WalkSample::Clear) => TraversalKind::Walk,
+                    Ok(WalkSample::BreakGlass) => TraversalKind::BreakGlass,
+                    Ok(WalkSample::Blocked) => return Err(PathError::NoStartSupport),
+                };
+                self.probe = None;
+                let head = &mut self.path[0];
+                head.kind = kind;
+                head.entry = live;
+            }
+            self.phase = RoutePhase::ValidateGoal;
+        }
+        let tail_needed = self
+            .path
+            .last()
+            .is_some_and(|p| distance(p.position, to) > 1.0)
+            && objective.is_none_or(|obj| world.objective_contains(obj, to));
+        if tail_needed {
+            let entry = self.path.last().unwrap().position;
+            let kind = if objective.is_none() {
+                self.goal_kinds
+                    .iter()
+                    .find(|(id, _)| graph.nodes[**id as usize] == entry)
+                    .map(|(_, &kind)| kind)
+            } else {
+                let sample = match self.probe_for(entry, to).advance(world) {
+                    Err(_) => return Err(self.deferred()),
+                    Ok(sample) => sample,
+                };
+                self.probe = None;
+                match sample {
+                    WalkSample::Clear => Some(TraversalKind::Walk),
+                    WalkSample::BreakGlass => Some(TraversalKind::BreakGlass),
+                    WalkSample::Blocked => None,
+                }
+            };
+            if let Some(kind) = kind {
+                self.path.push(RouteStep {
+                    entry,
+                    position: to,
+                    kind,
+                });
+            }
+        }
+        Ok(std::mem::take(&mut self.path))
+    }
+}
+
+/// Route outcomes and starvation for the bot that owns this work, plus the
+/// terminal results that must not be re-searched against an unchanged graph.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RouteStats {
+    pub completed: u32,
+    pub terminal: u32,
+    pub cancelled: u32,
+    /// Requests dropped while they already held attachment work.
+    pub discarded_attachments: u32,
+    pub denied_slices: u32,
+    pub max_age_slices: u32,
+    pub max_starved_slices: u32,
+}
+
+const TERMINAL_MEMO: usize = 8;
+
+/// One bot's routing work: the request being served and the graph-topology
+/// answers that reissuing cannot change.
+#[derive(Clone, Debug, Default)]
+pub struct RouteWork {
+    active: Option<RouteRequest>,
+    terminal: Vec<(RouteKey, PathError)>,
+    stats: RouteStats,
+}
+
+impl RouteWork {
+    pub fn stats(&self) -> RouteStats {
+        self.stats
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.active.is_some()
+    }
+
+    /// Slices the live request has waited, and its longest run without progress.
+    pub fn live_age(&self) -> (u32, u32) {
+        self.active
+            .as_ref()
+            .map_or((0, 0), |r| (r.age_slices, r.starved_slices))
+    }
+
+    pub fn cancel(&mut self) {
+        self.drop_active(true);
+        self.terminal.clear();
+    }
+
+    fn drop_active(&mut self, cancelled: bool) {
+        let Some(request) = self.active.take() else {
+            return;
+        };
+        if !cancelled {
+            return;
+        }
+        self.stats.cancelled = self.stats.cancelled.saturating_add(1);
+        if request.holds_attachments() {
+            self.stats.discarded_attachments = self.stats.discarded_attachments.saturating_add(1);
+        }
+    }
+
+    /// Budget denial stays pending; a truncated or disconnected graph does not
+    /// become answerable by asking it again. Collision-dependent refusals are
+    /// left out on purpose — they need live rechecking, not a negative cache.
+    fn remember(&mut self, key: RouteKey, error: PathError) {
+        if !matches!(
+            error,
+            PathError::Unreachable | PathError::IncompleteGraph | PathError::EmptyGraph
+        ) {
+            return;
+        }
+        self.terminal.retain(|(k, _)| !k.matches(&key));
+        self.terminal.insert(0, (key, error));
+        self.terminal.truncate(TERMINAL_MEMO);
+    }
+
+    fn recall(&self, key: &RouteKey) -> Option<PathError> {
+        self.terminal
+            .iter()
+            .find(|(k, _)| k.matches(key))
+            .map(|(_, error)| *error)
+    }
+}
+
+pub fn find_route_resumable(
+    world: &mut impl WorldQuery,
+    graph: &NavGraph,
+    from: [f32; 3],
+    to: [f32; 3],
+    objective: Option<ModeObjective>,
+    budget: &mut u32,
+    work: &mut RouteWork,
+) -> Result<Vec<RouteStep>, PathError> {
+    world.enter(QuerySubsystem::Connector);
+    let key = RouteKey::new(graph, from, to, objective);
+    // Terminal answers belong to the coverage that produced them.
+    work.terminal.retain(|(k, _)| k.graph == key.graph);
+    if work
+        .active
+        .as_ref()
+        .is_some_and(|r| !r.key.matches(&key) || r.key.graph != key.graph)
+    {
+        work.drop_active(true);
+    }
+    if graph.is_empty() {
+        let error = if graph.truncated {
+            PathError::IncompleteGraph
+        } else {
+            PathError::EmptyGraph
+        };
+        work.remember(key, error);
+        return Err(error);
+    }
+    if let Some(error) = work.recall(&key) {
+        return Err(error);
+    }
+    let request = work
+        .active
+        .get_or_insert_with(|| RouteRequest::begin(key, objective));
+    let before = request.progress_mark();
+    let result = request.advance(world, graph, budget, from);
+    request.age_slices = request.age_slices.saturating_add(1);
+    if request.progress_mark() == before {
+        request.starved_slices = request.starved_slices.saturating_add(1);
+    } else {
+        request.starved_slices = 0;
+    }
+    let stats = &mut work.stats;
+    stats.max_age_slices = stats.max_age_slices.max(request.age_slices);
+    stats.max_starved_slices = stats.max_starved_slices.max(request.starved_slices);
+    match result {
+        Err(PathError::BudgetExhausted { expanded }) => {
+            stats.denied_slices = stats.denied_slices.saturating_add(1);
+            Err(PathError::BudgetExhausted { expanded })
+        }
+        Err(error) => {
+            work.stats.terminal = work.stats.terminal.saturating_add(1);
+            work.drop_active(false);
+            work.remember(key, error);
+            Err(error)
+        }
+        Ok(path) => {
+            work.stats.completed = work.stats.completed.saturating_add(1);
+            work.drop_active(false);
+            Ok(path)
+        }
+    }
+}
+
+/// Graph supports within snapping range of a point, nearest first and stable on
+/// ties, capped so that quota slicing alone cannot change the considered set.
+fn near_nodes(graph: &NavGraph, at: [f32; 3]) -> Vec<(u16, f32)> {
+    let mut nearby: Vec<_> = graph
+        .nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| {
+            let d = distance(at, *p);
+            (d <= SNAP_IN && (at[2] - p[2]).abs() <= STEP_Z_IN).then_some((i as u16, d))
+        })
+        .collect();
+    nearby.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+    nearby.truncate(8);
+    nearby
+}
+
+#[derive(Clone, Debug)]
+pub struct RouteSearch {
+    graph_key: (u64, u64, u32, u32),
+    goals: Vec<u16>,
+    is_goal: Vec<bool>,
+    g: Vec<f32>,
+    parent: Vec<Option<(u16, TraversalKind)>>,
+    closed: Vec<bool>,
+    open: BinaryHeap<Reverse<(OrdF, u16, u32)>>,
+    pub expanded: u32,
+    result: Option<Result<Vec<RouteStep>, PathError>>,
+}
+
+fn graph_key(graph: &NavGraph) -> (u64, u64, u32, u32) {
+    (graph.generation, graph.digest, graph.schema, graph.hull)
+}
+
+impl RouteSearch {
+    pub fn begin(graph: &NavGraph, starts: &[(u16, f32)], goals: &[u16]) -> Self {
+        let n = graph.nodes.len();
+        let mut search = Self {
+            graph_key: graph_key(graph),
+            goals: goals.to_vec(),
+            is_goal: vec![false; n],
+            g: vec![f32::INFINITY; n],
+            parent: vec![None; n],
+            closed: vec![false; n],
+            open: BinaryHeap::new(),
+            expanded: 0,
+            result: None,
+        };
+        for &id in goals {
+            search.is_goal[id as usize] = true;
+        }
+        for &(id, cost) in starts {
+            search.g[id as usize] = cost;
+            search.open.push(Reverse((
+                OrdF(cost + HEURISTIC_WEIGHT * search.heuristic(graph, id)),
+                id,
+                0,
+            )));
+        }
+        search
+    }
+
+    fn heuristic(&self, graph: &NavGraph, id: u16) -> f32 {
+        self.goals
+            .iter()
+            .map(|&g| distance(graph.nodes[id as usize], graph.nodes[g as usize]))
+            .fold(f32::INFINITY, f32::min)
+    }
+
+    pub fn advance(
+        &mut self,
+        graph: &NavGraph,
+        budget: &mut u32,
+    ) -> Result<Vec<RouteStep>, PathError> {
+        if self.graph_key != graph_key(graph) || self.g.len() != graph.nodes.len() {
+            return Err(PathError::GraphChanged);
+        }
+        if let Some(result) = &self.result {
+            return result.clone();
+        }
+        let mut slice = 0;
+        while let Some(&Reverse((_, i, _))) = self.open.peek() {
+            if self.closed[i as usize] {
+                self.open.pop();
+                continue;
+            }
+            // Leave the next live node in the heap until work is actually granted.
+            if *budget == 0 || slice >= EXPAND_CAP {
+                return Err(PathError::BudgetExhausted {
+                    expanded: self.expanded,
+                });
+            }
+            self.open.pop();
+            self.closed[i as usize] = true;
+            self.expanded += 1;
+            slice += 1;
+            *budget -= 1;
+            if self.is_goal[i as usize] {
+                let path = reconstruct(graph, &self.parent, i);
+                self.result = Some(Ok(path.clone()));
+                return Ok(path);
+            }
+            for edge in &graph.adj[i as usize] {
+                let j = edge.to as usize;
+                let ng = self.g[i as usize] + edge.cost;
+                if !self.closed[j] && ng + 0.01 < self.g[j] {
+                    self.g[j] = ng;
+                    self.parent[j] = Some((i, edge.kind));
+                    let f = ng + HEURISTIC_WEIGHT * self.heuristic(graph, edge.to);
+                    self.open.push(Reverse((OrdF(f), edge.to, self.expanded)));
+                }
+            }
+        }
+        let error = if graph.truncated {
+            PathError::IncompleteGraph
+        } else {
+            PathError::Unreachable
+        };
+        self.result = Some(Err(error));
+        Err(error)
+    }
+}
+
+fn search(
+    graph: &NavGraph,
+    starts: &[(u16, f32)],
+    goals: &[u16],
+    budget: &mut u32,
+) -> Result<Vec<RouteStep>, PathError> {
+    RouteSearch::begin(graph, starts, goals).advance(graph, budget)
+}
+
+fn distance(a: [f32; 3], b: [f32; 3]) -> f32 {
+    ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+}
+
+fn reconstruct(
+    graph: &NavGraph,
+    parent: &[Option<(u16, TraversalKind)>],
+    goal: u16,
+) -> Vec<RouteStep> {
+    let mut path = Vec::new();
+    let mut i = goal;
+    loop {
+        let (entry, kind) = parent[i as usize]
+            .map(|(p, kind)| (graph.nodes[p as usize], kind))
+            .unwrap_or((graph.nodes[i as usize], TraversalKind::Walk));
+        path.push(RouteStep {
+            entry,
+            position: graph.nodes[i as usize],
+            kind,
+        });
+        let Some((p, _)) = parent[i as usize] else {
+            break;
+        };
+        i = p;
+    }
+    path.reverse();
+    path
+}
+
+type Buckets = BTreeMap<(i32, i32), Vec<usize>>;
+fn cell(p: [f32; 3], step: f32) -> (i32, i32) {
+    ((p[0] / step).floor() as i32, (p[1] / step).floor() as i32)
+}
+fn node_buckets(nodes: &[[f32; 3]], step: f32) -> Buckets {
+    let mut buckets = Buckets::new();
+    for (i, &p) in nodes.iter().enumerate() {
+        buckets.entry(cell(p, step)).or_default().push(i);
+    }
+    buckets
+}
+fn neighbors(buckets: &Buckets, p: [f32; 3], step: f32) -> Vec<usize> {
+    let (x, y) = cell(p, step);
+    let mut result = Vec::new();
+    for dx in -3..=3 {
+        for dy in -3..=3 {
+            if let Some(ids) = buckets.get(&(x + dx, y + dy)) {
+                result.extend_from_slice(ids);
+            }
+        }
+    }
+    result.sort_unstable();
+    result
+}
+
+/// A connector check that keeps its own cursor: one clearance query and one
+/// floor probe per 16-unit segment. A denied query leaves the cursor where it
+/// was, so the next grant continues instead of restarting the whole check.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SupportProbe {
+    a: [f32; 3],
+    b: [f32; 3],
+    clearance: Option<WalkSample>,
+    segments: u32,
+    /// Floor probes already accepted; also the progress mark for starvation.
+    done: u32,
+    previous_z: f32,
+}
+
+impl SupportProbe {
+    pub fn begin(a: [f32; 3], b: [f32; 3]) -> Self {
+        Self {
+            a,
+            b,
+            clearance: None,
+            segments: (dist_xy(a, b) / 16.0).ceil().max(1.0) as u32,
+            done: 0,
+            previous_z: a[2],
+        }
+    }
+
+    pub fn advance(&mut self, world: &mut impl WorldQuery) -> QueryResult<WalkSample> {
+        let clearance = match self.clearance {
+            Some(sample) => sample,
+            None => {
+                let sample = world.walk_hull(self.a, self.b)?;
+                self.clearance = Some(sample);
+                sample
+            }
+        };
+        if !matches!(clearance, WalkSample::Clear | WalkSample::BreakGlass) {
+            return Ok(clearance);
+        }
+        while self.done < self.segments {
+            let t = (self.done + 1) as f32 / self.segments as f32;
+            let p: [f32; 3] = std::array::from_fn(|i| self.a[i] + (self.b[i] - self.a[i]) * t);
+            let ground =
+                world.navigation_trace([p[0], p[1], p[2] + 2.0], [p[0], p[1], p[2] - STEP_Z_IN])?;
+            if ground.startsolid
+                || ground.normal[2] < 0.7
+                || ground.fraction >= 1.0
+                || (ground.endpos[2] - self.previous_z).abs() > STEP_Z_IN + 1.0
+            {
+                return Ok(WalkSample::Blocked);
+            }
+            self.previous_z = ground.endpos[2];
+            self.done += 1;
+        }
+        Ok(if (self.b[2] - self.previous_z).abs() > STEP_Z_IN + 1.0 {
+            WalkSample::Blocked
+        } else {
+            clearance
+        })
+    }
+}
+
+pub fn supported_walk(
+    world: &mut impl WorldQuery,
+    a: [f32; 3],
+    b: [f32; 3],
+) -> QueryResult<WalkSample> {
+    SupportProbe::begin(a, b).advance(world)
+}
+
+/// Revalidate the horizontal approach and the landing of an explicitly selected drop.
+pub fn drop_clear(
+    world: &mut impl WorldQuery,
+    from: [f32; 3],
+    to: [f32; 3],
+) -> QueryResult<WalkSample> {
+    if from[2] - to[2] <= STEP_Z_IN {
+        return world.walk_hull(from, to);
+    }
+    if from[2] - to[2] > DROP_Z_MAX {
+        return Ok(WalkSample::Blocked);
+    }
+    let top = [to[0], to[1], from[2] + 2.0];
+    match world.walk_hull(from, [to[0], to[1], from[2]])? {
+        WalkSample::Clear => {}
+        other => return Ok(other),
+    }
+    let land = world.hull_trace(top, [to[0], to[1], to[2] - 8.0])?;
+    Ok(
+        if !land.startsolid
+            && land.normal[2] >= 0.7
+            && land.fraction < 1.0
+            && (land.endpos[2] - to[2]).abs() <= STEP_Z_IN
+        {
+            WalkSample::Clear
+        } else {
+            WalkSample::Blocked
+        },
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct OrdF(f32);
+
+impl Eq for OrdF {}
+
+impl Ord for OrdF {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
+impl PartialOrd for OrdF {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[cfg(test)]
+mod node_graph_tests {
+    use super::*;
+
+    /// A floor at z = 0 and a wall across x = 100.
+    struct Flat;
+
+    impl BakeTraces for Flat {
+        fn bake_hull(&self, start: [f32; 3], end: [f32; 3]) -> HullTrace {
+            let mut f = 1.0f32;
+            let mut normal = [0.0; 3];
+            if end[2] < 0.0 && start[2] >= 0.0 {
+                f = f.min(start[2] / (start[2] - end[2]));
+                normal = [0.0, 0.0, 1.0];
+            }
+            if start[0] < 100.0 && end[0] >= 100.0 {
+                let wall = (100.0 - start[0]) / (end[0] - start[0]);
+                if wall < f {
+                    f = wall;
+                    normal = [-1.0, 0.0, 0.0];
+                }
+            }
+            if start[0] > 100.0 && end[0] <= 100.0 {
+                let wall = (start[0] - 100.0) / (start[0] - end[0]);
+                if wall < f {
+                    f = wall;
+                    normal = [1.0, 0.0, 0.0];
+                }
+            }
+            let endpos = std::array::from_fn(|k| start[k] + (end[k] - start[k]) * f);
+            HullTrace { fraction: f, normal, endpos, startsolid: start[2] < 0.0 }
+        }
+
+        fn bake_navigation(&self, start: [f32; 3], end: [f32; 3]) -> HullTrace {
+            self.bake_hull(start, end)
+        }
+    }
+
+    fn node(x: f32, y: f32, end: Option<u32>, anim: &str) -> asset_world::Iw6PathNode {
+        asset_world::Iw6PathNode { ty: 1, origin: [x, y, NODE_CENTER_IN], yaw: 0.0, negotiation_end: end, animscript: anim.to_owned(), links: Vec::new() }
+    }
+
+    #[test]
+    fn walk_links_stop_at_walls_and_traversals_cross_them() {
+        // 0,1,2 west of the wall; 3,4 east of it; 2 -> 3 is an authored traversal.
+        let nodes = vec![
+            node(0.0, 0.0, None, ""),
+            node(48.0, 0.0, None, ""),
+            node(90.0, 0.0, Some(3), "jump_up_40"),
+            node(110.0, 0.0, None, ""),
+            node(160.0, 0.0, None, ""),
+        ];
+        let g = from_path_nodes(&Flat, &nodes, 7);
+        assert_eq!((g.nodes.len(), g.hull), (5, NODE_HULL));
+        let kind = |a: usize, b: usize| g.adj[a].iter().find(|e| e.to as usize == b).map(|e| e.kind);
+        assert_eq!(kind(0, 1), Some(TraversalKind::Walk));
+        assert_eq!(kind(1, 0), Some(TraversalKind::Walk));
+        assert_eq!(kind(2, 3), Some(TraversalKind::Negotiate));
+        // The wall stops the walk, and `jump_up` is one way.
+        assert_eq!(kind(1, 3), None);
+        assert_eq!(kind(3, 2), None);
+        assert_eq!(kind(3, 4), Some(TraversalKind::Walk));
+        let mut budget = EXPAND_CAP;
+        let route = find_path(&g, [0.0, 0.0, 0.0], [160.0, 0.0, 0.0], &mut budget).expect("a route");
+        assert!(route.iter().any(|s| s.kind == TraversalKind::Negotiate));
+        // Nothing leads back across the wall, so the far side cannot reach the near one.
+        let mut budget = EXPAND_CAP;
+        assert!(find_path(&g, [160.0, 0.0, 0.0], [0.0, 0.0, 0.0], &mut budget).is_err());
+    }
+
+    #[test]
+    fn the_maps_own_links_are_the_graph_and_nothing_is_rebuilt() {
+        // Nodes 0..3 in a row with a wall between 1 and 2 (`Flat` would stop a rebuilt walk there);
+        // the map's links say 1 -> 2 is a walk anyway (a door the collision does not know), 2 -> 3 a
+        // traversal, and 0 -> 3 is absent although the nodes are near.
+        let link = |to: u32, cost: f32, negotiation: bool| asset_world::Iw6PathLink { to, cost, negotiation };
+        let mut nodes = vec![node(0.0, 0.0, None, ""), node(48.0, 0.0, None, ""), node(110.0, 0.0, None, ""), node(150.0, 0.0, None, "")];
+        nodes[0].links = vec![link(1, 48.0, false)];
+        nodes[1].links = vec![link(0, 48.0, false), link(2, 62.0, false)];
+        nodes[2].links = vec![link(3, 40.0, true)];
+        for n in &mut nodes {
+            n.origin[2] = 0.0; // the path data's origin is the seat, not the capsule's centre
+        }
+        let g = from_path_nodes(&Flat, &nodes, 3);
+        let edge = |a: usize, b: usize| g.adj[a].iter().find(|e| e.to as usize == b).copied();
+        assert_eq!(edge(1, 2).map(|e| (e.kind, e.cost)), Some((TraversalKind::Walk, 62.0)));
+        assert_eq!(edge(2, 3).map(|e| e.kind), Some(TraversalKind::Negotiate));
+        assert!(edge(2, 3).unwrap().cost > 40.0, "a traversal costs more than its length");
+        assert_eq!(edge(0, 3), None);
+        assert_eq!(edge(3, 2), None, "links are directed as the map gives them");
+        assert_eq!(g.adj.iter().map(Vec::len).sum::<usize>(), 4);
+        assert_eq!(g.nodes[1], [48.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn symmetric_animations_link_both_ways() {
+        let nodes = vec![node(90.0, 0.0, Some(1), "window_over_40"), node(110.0, 0.0, None, "")];
+        let g = from_path_nodes(&Flat, &nodes, 1);
+        assert!(g.adj[1].iter().any(|e| e.to == 0 && e.kind == TraversalKind::Negotiate));
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+
+    /// A corridor of nodes along x, 40 apart, with a door across it at x = 100..108.
+    fn corridor() -> NavGraph {
+        let nodes: Vec<[f32; 3]> = (0..10).map(|i| [i as f32 * 40.0, 0.0, 0.0]).collect();
+        let mut adj = vec![Vec::new(); nodes.len()];
+        for i in 0..nodes.len() - 1 {
+            adj[i].push(NavEdge { to: i as u16 + 1, cost: 40.0, kind: TraversalKind::Walk });
+            adj[i + 1].push(NavEdge { to: i as u16, cost: 40.0, kind: TraversalKind::Walk });
+        }
+        let component = label_components(nodes.len(), &adj);
+        NavGraph { nodes, component, adj, ..NavGraph::default() }
+    }
+
+    #[test]
+    fn a_closed_gate_cuts_the_route_and_an_open_one_restores_it() {
+        let mut g = corridor();
+        let mut budget = EXPAND_CAP * 8;
+        assert!(find_path(&g, g.nodes[0], g.nodes[9], &mut budget).is_ok());
+        let generation = g.generation;
+        assert!(g.set_gate(7, [100.0, -64.0, -4.0], [108.0, 64.0, 90.0], true));
+        assert_ne!(g.generation, generation, "walking bots must re-plan");
+        assert_ne!(g.component[0], g.component[9]);
+        let mut budget = EXPAND_CAP * 8;
+        assert!(find_path(&g, g.nodes[0], g.nodes[9], &mut budget).is_err(), "the closed door blocks the route");
+        assert!(find_path(&g, g.nodes[0], g.nodes[2], &mut budget).is_ok(), "nodes on one side still connect");
+        // Closing it again changes nothing.
+        assert!(!g.set_gate(7, [100.0, -64.0, -4.0], [108.0, 64.0, 90.0], true));
+        assert!(g.set_gate(7, [100.0, -64.0, -4.0], [108.0, 64.0, 90.0], false));
+        assert_eq!(g.component[0], g.component[9]);
+        let mut budget = EXPAND_CAP * 8;
+        assert!(find_path(&g, g.nodes[0], g.nodes[9], &mut budget).is_ok(), "the opened door lets the route through");
+        assert_eq!(g.adj, g.gates.full_adj);
+    }
+
+    #[test]
+    fn two_gates_on_one_link_need_both_open() {
+        let mut g = corridor();
+        let (lo, hi) = ([100.0, -64.0, -4.0], [108.0, 64.0, 90.0]);
+        g.set_gate(1, lo, hi, true);
+        g.set_gate(2, lo, hi, true);
+        g.set_gate(1, lo, hi, false);
+        assert_ne!(g.component[0], g.component[9], "the second door still holds it shut");
+        g.set_gate(2, lo, hi, false);
+        assert_eq!(g.component[0], g.component[9]);
+    }
+}

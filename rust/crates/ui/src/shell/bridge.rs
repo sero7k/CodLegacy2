@@ -1,0 +1,617 @@
+//! bo2mp shell: what the front end's scripts know, handed to the shell, and
+//! what the shell asks of them.
+//!
+//! The shell draws every front-end screen itself. BO2's scripts still run
+//! underneath (his stats file, Create-a-Class, the options, the match's
+//! start and its countdown); `lui_hud` calls `lui_side` once a frame with
+//! their host, which publishes the catalog (maps, modes, his card) and
+//! carries out the shell's requests.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+use hks_t6::host::Host;
+use hks_t6::mp::Mp;
+
+/// His Unlock All choice, kept in his stats file.
+pub(crate) const UNLOCK_ALL_STAT: &str = "bo2rb.unlockall";
+
+/// A map the lobby can pick.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct MapEntry {
+    /// The name the scripts and the match setup know it by (`mp_la`,
+    /// `mp_rust`).
+    pub ui_name: String,
+    pub title: String,
+    /// The section it is listed under ("BLACK OPS II", "CLASSIC MAPS").
+    pub group: String,
+    /// Where it comes from ("Modern Warfare 2 (DLC)").
+    pub origin: String,
+    /// Picture names to try, best first.
+    pub pictures: Vec<String>,
+}
+
+/// A game mode the lobby can pick.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ModeEntry {
+    pub key: String,
+    pub title: String,
+    pub desc: String,
+    /// bo2mp: its rules as Black Ops II's game settings give them
+    /// (mp/gamesettings_default.cfg, then mp/gamesettings_<type>.cfg):
+    /// time limit (minutes, 0 none), score limit, round limit, lives.
+    pub rules: ModeRules,
+    /// gametypestable's own: a party game (its playlist group `party`), and
+    /// its playlist picture (`playlist_tdm`).
+    pub party: bool,
+    pub picture: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct ModeRules {
+    pub time_limit: Option<f32>,
+    pub score_limit: Option<f32>,
+    pub round_limit: Option<f32>,
+    pub lives: Option<f32>,
+}
+
+/// A game type's `gametype_setting` lines (the default file, then its own).
+pub(crate) fn mode_rules(configs: &std::collections::HashMap<String, String>, key: &str) -> ModeRules {
+    let mut set: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+    for file in ["mp/gamesettings_default.cfg".to_owned(), format!("mp/gamesettings_{key}.cfg")] {
+        let Some(text) = configs.get(&file) else { continue };
+        for line in text.lines() {
+            let mut w = line.split("//").next().unwrap_or("").split_whitespace();
+            if w.next().is_some_and(|v| v.eq_ignore_ascii_case("gametype_setting"))
+                && let (Some(name), Some(value)) = (w.next(), w.next().and_then(|x| x.trim_matches('"').parse::<f32>().ok()))
+            {
+                set.insert(name.to_ascii_lowercase(), value);
+            }
+        }
+    }
+    ModeRules {
+        time_limit: set.get("timelimit").copied(),
+        score_limit: set.get("scorelimit").copied(),
+        round_limit: set.get("roundlimit").copied(),
+        lives: set.get("playernumlives").copied(),
+    }
+}
+
+/// His card: name, level, prestige and how far into the level he is.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct PlayerCard {
+    pub name: String,
+    pub level: i32,
+    pub prestige: i32,
+    pub xp_frac: f32,
+    /// The rank icon's picture name (another game's as `t5:<material>`).
+    pub rank_picture: String,
+    /// His combat record: (label, value).
+    pub record: Vec<(String, String)>,
+    /// He is at the top level and has a prestige to go.
+    pub can_prestige: bool,
+    /// His experience, and what the next level needs.
+    pub xp: i64,
+    pub xp_next: i64,
+    /// His calling card and emblem as his stats hold them (`iw4:cardtitle_*`,
+    /// `iw4:cardicon_*`; empty = the default, `cards`).
+    pub card: String,
+    pub emblem: String,
+}
+
+/// bo2mp: the Tricky modes: (the mode they play, key, title).
+pub(crate) const TRICKY: &[(&str, &str, &str)] =
+    &[("dm", "tricky_dm", "TRICKY FREE FOR ALL"), ("sd", "tricky_sd", "TRICKY SEARCH AND DESTROY")];
+
+/// The mode a Tricky mode plays (`tricky_sd` -> `sd`); `None` for any other.
+pub(crate) fn tricky_base(key: &str) -> Option<&'static str> {
+    TRICKY.iter().find(|(_, k, _)| k.eq_ignore_ascii_case(key)).map(|(b, _, _)| *b)
+}
+
+/// bo2mp: Jiggy Free For All (Custom Games): Free For All with the Jiggy 4.3
+/// mod menu's scripts linked (`sim::set_jiggy`): (the mode it plays, key, title).
+pub(crate) const JIGGY: (&str, &str, &str) = ("dm", "jiggy_dm", "JIGGY FREE FOR ALL");
+
+/// The mode Jiggy Free For All plays (`jiggy_dm` -> `dm`); `None` for any other.
+pub(crate) fn jiggy_base(key: &str) -> Option<&'static str> {
+    JIGGY.1.eq_ignore_ascii_case(key).then_some(JIGGY.0)
+}
+
+/// Bots in Tricky Search and Destroy: none with him, two against him.
+pub(crate) const TRICKY_SD_BOTS: (u32, u32) = (0, 2);
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Catalog {
+    /// Multiplayer's maps (the map picker, matchmaking's pool).
+    pub maps: Vec<MapEntry>,
+    /// bo2mp: Warzone's maps (Rebirth Island), for the WARZONE menu only.
+    pub warzone_maps: Vec<MapEntry>,
+    pub modes: Vec<ModeEntry>,
+    pub player: PlayerCard,
+}
+
+impl Catalog {
+    pub fn map(&self, ui_name: &str) -> Option<&MapEntry> {
+        self.maps.iter().chain(&self.warzone_maps).find(|m| m.ui_name.eq_ignore_ascii_case(ui_name))
+    }
+
+    /// A multiplayer map (never a Warzone one).
+    pub fn mp_map(&self, ui_name: &str) -> Option<&MapEntry> {
+        self.maps.iter().find(|m| m.ui_name.eq_ignore_ascii_case(ui_name))
+    }
+
+    pub fn mode(&self, key: &str) -> Option<&ModeEntry> {
+        self.modes.iter().find(|m| m.key.eq_ignore_ascii_case(key))
+    }
+
+    /// The groups in the order their first map is listed.
+    pub fn groups(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for m in &self.maps {
+            if !out.contains(&m.group) {
+                out.push(m.group.clone());
+            }
+        }
+        out
+    }
+}
+
+/// What the match he starts plays.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct StartSpec {
+    pub map: String,
+    pub gametype: String,
+    pub bot_friends: u32,
+    pub bot_enemies: u32,
+    pub bot_difficulty: u32,
+    /// bo2mp: a public match (FIND A MATCH), not a Custom Game.
+    pub public: bool,
+    /// bo2mp: Resurgence with squads of this size (WARZONE).
+    pub br: Option<u8>,
+}
+
+/// bo2mp: whether the shell's last START was a public match (FIND A
+/// MATCH), read by the match start (`sim::set_local_match_public`).
+static PUBLIC_START: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn public_start() -> bool {
+    PUBLIC_START.load(Ordering::Relaxed)
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Request {
+    Start(StartSpec),
+    CancelStart,
+    /// Barracks' ENTER PRESTIGE.
+    Prestige,
+    /// Options > ACCOUNT > UNLOCK ALL.
+    UnlockAll(bool),
+    /// Barracks: his calling card or emblem.
+    SetLook(super::cards::Kind, String),
+}
+
+#[derive(Default)]
+struct Bridge {
+    catalog: Option<Arc<Catalog>>,
+    requests: Vec<Request>,
+    /// The match starts in this many ms (a Custom Game's countdown, or the
+    /// public lobby's between matches), and how long that countdown was.
+    starting_in: Option<f64>,
+    starting_total: f64,
+    built_at: f64,
+}
+
+static BRIDGE: Mutex<Option<Bridge>> = Mutex::new(None);
+static SHOWN: AtomicBool = AtomicBool::new(false);
+static LOADING_SHOWN: AtomicBool = AtomicBool::new(false);
+
+fn with<R>(f: impl FnOnce(&mut Bridge) -> R) -> R {
+    let mut guard = BRIDGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    f(guard.get_or_insert_with(Bridge::default))
+}
+
+/// The shell draws the front end (`BO2_SHELL=off`: BO2's own menus).
+pub(crate) fn enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("BO2_SHELL").is_ok_and(|v| v.eq_ignore_ascii_case("off") || v == "0"))
+}
+
+/// The shell's screens are up: BO2's menus are hidden and get no input.
+pub(crate) fn covers_lui() -> bool {
+    enabled() && SHOWN.load(Ordering::Relaxed)
+}
+
+/// The shell's loading screen is up (BO2's is not opened).
+pub(crate) fn covers_loading() -> bool {
+    enabled() && LOADING_SHOWN.load(Ordering::Relaxed)
+}
+
+pub(crate) fn set_shown(on: bool) {
+    SHOWN.store(on, Ordering::Relaxed);
+}
+
+pub(crate) fn set_loading_shown(on: bool) {
+    LOADING_SHOWN.store(on, Ordering::Relaxed);
+}
+
+pub(crate) fn catalog() -> Option<Arc<Catalog>> {
+    with(|b| b.catalog.clone())
+}
+
+/// The preview's stand-in catalog.
+pub(crate) fn set_preview_catalog(c: Catalog) {
+    with(|b| b.catalog = Some(Arc::new(c)));
+}
+
+/// The preview's stand-in countdown.
+pub(crate) fn set_preview_starting(ms: Option<f64>) {
+    with(|b| b.starting_in = ms);
+}
+
+pub(crate) fn request(r: Request) {
+    with(|b| b.requests.push(r));
+}
+
+pub(crate) fn starting_in() -> Option<f64> {
+    with(|b| b.starting_in)
+}
+
+/// How long the running countdown was (ms).
+pub(crate) fn starting_total() -> f64 {
+    with(|b| b.starting_total)
+}
+
+fn text(v: &hks_t6::host::EngineValues, key: &str) -> String {
+    if key.is_empty() {
+        return String::new();
+    }
+    let k = key.to_ascii_uppercase();
+    v.localize.get(&k).cloned().unwrap_or_default()
+}
+
+fn cell(row: &[String], i: usize) -> &str {
+    row.get(i).map_or("", |c| c.trim())
+}
+
+/// A picture name from a mapstable cell: a material-looking word.
+fn looks_like_picture(c: &str) -> bool {
+    !c.is_empty() && c.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_') && c.chars().any(|ch| ch.is_ascii_alphabetic()) && c.contains('_')
+}
+
+fn build_catalog(host: &Host, mp: Option<&Mp>) -> Catalog {
+    let v = host.values.borrow();
+    // Maps: BO2's mapstable (its own rows, then the other games' the map
+    // list added), in the order of its sort column.
+    let foreign = crate::foreign_maps::categories();
+    let mut maps: Vec<(i32, MapEntry)> = Vec::new();
+    for row in hks_t6::mp::table_rows(&v, "mp/mapstable.csv") {
+        let name = cell(row, 0);
+        if name.is_empty() || !name.starts_with("mp_") || maps.iter().any(|(_, m)| m.ui_name == name) {
+            continue;
+        }
+        let key = cell(row, 3);
+        let title = [format!("{key}_CAPS"), key.to_owned()].iter().map(|k| text(&v, k)).find(|t| !t.is_empty());
+        let Some(title) = title else { continue };
+        let sort = cell(row, 5).parse::<i32>().unwrap_or(999);
+        let (group, origin) = foreign
+            .iter()
+            .find_map(|c| c.maps.iter().find(|m| m.ui_name == name).map(|m| (m.section.clone(), m.origin.clone())))
+            .unwrap_or_else(|| ("BLACK OPS II".to_owned(), "Black Ops II".to_owned()));
+        // (A foreign map's row is Aftermath's, renamed: its icon column is
+        // Aftermath's picture, so only BO2's own maps use it.)
+        let own = group == "BLACK OPS II";
+        let mut pictures = Vec::new();
+        if own && looks_like_picture(cell(row, 4)) {
+            pictures.push(cell(row, 4).to_owned());
+        }
+        pictures.extend([
+            format!("menu_{name}_map_select_final"),
+            format!("loadscreen_{name}"),
+            format!("menu_{name}_map_select"),
+            format!("menu_mp_map_select_{}_big", name.trim_start_matches("mp_")),
+        ]);
+        maps.push((
+            if group == "BLACK OPS II" { sort } else { 10_000 + sort },
+            MapEntry {
+                ui_name: name.to_owned(),
+                title: title.to_uppercase(),
+                group,
+                origin,
+                pictures,
+            },
+        ));
+    }
+    // BO2's own maps in its order, then each game's (newest first), its maps
+    // by name; custom maps last.
+    let rank = |g: &str| match g {
+        "BLACK OPS II" => 0,
+        "MODERN WARFARE 3" => 1,
+        "BLACK OPS" => 2,
+        "MODERN WARFARE 2" => 3,
+        "WORLD AT WAR" => 4,
+        "CALL OF DUTY 4" => 5,
+        "CUSTOM MAPS" => 7,
+        _ => 6,
+    };
+    maps.sort_by(|(sa, a), (sb, b)| {
+        rank(&a.group).cmp(&rank(&b.group)).then_with(|| {
+            if a.group == "BLACK OPS II" { sa.cmp(sb) } else { a.title.cmp(&b.title) }
+        })
+    });
+    // Modes: gametypestable's multiplayer rows with a name.
+    let mut modes: Vec<ModeEntry> = Vec::new();
+    let mut rows: Vec<&Vec<String>> = hks_t6::mp::table_rows(&v, "mp/gametypestable.csv").iter().filter(|r| cell(r, 0) == "0").collect();
+    rows.sort_by_key(|r| cell(r, 5).parse::<i32>().unwrap_or(999));
+    for row in rows {
+        let key = cell(row, 1);
+        let title = text(&v, cell(row, 2));
+        if key.is_empty() || title.is_empty() || modes.iter().any(|m| m.key == key) {
+            continue;
+        }
+        let desc = [cell(row, 3)].iter().map(|k| text(&v, k)).find(|t| !t.is_empty()).unwrap_or_default();
+        modes.push(ModeEntry {
+            key: key.to_owned(),
+            title: title.to_uppercase(),
+            desc,
+            rules: mode_rules(&v.configs, key),
+            party: cell(row, 9).eq_ignore_ascii_case("party"),
+            picture: cell(row, 4).to_owned(),
+        });
+    }
+    // bo2mp: the Tricky modes (Custom Games): a mode as it plays, two bots,
+    // his trickshot script on.
+    for (base, key, title) in TRICKY {
+        if let Some(m) = modes.iter().find(|m| m.key == *base).cloned() {
+            modes.push(ModeEntry {
+                key: (*key).to_owned(),
+                title: (*title).to_owned(),
+                desc: format!("{} Your trickshot script runs{}.", m.desc, if *base == "sd" { ", two bots" } else { "" }).trim().to_owned(),
+                ..m
+            });
+        }
+    }
+    // bo2mp: Jiggy Free For All (Custom Games): Free For All with the Jiggy
+    // mod menu's scripts (read from the `jiggy` folder at match start).
+    if let Some(m) = modes.iter().find(|m| m.key == JIGGY.0).cloned() {
+        modes.push(ModeEntry {
+            key: JIGGY.1.to_owned(),
+            title: JIGGY.2.to_owned(),
+            desc: format!("{} The Jiggy mod menu runs (custom games only).", m.desc).trim().to_owned(),
+            ..m
+        });
+    }
+    // His card.
+    let name = v.dvars.get("name").filter(|n| !n.trim().is_empty()).cloned().unwrap_or_else(|| "Player".to_owned());
+    // bo2mp: a `set_rank.txt` beside the game ("<prestige> <level>", e.g.
+    // "6 53") sets his rank once, the level's XP read off BO2's rank table;
+    // the file is renamed `set_rank.done` after.
+    if let Some(m) = mp {
+        let file = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("set_rank.txt")));
+        if let Some((file, text)) = file.and_then(|f| std::fs::read_to_string(&f).ok().map(|t| (f, t))) {
+            let want: Vec<i32> = text.split_whitespace().filter_map(|w| w.parse().ok()).collect();
+            if let [wp, wl] = want[..] {
+                let rank = (wl.clamp(1, bo2_profile::progression::max_level()) - 1).max(0);
+                let prestige = wp.clamp(0, bo2_profile::progression::max_prestige());
+                let row = hks_t6::mp::table_rows(&v, "mp/ranktable.csv")
+                    .iter()
+                    .chain(hks_t6::mp::table_rows(&v, "mp/rankTable.csv"))
+                    .find(|r| cell(r, 0).parse::<i32>().ok() == Some(rank))
+                    .cloned();
+                if let Some(row) = row {
+                    let num = |i: usize| cell(&row, i).parse::<f32>().unwrap_or(0.0);
+                    let mut g = m.borrow_mut();
+                    let p = &mut g.profile;
+                    p.set_stat(bo2_profile::PLEVEL.to_owned(), bo2_profile::StatValue::Num(prestige as f32));
+                    p.set_stat(bo2_profile::RANK.to_owned(), bo2_profile::StatValue::Num(rank as f32));
+                    p.set_stat(bo2_profile::RANK_XP.to_owned(), bo2_profile::StatValue::Num(num(2)));
+                    p.set_stat("playerstatslist.minxp.statvalue".to_owned(), bo2_profile::StatValue::Num(num(2)));
+                    p.set_stat("playerstatslist.maxxp.statvalue".to_owned(), bo2_profile::StatValue::Num(num(7)));
+                    diag::info!(Ui, "bo2mp shell: set_rank.txt: prestige {prestige}, level {} ({} XP)", rank + 1, num(2));
+                    let _ = std::fs::rename(&file, file.with_extension("done"));
+                }
+            }
+        }
+    }
+    let (rank, prestige, xp) = mp.map_or((0, 0, 0.0), |m| {
+        let m = m.borrow();
+        (
+            m.profile.rank().max(0),
+            m.profile.plevel().max(0),
+            m.stat(bo2_profile::RANK_XP).as_num().unwrap_or(0.0),
+        )
+    });
+    let xp_frac = hks_t6::mp::table_rows(&v, "mp/ranktable.csv")
+        .iter()
+        .chain(hks_t6::mp::table_rows(&v, "mp/rankTable.csv"))
+        .find(|r| cell(r, 0).parse::<i32>().ok() == Some(rank))
+        .and_then(|r| {
+            let lo = cell(r, 2).parse::<f32>().ok()?;
+            let hi = cell(r, 7).parse::<f32>().ok()?;
+            (hi > lo).then(|| ((xp - lo) / (hi - lo)).clamp(0.0, 1.0))
+        })
+        .unwrap_or(0.0);
+    let level = rank + 1;
+    let unlock_all = mp.is_some_and(|m| m.borrow().profile.stat_num(UNLOCK_ALL_STAT) != 0.0);
+    super::options::UNLOCK_ALL.store(unlock_all, std::sync::atomic::Ordering::Relaxed);
+    let stat = |name: &str| mp.map_or(0.0, |m| m.borrow().stat(&format!("playerstatslist.{name}.statvalue")).as_num().unwrap_or(0.0));
+    let (kills, deaths) = (stat("kills"), stat("deaths"));
+    let minutes = (stat("time_played_total") / 60.0).round() as i64;
+    let record = vec![
+        ("KILLS".to_owned(), format!("{}", kills as i64)),
+        ("DEATHS".to_owned(), format!("{}", deaths as i64)),
+        ("K/D RATIO".to_owned(), format!("{:.2}", if deaths > 0.0 { kills / deaths } else { kills })),
+        ("WINS".to_owned(), format!("{}", stat("wins") as i64)),
+        ("LOSSES".to_owned(), format!("{}", stat("losses") as i64)),
+        ("HEADSHOTS".to_owned(), format!("{}", stat("headshots") as i64)),
+        ("SCORE".to_owned(), format!("{}", stat("score") as i64)),
+        ("TIME PLAYED".to_owned(), format!("{}h {:02}m", minutes / 60, minutes % 60)),
+    ];
+    let xp_next = hks_t6::mp::table_rows(&v, "mp/ranktable.csv")
+        .iter()
+        .chain(hks_t6::mp::table_rows(&v, "mp/rankTable.csv"))
+        .find(|r| cell(r, 0).parse::<i32>().ok() == Some(rank))
+        .and_then(|r| cell(r, 7).parse::<f32>().ok())
+        .unwrap_or(0.0) as i64;
+    let look = |stat: &str| {
+        mp.and_then(|m| match m.borrow().profile.stat(stat) {
+            Some(bo2_profile::StatValue::Str(t)) => Some(t.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+    };
+    let (card, emblem) = (look(super::cards::CARD_STAT), look(super::cards::EMBLEM_STAT));
+    let can_prestige = level >= bo2_profile::progression::max_level() && prestige < bo2_profile::progression::max_prestige();
+    let (warzone_maps, maps): (Vec<MapEntry>, Vec<MapEntry>) =
+        maps.into_iter().map(|(_, m)| m).partition(|m| hks_t6::mapvote::is_warzone_map(&m.ui_name));
+    Catalog {
+        maps,
+        warzone_maps,
+        modes,
+        player: PlayerCard {
+            name,
+            level,
+            prestige,
+            xp_frac,
+            rank_picture: bo2_profile::progression::rank_picture(level, prestige),
+            record,
+            can_prestige,
+            xp: xp as i64,
+            xp_next,
+            card,
+            emblem,
+        },
+    }
+}
+
+/// Once a frame in the front end, with BO2's scripts: the catalog out, the
+/// shell's requests in.
+pub(crate) fn lui_side(host: &mut Host, mp: Option<&Mp>) {
+    if !enabled() {
+        return;
+    }
+    let now = host.now_ms();
+    // The catalog, again every two seconds (his card changes after a match).
+    let rebuild = with(|b| b.catalog.is_none() || now - b.built_at > 2000.0 || now < b.built_at);
+    if rebuild {
+        let c = build_catalog(host, mp);
+        let first = with(|b| b.catalog.is_none());
+        if first {
+            diag::info!(
+                Ui,
+                "bo2mp shell: {} maps in {} groups, {} modes; {} level {} prestige {} ({})",
+                c.maps.len(),
+                c.groups().len(),
+                c.modes.len(),
+                c.player.name,
+                c.player.level,
+                c.player.prestige,
+                c.player.rank_picture
+            );
+            if let Some(m) = c.maps.first() {
+                diag::info!(Ui, "bo2mp shell: first map {} pictures tried {:?}", m.ui_name, m.pictures);
+            }
+        }
+        with(|b| {
+            if b.catalog.as_deref() != Some(&c) {
+                b.catalog = Some(Arc::new(c));
+            }
+            b.built_at = now;
+        });
+    }
+    // The private countdown, else the public lobby's.
+    let starting = mp
+        .and_then(|m| {
+            let m = m.borrow();
+            m.private_start_ms.or(m.public_start_ms)
+        })
+        .map(|at| (at - now).max(0.0));
+    let requested = mp.is_some_and(|m| m.borrow().start_requested);
+    with(|b| {
+        let next = starting.or(requested.then_some(5000.0));
+        // (A countdown's length: what it read when it began.)
+        if b.starting_in.is_none() || next.is_some_and(|n| n > b.starting_total) {
+            b.starting_total = next.unwrap_or(0.0);
+        }
+        b.starting_in = next;
+    });
+    for r in with(|b| std::mem::take(&mut b.requests)) {
+        match r {
+            Request::Start(mut spec) => {
+                PUBLIC_START.store(spec.public, Ordering::Relaxed);
+                // bo2mp: the bots spawned are the lobby's, held to its rules:
+                // 18 players at most, none friendly without teams (Warzone's
+                // squads keep theirs, within the 18).
+                let humans = super::lobby_rules::humans();
+                let teams = spec.br.is_some() || super::lobby_rules::has_teams(&spec.gametype);
+                (spec.bot_friends, spec.bot_enemies) = super::lobby_rules::fit(spec.bot_friends, spec.bot_enemies, humans, teams);
+                // bo2mp: TRICKSHOT MODE is Custom Games' only.
+                if spec.public || spec.br.is_some() {
+                    sim::set_trickshot(false);
+                    // (And so is JIGGY FREE FOR ALL.)
+                    sim::set_jiggy(false);
+                }
+                sim::set_resurgence(spec.br);
+                // (The Warzone HUD draws what the script's text lines would.)
+                sim::set_warzone_hud(crate::hud_modern::modern_hud_enabled());
+                {
+                    let mut v = host.values.borrow_mut();
+                    for (k, x) in [
+                        ("ui_mapname", spec.map.clone()),
+                        ("ui_gametype", spec.gametype.clone()),
+                        ("bot_friends", spec.bot_friends.to_string()),
+                        ("bot_enemies", spec.bot_enemies.to_string()),
+                        ("bot_difficulty", spec.bot_difficulty.to_string()),
+                    ] {
+                        v.dvars.insert(k.to_owned(), x);
+                    }
+                }
+                if let Some(m) = mp {
+                    let mut m = m.borrow_mut();
+                    m.game_modes.insert(1);
+                    m.start_requested = true;
+                }
+                diag::info!(Ui, "bo2mp shell: START {spec:?}");
+            }
+            Request::CancelStart => {
+                if let Some(m) = mp {
+                    let mut m = m.borrow_mut();
+                    m.start_requested = false;
+                    m.private_start_ms = None;
+                }
+            }
+            Request::UnlockAll(on) => {
+                if let Some(m) = mp {
+                    m.borrow_mut().profile.set_stat(UNLOCK_ALL_STAT.to_owned(), bo2_profile::StatValue::Num(if on { 1.0 } else { 0.0 }));
+                    super::options::UNLOCK_ALL.store(on, std::sync::atomic::Ordering::Relaxed);
+                    diag::info!(Ui, "bo2mp shell: unlock all {}", if on { "on" } else { "off" });
+                    with(|b| b.built_at = -1.0e9);
+                }
+            }
+            Request::SetLook(kind, name) => {
+                if let Some(m) = mp {
+                    m.borrow_mut().profile.set_stat(kind.stat().to_owned(), bo2_profile::StatValue::Str(name.clone()));
+                    diag::info!(Ui, "bo2mp shell: {kind:?} now {name}");
+                    with(|b| b.built_at = -1.0e9);
+                }
+            }
+            Request::Prestige => {
+                if let Some(m) = mp {
+                    // (As mp/prestige_reset.cfg: level 1 again, the
+                    // bought items unbought, then the next prestige.)
+                    let done = {
+                        let p = &mut m.borrow_mut().profile;
+                        let ok = p.plevel() < bo2_profile::progression::max_prestige();
+                        if ok {
+                            p.prestige_stats_reset();
+                            p.set_stat(bo2_profile::RANK_XP.to_owned(), bo2_profile::StatValue::Num(0.0));
+                            p.set_stat(bo2_profile::RANK.to_owned(), bo2_profile::StatValue::Num(0.0));
+                        }
+                        ok && p.prestige_request(bo2_profile::progression::max_prestige())
+                    };
+                    diag::info!(Ui, "bo2mp shell: enter prestige: {}", if done { "done" } else { "not allowed" });
+                    with(|b| b.built_at = -1.0e9);
+                }
+            }
+        }
+    }
+}

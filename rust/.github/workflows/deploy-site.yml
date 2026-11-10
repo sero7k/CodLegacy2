@@ -1,0 +1,45 @@
+name: deploy-site
+# Publishes web/ to Cloudflare Pages when it changes on main.
+# Needs two repository secrets (Settings > Secrets and variables > Actions):
+#   CLOUDFLARE_API_TOKEN   (permission: Cloudflare Pages - Edit)
+#   CLOUDFLARE_ACCOUNT_ID
+# Without them the job does nothing. See web/README.md.
+# Optional repository variable CL_API_URL (Settings > Secrets and variables > Actions >
+# Variables), e.g. https://codlegacy.example.com : the address of the account service.
+# When set, the deployed pages call it for sign-in, launcher keys and the leaderboard.
+on:
+  push:
+    branches: [main]
+    paths: ['web/**', '.github/workflows/deploy-site.yml']
+  workflow_dispatch:
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CL_API_URL: ${{ vars.CL_API_URL }}
+    steps:
+      - uses: actions/checkout@v4
+        if: env.CF_TOKEN != ''
+      - name: Point the site at the account service
+        if: env.CF_TOKEN != '' && env.CL_API_URL != ''
+        run: |
+          case "$CL_API_URL" in
+            https://*) ;;
+            *) echo "CL_API_URL must start with https://"; exit 1 ;;
+          esac
+          if printf '%s' "$CL_API_URL" | grep -qE '[^A-Za-z0-9.:/_-]'; then
+            echo "CL_API_URL contains unexpected characters"; exit 1
+          fi
+          sed -i "s|<meta name=\"cl-api\" content=\"\">|<meta name=\"cl-api\" content=\"${CL_API_URL%/}\">|" web/index.html
+          grep -F 'name="cl-api"' web/index.html
+      - name: Deploy to Cloudflare Pages
+        if: env.CF_TOKEN != ''
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy web --project-name=codlegacy --branch=main
+      - name: Skipped
+        if: env.CF_TOKEN == ''
+        run: echo "CLOUDFLARE_API_TOKEN is not set; nothing deployed."

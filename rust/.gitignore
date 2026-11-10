@@ -1,0 +1,27 @@
+# Machine-local config (games paths, etc.)
+.env
+
+# Rust
+/target/
+**/target/
+/dist/
+
+# Runtime output next to the binary / cwd.
+codlegacy-artifacts
+
+# Agent working memory. None of it is the product: the artifacts, the externals,
+# the agent clones and the RE tooling and its bases all stay on this machine.
+/context/
+/target-tools
+mono_crash.*.json
+
+# Account service data (SQLite) from local testing.
+/accounts-data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Launcher update signing key (private). Never commit.
+*.signing-key
+update_key.secret
+/CodLegacy-Setup.exe

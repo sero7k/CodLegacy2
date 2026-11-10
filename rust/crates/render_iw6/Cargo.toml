@@ -1,0 +1,34 @@
+[package]
+name = "render_iw6"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Draws Call of Duty: Ghosts maps with Ghosts' own techniques and shaders (translated by dxbc_sm5), its lightmaps, light grid, probes, sun, fog and post."
+
+[dependencies]
+codlegacy_env.workspace = true
+map_bake.workspace = true
+fx_iw4.workspace = true
+fastfile_iw6.workspace = true
+iw6_pose.workspace = true
+# (Only for its picture type: `render_h1::gpu` uploads it.)
+fastfile_h1.workspace = true
+render_h1.workspace = true
+native_quality.workspace = true
+native_cull.workspace = true
+dpvs_iw4.workspace = true
+marks_iw4.workspace = true
+dxbc_sm5.workspace = true
+wgpu = "29"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+glam = "0.32.1"
+png = "0.18"
+
+[dev-dependencies]
+flate2.workspace = true
+naga = { version = "29", features = ["wgsl-in"] }
+wgpu = { version = "29", features = ["noop"] }
+
+[lints]
+workspace = true

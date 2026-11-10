@@ -1,0 +1,196 @@
+use std::path::PathBuf;
+
+use render::diag::acceptance::{ACCEPTANCE_ENV, ACCEPTANCE_FLAG, ACCEPTANCE_MAPS};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AcceptanceLaunch {
+    pub dir: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LaunchMode {
+    Menu,
+    /// bo2mp lane C: `frontend t6mp` - Black Ops II's multiplayer front end
+    /// (its own menus), no map until a match starts.
+    FrontendT6Mp,
+    Map(String),
+    /// bo2zm M4: Black Ops II's own front end first; Start loads the map.
+    Frontend(String),
+    Serve(String),
+    ExportGltf(String),
+    Play {
+        name: String,
+        zone_override: Option<String>,
+    },
+    /// bo2mp: `check-maps` - every MW2 map zone read and its pictures looked
+    /// up, a report written (no window).
+    CheckMaps,
+    /// bo2mp: `CodLegacy check-guns` - the guest guns, read as a match reads them.
+    CheckGuns,
+    /// bo2mp: `CodLegacy export-mw3 <folder>`: the small copy of Modern Warfare
+    /// III (its guns, gun sounds, gun and camo pictures, calling cards and
+    /// emblems), as Options > GAME FOLDERS makes it (`ui::jup_pack`).
+    ExportMw3(PathBuf),
+    /// bo2mp: `CodLegacy export-jup <folder>`: Modern Warfare III's (2023) guns,
+    /// camos, calling cards, emblems and gun sounds in our own converted
+    /// files, to be used without the game (`assets::export_jup`).
+    ExportJup(PathBuf),
+    /// `CodLegacy check-ghosts [zone]` - a Ghosts zone's assets and sounds, and
+    /// Ghosts' menu music checked in its sound pak (no window).
+    CheckGhosts(Option<String>),
+    /// bo2mp: `CodLegacy pack <folder>` - a server pack (gameplay half) of every
+    /// multiplayer map from the other games, for a dedicated server.
+    Pack(PathBuf),
+}
+
+pub fn parse_cli(
+    args: impl Iterator<Item = String>,
+) -> Result<(LaunchMode, Option<AcceptanceLaunch>), String> {
+    let (args, acceptance) = parse_acceptance_flag(args)?;
+    let args = console::strip_cmds_flag(args.into_iter());
+    let mode = parse_launch_args(args.into_iter())?;
+    Ok((mode, acceptance))
+}
+
+fn parse_acceptance_flag(
+    args: impl Iterator<Item = String>,
+) -> Result<(Vec<String>, Option<AcceptanceLaunch>), String> {
+    let mut out = Vec::new();
+    let mut acceptance = None;
+    let mut iter = args.peekable();
+    while let Some(arg) = iter.next() {
+        if arg == ACCEPTANCE_FLAG {
+            match iter.next() {
+                Some(dir) if !dir.is_empty() && !dir.starts_with('-') => {
+                    acceptance = Some(AcceptanceLaunch {
+                        dir: PathBuf::from(dir),
+                    });
+                }
+                _ => {
+                    return Err(format!(
+                        "usage: CodLegacy --render-acceptance <artifact-dir> map <zone>\n\
+                         env alternative: {env}=<artifact-dir>\n\
+                         expected maps later: {maps}",
+                        env = ACCEPTANCE_ENV,
+                        maps = ACCEPTANCE_MAPS.join(", ")
+                    ));
+                }
+            }
+        } else if let Some(dir) = arg.strip_prefix(&(ACCEPTANCE_FLAG.to_owned() + "=")) {
+            if dir.is_empty() {
+                return Err("empty --render-acceptance path".into());
+            }
+            acceptance = Some(AcceptanceLaunch {
+                dir: PathBuf::from(dir),
+            });
+        } else {
+            out.push(arg);
+        }
+    }
+    if acceptance.is_none()
+        && let Some(dir) = codlegacy_env::var_os(ACCEPTANCE_ENV)
+    {
+        acceptance = Some(AcceptanceLaunch {
+            dir: PathBuf::from(dir),
+        });
+    }
+    Ok((out, acceptance))
+}
+
+const USAGE: &str = "usage: CodLegacy [--cmds '<script>'] map <zone> | serve [zone] | menu | play <demo>\n       CodLegacy export-gltf <zone>\n       CodLegacy pack <folder>\n       CodLegacy export-jup <folder>\n       CodLegacy --help";
+
+pub fn parse_launch_args(mut args: impl Iterator<Item = String>) -> Result<LaunchMode, String> {
+    match args.next().as_deref() {
+        Some("--help") | Some("-h") => Err(USAGE.into()),
+        Some("map") => {
+            let Some(zone) = args.next().filter(|z| !z.is_empty()) else {
+                return Err("usage: CodLegacy map <zone> [--cmds '<script>']".into());
+            };
+            Ok(LaunchMode::Map(zone))
+        }
+        // bo2mp lane C: `frontend t6mp` is Black Ops II's multiplayer front
+        // end; bo2zm M4: `frontend <zone>` opens on BO2's own (zombies) menu
+        // and Start loads that map.
+        Some("frontend") => match (args.next().filter(|z| !z.is_empty()), args.next()) {
+            (Some(z), None) if z == "t6mp" => Ok(LaunchMode::FrontendT6Mp),
+            (Some(zone), _) => Ok(LaunchMode::Frontend(zone)),
+            _ => Err("usage: CodLegacy frontend t6mp | frontend <zone> [--cmds '<script>']".into()),
+        },
+        // bo2mp: with no zone, `CODLEGACY_SERVER_ROTATION` names the maps.
+        Some("serve") => Ok(LaunchMode::Serve(args.next().unwrap_or_else(String::new))),
+        Some("export-gltf") => {
+            let Some(zone) = args.next().filter(|zone| !zone.is_empty()) else {
+                return Err("usage: CodLegacy export-gltf <zone>".into());
+            };
+            if args.next().is_some() {
+                return Err("usage: CodLegacy export-gltf <zone>".into());
+            }
+            Ok(LaunchMode::ExportGltf(zone))
+        }
+        Some("menu") => {
+            if args.next().is_some() {
+                return Err("usage: CodLegacy menu [--cmds '<script>']".into());
+            }
+            Ok(LaunchMode::Menu)
+        }
+        Some("play") => parse_play_args(args),
+        Some("check-maps") => Ok(LaunchMode::CheckMaps),
+        Some("pack") => match args.next().filter(|d| !d.is_empty()) {
+            Some(dir) => Ok(LaunchMode::Pack(PathBuf::from(dir))),
+            None => Err("usage: CodLegacy pack <folder>".into()),
+        },
+        Some("check-guns") => Ok(LaunchMode::CheckGuns),
+        Some("export-mw3") => match args.next().filter(|d| !d.is_empty()) {
+            Some(dir) => Ok(LaunchMode::ExportMw3(PathBuf::from(dir))),
+            None => Err("usage: CodLegacy export-mw3 <folder>".into()),
+        },
+        Some("export-jup") => match args.next().filter(|d| !d.is_empty()) {
+            Some(dir) => Ok(LaunchMode::ExportJup(PathBuf::from(dir))),
+            None => Err("usage: CodLegacy export-jup <folder>".into()),
+        },
+        Some("check-ghosts") => Ok(LaunchMode::CheckGhosts(args.next().filter(|z| !z.is_empty()))),
+        Some(other) => Err(format!(
+            "unknown launch args starting with `{other}` — expected: map <zone> | serve <zone> | menu | play <demo> [--cmds '<script>'] | export-gltf <zone>"
+        )),
+        None => Err(USAGE.into()),
+    }
+}
+
+fn parse_play_args(args: impl Iterator<Item = String>) -> Result<LaunchMode, String> {
+    let usage = "usage: CodLegacy play <demo> [--zone <zone>] [--cmds '<script>']";
+    let mut name = None;
+    let mut zone_override = None;
+    let mut iter = args.peekable();
+    while let Some(arg) = iter.next() {
+        if arg == "--zone" {
+            match iter.next() {
+                Some(zone) if !zone.is_empty() && !zone.starts_with('-') => {
+                    zone_override = Some(zone);
+                }
+                _ => return Err(usage.into()),
+            }
+            continue;
+        }
+        if let Some(zone) = arg.strip_prefix("--zone=") {
+            if zone.is_empty() {
+                return Err("empty --zone".into());
+            }
+            zone_override = Some(zone.to_owned());
+            continue;
+        }
+        if arg.starts_with('-') {
+            return Err(format!("unknown play flag `{arg}` — expected --zone"));
+        }
+        if name.is_some() {
+            return Err(format!("{usage} (extra `{arg}`)"));
+        }
+        name = Some(replay::demo_stem(&arg).to_owned());
+    }
+    let Some(name) = name.filter(|n| !n.is_empty()) else {
+        return Err(usage.into());
+    };
+    Ok(LaunchMode::Play {
+        name,
+        zone_override,
+    })
+}

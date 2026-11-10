@@ -1,0 +1,370 @@
+//! bo2mp shell: the backdrop - a map picture over the whole screen that
+//! fades into dark navy on the left (where the menus are), at the top and
+//! at the bottom, so the map shows without fighting the text. In the lobby
+//! it is the lobby's map, in the map picker the map in focus; on the main
+//! and Multiplayer screens the maps take turns. A new picture fades in over
+//! the old, and each drifts slowly closer while it is up. The Zombies
+//! screens show the Zombies map (and start) in the same way, faded into a
+//! dark red (`theme::palette`).
+
+use bevy::prelude::*;
+use bevy::window::PrimaryWindow;
+
+use super::pics::{ShellPics, cover};
+use super::theme::{Palette, palette};
+use super::{Screen, Shell, bridge, pages, zombies};
+
+#[derive(Component)]
+pub(crate) struct BgRoot;
+
+/// 0: the picture now, 1: the one fading out.
+#[derive(Component)]
+pub(crate) struct BgLayer(u8);
+
+#[derive(Default)]
+pub(crate) struct BgState {
+    now: Option<(String, Handle<Image>, f64)>,
+    old: Option<(Handle<Image>, f64)>,
+    slide_at: f64,
+    seed: u64,
+    was_main: bool,
+    /// The colours the fades were made in.
+    pal: Option<Palette>,
+}
+
+const FADE: f64 = 0.9;
+
+/// The menu photographs (the main screens' backdrop while no map is
+/// chosen), shown in a random order.
+const PHOTOS: [&[u8]; 21] = [
+    include_bytes!("../../assets/menu_backgrounds/bg01.jpg"),
+    include_bytes!("../../assets/menu_backgrounds/bg02.jpg"),
+    include_bytes!("../../assets/menu_backgrounds/bg03.jpg"),
+    include_bytes!("../../assets/menu_backgrounds/bg04.jpg"),
+    include_bytes!("../../assets/menu_backgrounds/bg05.jpg"),
+    include_bytes!("../../assets/menu_backgrounds/bg06.jpg"),
+    include_bytes!("../../assets/menu_backgrounds/bg07.jpg"),
+    include_bytes!("../../assets/menu_backgrounds/bg08.jpg"),
+    include_bytes!("../../assets/menu_backgrounds/bg09.jpg"),
+    include_bytes!("../../assets/menu_backgrounds/bg10.jpg"),
+    include_bytes!("../../assets/menu_backgrounds/bg11.jpg"),
+    include_bytes!("../../assets/menu_backgrounds/bg12.jpg"),
+    include_bytes!("../../assets/menu_backgrounds/bg13.jpg"),
+    include_bytes!("../../assets/menu_backgrounds/bg14.jpg"),
+    include_bytes!("../../assets/menu_backgrounds/bg15.jpg"),
+    include_bytes!("../../assets/menu_backgrounds/bg16.jpg"),
+    include_bytes!("../../assets/menu_backgrounds/bg17.jpg"),
+    include_bytes!("../../assets/menu_backgrounds/bg18.jpg"),
+    include_bytes!("../../assets/menu_backgrounds/bg19.jpg"),
+    include_bytes!("../../assets/menu_backgrounds/bg20.jpg"),
+    include_bytes!("../../assets/menu_backgrounds/bg21.jpg"),
+];
+
+/// The Zombies menu's survivors (the Zombies screens' backdrop while no
+/// map is shown), in a random order.
+const ZM_PHOTOS: [&[u8]; 12] = [
+    include_bytes!("../../assets/menu_backgrounds/zm01.jpg"),
+    include_bytes!("../../assets/menu_backgrounds/zm02.jpg"),
+    include_bytes!("../../assets/menu_backgrounds/zm03.jpg"),
+    include_bytes!("../../assets/menu_backgrounds/zm04.jpg"),
+    include_bytes!("../../assets/menu_backgrounds/zm05.jpg"),
+    include_bytes!("../../assets/menu_backgrounds/zm06.jpg"),
+    include_bytes!("../../assets/menu_backgrounds/zm07.jpg"),
+    include_bytes!("../../assets/menu_backgrounds/zm08.jpg"),
+    include_bytes!("../../assets/menu_backgrounds/zm09.jpg"),
+    include_bytes!("../../assets/menu_backgrounds/zm10.jpg"),
+    include_bytes!("../../assets/menu_backgrounds/zm11.jpg"),
+    include_bytes!("../../assets/menu_backgrounds/zm12.jpg"),
+];
+
+/// A small random number source (the order the photos come in).
+fn next_random(seed: &mut u64) -> u64 {
+    if *seed == 0 {
+        *seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0x9E37_79B9, |d| d.as_nanos() as u64) | 1;
+    }
+    *seed ^= *seed << 13;
+    *seed ^= *seed >> 7;
+    *seed ^= *seed << 17;
+    *seed
+}
+
+/// The photo `i` (of the Zombies set when `zm`) as a picture (decoded once).
+fn photo(i: usize, zm: bool, pics: &mut ShellPics, images: &mut Assets<Image>) -> Option<Handle<Image>> {
+    let name = format!("\u{1}menu photo {}{i}", if zm { "zm " } else { "" });
+    if let Some(h) = pics.get(&name, None, images) {
+        return Some(h);
+    }
+    let set: &[&[u8]] = if zm { &ZM_PHOTOS } else { &PHOTOS };
+    let img = Image::from_buffer(
+        set.get(i)?,
+        bevy::image::ImageType::Extension("jpg"),
+        bevy::image::CompressedImageFormats::NONE,
+        true,
+        bevy::image::ImageSampler::linear(),
+        bevy::asset::RenderAssetUsages::default(),
+    )
+    .map_err(|e| diag::warn!(Ui, "bo2mp shell: menu photo {i} did not decode: {e}"))
+    .ok()?;
+    let h = images.add(img);
+    pics.insert(&name, h.clone());
+    Some(h)
+}
+
+/// The screens with no map to show: the photos take turns there.
+fn photo_screen(shell: &Shell) -> bool {
+    match shell.screen {
+        Screen::Main | Screen::Multiplayer | Screen::Options | Screen::Barracks | Screen::CardPick | Screen::EmblemPick => true,
+        Screen::Classes | Screen::ClassEdit | Screen::ItemPick => !matches!(shell.cac_from, Screen::Lobby | Screen::WzLobby),
+        Screen::Zombies | Screen::ZmRecord => true,
+        Screen::WzMenu => true,
+        // (WARZONE's lobby and picker show its map, or the photos until
+        // it is installed.)
+        Screen::WzLobby | Screen::WzModePick => bridge::catalog().is_none_or(|c| super::warzone::map(&c).is_err()),
+        _ => false,
+    }
+}
+
+/// Which photos the backdrop takes from: the Zombies survivors anywhere in
+/// the Zombies front end (its own screens and the shared ones opened from
+/// it, `Shell::in_zombies`), the soldiers everywhere else. Never the
+/// soldiers in Zombies.
+fn zombies_photos(shell: &Shell) -> bool {
+    shell.in_zombies()
+}
+
+/// A backdrop name from the Zombies set (a Zombies map picture or photo).
+fn is_zombies_pic(name: &str) -> bool {
+    name.starts_with("zm:") || name.starts_with("zmphoto:")
+}
+
+/// The next photo of the set (`zm`: the survivors), when it is due or the
+/// backdrop is not one of that set's.
+fn show_photo(st: &mut BgState, zm: bool, now: f64, pics: &mut ShellPics, images: &mut Assets<Image>) {
+    let (set, tag) = if zm { (ZM_PHOTOS.len(), "zmphoto:") } else { (PHOTOS.len(), "photo:") };
+    if now >= st.slide_at || st.now.as_ref().is_none_or(|(n, ..)| !n.starts_with(tag)) {
+        // (Never the same photo twice in a row.)
+        let mut i = (next_random(&mut st.seed) % set as u64) as usize;
+        if st.now.as_ref().is_some_and(|(n, ..)| *n == format!("{tag}{i}")) {
+            i = (i + 1) % set;
+        }
+        st.slide_at = now + SLIDE_SECS;
+        if let Some(h) = photo(i, zm, pics, images) {
+            st.old = st.now.take().map(|(_, h, _)| (h, now));
+            st.now = Some((format!("{tag}{i}"), h, now));
+        }
+    }
+}
+
+const SLIDE_SECS: f64 = 9.0;
+
+fn spawn(commands: &mut Commands, pal: Palette) {
+    let [r, g, b] = pal.shade;
+    let shade = |a: f32| Color::srgba(r, g, b, a);
+    let full = || Node {
+        position_type: PositionType::Absolute,
+        left: Val::Px(0.0),
+        top: Val::Px(0.0),
+        width: Val::Percent(100.0),
+        height: Val::Percent(100.0),
+        ..default()
+    };
+    commands
+        .spawn((
+            BgRoot,
+            GlobalZIndex(5),
+            BackgroundColor(Color::srgb(r * 1.5, g * 1.25, b * 1.15)),
+            Node {
+                overflow: Overflow::clip(),
+                ..full()
+            },
+        ))
+        .with_children(|c| {
+            for i in [1u8, 0] {
+                c.spawn((BgLayer(i), ImageNode::default(), Visibility::Hidden, Node {
+                    position_type: PositionType::Absolute,
+                    ..default()
+                }));
+            }
+            // The fades: the left side (the menus), the top and the bottom,
+            // and a cool tint over it all.
+            c.spawn((
+                full(),
+                BackgroundGradient::from(LinearGradient::to_right(vec![
+                    ColorStop::new(shade(0.97), Val::Percent(0.0)),
+                    ColorStop::new(shade(0.78), Val::Percent(42.0)),
+                    ColorStop::new(shade(0.30), Val::Percent(100.0)),
+                ])),
+            ));
+            c.spawn((
+                full(),
+                BackgroundGradient::from(LinearGradient::to_bottom(vec![
+                    ColorStop::new(shade(0.80), Val::Percent(0.0)),
+                    ColorStop::new(shade(0.0), Val::Percent(24.0)),
+                    ColorStop::new(shade(0.0), Val::Percent(62.0)),
+                    ColorStop::new(shade(0.92), Val::Percent(100.0)),
+                ])),
+            ));
+            c.spawn((full(), BackgroundColor(pal.tint)));
+        });
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn shell_background(
+    mut commands: Commands,
+    shell: Res<Shell>,
+    mut pics: ResMut<ShellPics>,
+    icons: Option<Res<assets::T6HudIcons>>,
+    mut images: ResMut<Assets<Image>>,
+    roots: Query<Entity, With<BgRoot>>,
+    mut layers: Query<(&BgLayer, &mut ImageNode, &mut Node, &mut Visibility)>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    time: Res<Time>,
+    mut st: Local<BgState>,
+) {
+    let up = bridge::covers_lui();
+    if !up {
+        for e in &roots {
+            commands.entity(e).despawn();
+        }
+        return;
+    }
+    // (New colours: the backdrop is made again; its pictures stay.)
+    let pal = palette(&shell);
+    if roots.is_empty() || st.pal != Some(pal) {
+        for e in &roots {
+            commands.entity(e).despawn();
+        }
+        spawn(&mut commands, pal);
+        st.pal = Some(pal);
+        return;
+    }
+    let Some(c) = bridge::catalog() else { return };
+    let now = time.elapsed_secs_f64();
+    // Back on the main menu: a new random photo at once.
+    let on_main = shell.screen == Screen::Main;
+    if on_main && !st.was_main {
+        st.slide_at = 0.0;
+    }
+    st.was_main = on_main;
+    let zm_flow = zombies_photos(&shell);
+    if photo_screen(&shell) {
+        // (The Zombies front end shows the survivors, the rest the soldiers.)
+        show_photo(&mut st, zm_flow, now, &mut pics, &mut images);
+    } else {
+        // The map to show.
+        // (A Zombies map and start is `zm:<map>:<start>`.)
+        let zm = |map: &str, start: usize| Some(format!("zm:{map}:{start}"));
+        let target: Option<String> = match shell.screen {
+            Screen::MapPick => pages(&c)
+                .get(shell.page)
+                .and_then(|(_, maps)| maps.get(shell.focus))
+                .map(|&i| c.maps[i].ui_name.clone()),
+            Screen::ZmMapPick => zombies::pages(zombies::state().bo1())
+                .get(shell.page)
+                .and_then(|(_, maps)| maps.get(shell.focus))
+                .and_then(|&i| zm(zombies::all()[i].map, 0)),
+            Screen::ZmStartPick => zm(&shell.zm_map, shell.focus),
+            Screen::ZmLobby => zm(&shell.zm_map, shell.zm_start),
+            Screen::Classes | Screen::ClassEdit | Screen::ItemPick | Screen::WzLobby | Screen::WzModePick if shell.wz => {
+                super::warzone::map(&c).ok().map(|(ui, _)| ui)
+            }
+            _ => Some(shell.map.clone()),
+        };
+        if let Some(name) = target
+            && st.now.as_ref().is_none_or(|(n, ..)| *n != name)
+        {
+            let pictures = match name.strip_prefix("zm:").and_then(|r| r.rsplit_once(':')) {
+                Some((map, start)) => zombies::pictures(zombies::map(map), start.parse().unwrap_or(0)),
+                None => c.map(&name).map(|m| m.pictures.clone()).unwrap_or_default(),
+            };
+            if let Some(h) = pics.first(&pictures, icons.as_deref(), &mut images) {
+                st.old = st.now.take().map(|(_, h, _)| (h, now));
+                st.now = Some((name, h, now));
+            }
+        }
+        // (In Zombies, a map without a picture, or none in focus yet,
+        // shows the survivors, never a Multiplayer picture left over.)
+        if zm_flow && st.now.as_ref().is_none_or(|(n, ..)| !is_zombies_pic(n)) {
+            show_photo(&mut st, true, now, &mut pics, &mut images);
+        }
+    }
+    let (area, _) = super::window_scale(&windows);
+    for (layer, mut img, mut node, mut vis) in &mut layers {
+        let pic = match layer.0 {
+            0 => st.now.as_ref().map(|(_, h, at)| (h.clone(), *at, ((now - at) / FADE).clamp(0.0, 1.0))),
+            _ => st.old.as_ref().map(|(h, at)| (h.clone(), *at, 1.0 - ((now - at) / FADE).clamp(0.0, 1.0))),
+        };
+        let Some((h, since, alpha)) = pic.filter(|p| p.2 > 0.001) else {
+            if *vis != Visibility::Hidden {
+                *vis = Visibility::Hidden;
+            }
+            continue;
+        };
+        if img.image != h {
+            img.image = h.clone();
+        }
+        img.color = Color::srgba(1.0, 1.0, 1.0, alpha as f32);
+        // Covering the screen, drifting closer over 30 seconds.
+        let size = images.get(&h).map_or(area, |i| i.size_f32());
+        let drift = 1.0 + 0.06 * ((now - since) / 30.0).clamp(0.0, 1.0) as f32;
+        let s = cover(size, area) * drift;
+        node.width = Val::Px(s.x);
+        node.height = Val::Px(s.y);
+        node.left = Val::Px((area.x - s.x) * 0.5);
+        node.top = Val::Px((area.y - s.y) * 0.5);
+        if *vis != Visibility::Inherited {
+            *vis = Visibility::Inherited;
+        }
+    }
+    if st.old.as_ref().is_some_and(|(_, at)| now - at > FADE) {
+        st.old = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shell(screen: Screen, from: Screen) -> Shell {
+        Shell {
+            screen,
+            cac_from: from,
+            ..Shell::default()
+        }
+    }
+
+    #[test]
+    fn zombies_screens_and_screens_opened_from_them_use_the_zombies_photos() {
+        for s in [Screen::Zombies, Screen::ZmMapPick, Screen::ZmStartPick, Screen::ZmLobby, Screen::ZmRecord] {
+            assert!(zombies_photos(&shell(s, Screen::Main)), "{s:?}");
+        }
+        for s in [
+            Screen::Options,
+            Screen::Barracks,
+            Screen::CardPick,
+            Screen::EmblemPick,
+            Screen::Classes,
+            Screen::ClassEdit,
+            Screen::ItemPick,
+        ] {
+            assert!(zombies_photos(&shell(s, Screen::Zombies)), "{s:?} from Zombies");
+            assert!(zombies_photos(&shell(s, Screen::ZmLobby)), "{s:?} from the Zombies lobby");
+            assert!(!zombies_photos(&shell(s, Screen::Main)), "{s:?} from the main menu");
+            assert!(!zombies_photos(&shell(s, Screen::Multiplayer)), "{s:?} from Multiplayer");
+            assert!(!zombies_photos(&shell(s, Screen::WzMenu)), "{s:?} from WARZONE");
+        }
+        // (FRIENDS is only opened from the main menu: a stale `cac_from`
+        // does not make it Zombies'.)
+        assert!(!zombies_photos(&shell(Screen::Friends, Screen::Zombies)));
+        assert!(!zombies_photos(&shell(Screen::Main, Screen::Zombies)));
+        assert!(!zombies_photos(&shell(Screen::Multiplayer, Screen::Zombies)));
+    }
+
+    #[test]
+    fn zombies_pictures_are_told_apart() {
+        assert!(is_zombies_pic("zm:zm_transit:0"));
+        assert!(is_zombies_pic("zmphoto:3"));
+        assert!(!is_zombies_pic("photo:3"));
+        assert!(!is_zombies_pic("mp_la"));
+    }
+}

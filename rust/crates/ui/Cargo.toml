@@ -1,0 +1,51 @@
+[package]
+name = "ui"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Client UI state, settings and loading overlays."
+
+[features]
+# bo2mp: games left out of the game (owner, 5 Nov 2026).
+iw7 = ["dep:fastfile_iw7", "asset_audio/iw7"]
+jup = ["asset_audio/jup", "assets/jup"]
+bf1 = ["dep:bf1_adapter", "asset_transport/bf1"]
+
+[dependencies]
+codlegacy_env.workspace = true
+discord_presence.workspace = true # bo2mp: Discord Rich Presence
+image = { version = "0.25", default-features = false, features = ["png"] } # bo2mp shell: map pictures upscaled
+diag.workspace = true
+bevy.workspace = true
+audio.workspace = true
+asset_core.workspace = true
+asset_game.workspace = true
+asset_material.workspace = true
+asset_transport.workspace = true
+bf1_adapter = { path = "../bf1_adapter", optional = true } # bo2mp: the Battlefield 1 map section (feature `bf1`)
+asset_t6.workspace = true # bo2mp: Black Ops II's emblem table (bo_cards)
+lz4_flex.workspace = true
+fastfile_iw6.workspace = true # bo2mp: Ghosts' Create-a-Class pictures
+fastfile_s1.workspace = true
+fastfile_h1.workspace = true # bo2mp: Horizon MW's weapon icons
+asset_audio.workspace = true # bo2mp: where Horizon MW's weapon zones are
+fastfile_t7.workspace = true # bo2mp: Black Ops III's weapon icons
+fastfile_iw7 = { workspace = true, optional = true } # bo2mp: Infinite Warfare's map pictures (feature `iw7`)
+fastfile_jup.workspace = true # bo2mp: Modern Warfare III's (2023) emblems and calling cards (kept)
+assets.workspace = true
+bcdec_rs.workspace = true # bo2zm: popup blur of menu pictures
+frame.workspace = true
+net = { path = "../net" }
+playerstate_iw4.workspace = true
+session.workspace = true
+sim.workspace = true
+gamemode_iw4.workspace = true
+hks_t6.workspace = true # bo2zm M4
+bo2_profile.workspace = true # bo2mp stats saver
+asset_world.workspace = true # bo2mp vehicle screens (server vision)
+getrandom = "0.3" # bo2mp: the end screen's decoding text (real randomness)
+# bo2zm: the speakers' name (Settings' Sound Device row); bevy's audio already uses it.
+cpal = { version = "0.17", default-features = false }
+
+[lints]
+workspace = true

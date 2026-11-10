@@ -1,0 +1,31 @@
+[package]
+name = "asset_transport"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Filesystem transport: discover games, inflate FastFiles, index IWDs, cache blobs."
+
+[features]
+# bo2mp: Battlefield 1, left out of the game (owner, 5 Nov 2026).
+bf1 = ["dep:bf1_adapter"]
+
+[dependencies]
+codlegacy_env.workspace = true
+map_bake.workspace = true # bo2mp: the bake is cleared with the other caches
+asset_core.workspace = true
+diag.workspace = true
+bf1_adapter = { path = "../bf1_adapter", optional = true } # bo2mp: the `bf1:` request and the Game Folders check (feature `bf1`)
+fastfile_iw4.workspace = true
+fastfile_t5.workspace = true
+fastfile_iw5.workspace = true
+fastfile_t6.workspace = true # bo2zm
+miniz_oxide.workspace = true
+zip.workspace = true
+flate2.workspace = true
+dotenvy.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+lnk = "0.6.4"
+
+[lints]
+workspace = true

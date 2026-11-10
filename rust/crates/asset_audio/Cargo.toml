@@ -1,0 +1,38 @@
+[package]
+name = "asset_audio"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Authored sound aliases, curves, codecs, and map sound facts."
+
+[features]
+# bo2mp: games left out of the game (owner, 5 Nov 2026).
+iw7 = ["dep:fastfile_iw7"]
+jup = []
+
+[dependencies]
+codlegacy_env.workspace = true
+sab_t6.workspace = true
+memmap2 = "0.9" # bo2mp: the sound banks are mapped, not read into memory
+asset_t6.workspace = true
+asset_core.workspace = true
+asset_transport.workspace = true
+asset_iw4.workspace = true
+fastfile_iw4.workspace = true
+fastfile_iw5.workspace = true
+fastfile_t5.workspace = true
+fastfile_iw6.workspace = true # bo2mp: Ghosts' gun sounds
+fastfile_s1.workspace = true # bo2mp: Advanced Warfare's gun sounds
+fastfile_h1.workspace = true # bo2mp: Horizon MW's gun sounds
+fastfile_t7.workspace = true # bo2mp: Black Ops III's gun sounds
+fastfile_iw7 = { workspace = true, optional = true } # bo2mp: where Infinite Warfare's gun zones are (feature `iw7`)
+fastfile_jup.workspace = true # bo2mp: Modern Warfare III's (2023) install (its cards stay) and sounds (feature `jup`)
+t4 = { path = "../t4" } # bo2mp: World at War's gun sounds
+bo2_profile.workspace = true # bo2mp: the Workshop weapon packs whose sounds are read
+diag.workspace = true
+bevy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

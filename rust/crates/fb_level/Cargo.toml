@@ -1,0 +1,14 @@
+[package]
+name = "fb_level"
+# Vendored from https://github.com/AaronSparks/Battlefield-1-Rust-Rewrite (Unlicense). See docs/BF1.md and NOTICE.
+description = "Walk a Frostbite level's EBX data and collect placed meshes"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "Unlicense"
+
+[dependencies]
+anyhow = "1"
+fb_vfs = { path = "../fb_vfs" }
+fb_ebx = { path = "../fb_ebx" }
+glam.workspace = true

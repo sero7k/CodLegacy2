@@ -1,0 +1,32 @@
+# systemd unit for the account service.
+#   sudo useradd --system --home /var/lib/codlegacy --create-home codlegacy
+#   sudo install -m 0755 codlegacy-accounts /opt/codlegacy/codlegacy-accounts
+#   sudo cp -r web /opt/codlegacy/web
+#   sudo install -d -m 0750 -o root -g codlegacy /etc/codlegacy
+#   sudo install -m 0640 -o root -g codlegacy accounts.env /etc/codlegacy/accounts.env
+#   sudo cp codlegacy-accounts.service /etc/systemd/system/
+#   sudo systemctl enable --now codlegacy-accounts
+[Unit]
+Description=CodLegacy account service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=codlegacy
+Group=codlegacy
+EnvironmentFile=/etc/codlegacy/accounts.env
+ExecStart=/opt/codlegacy/codlegacy-accounts
+Restart=on-failure
+RestartSec=3
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ReadWritePaths=/var/lib/codlegacy
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

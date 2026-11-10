@@ -1,0 +1,2239 @@
+use asset_game::WeaponRegistry;
+use asset_world::{ClipCollision, SpawnPoint};
+use assets::{
+    LoadingScreen, MatchLoadAbort, MatchType10SoundHints, PreparedDestructibleDeath,
+    PreparedFpvMeshes, PreparedMatchReady, PreparedWeapons, PreparedXAnims,
+};
+use bevy::ecs::system::SystemParam;
+use bevy::prelude::*;
+use frame::{
+    CacWeaponOffer, ClassSelectHandoff, HasWorld, HostClassLoadouts, LaunchIdentity, LaunchReport,
+    MatchInstalled, WorldGeneration, WorldProducts,
+};
+use net::{AuthorityInputGate, AuthorityLoadHold, AuthorityWorld, ClientSet};
+
+use crate::SessionContentManifest;
+use crate::combat_table;
+use render_frontend::adapters::anim::dyn_ent::{DynEntPhysClip, DynEntPhysWorld};
+use render_frontend::prepare::scene::camera::SimCamera;
+use render_frontend::prepare::scene::world::{WorldScene, world_scene_from_draw};
+use render_fx::{PreparedFxCatalog, PreparedFxModels, PreparedImpactFx, PreparedTracers};
+use std::sync::Arc;
+
+use crate::loadout::{AuthoritativeClassProjection, ClassRow, project_class};
+use crate::startup::{PendingConsoleLines, StartupCommands};
+
+fn log_world_report(report: &[String]) {
+    if report.is_empty() {
+        diag::info!(World, "world report: no rows");
+        return;
+    }
+    diag::info!(World, "world report: {} rows", report.len());
+    for row in report {
+        diag::info!(World, "world report: {row}");
+    }
+}
+
+/// bo2mp: why the map itself did not read, from the world report: its
+/// lane's gap (`lane gap [assets::lane::<lane>::load_world/...]: <why>`).
+fn map_read_gap(report: &[String]) -> Option<String> {
+    report.iter().find_map(|row| {
+        let rest = row.strip_prefix("lane gap [")?;
+        let (addr, why) = rest.split_once("]: ")?;
+        (addr.starts_with("assets::lane::") && addr.contains("load_world")).then(|| why.to_owned())
+    })
+}
+
+/// bo2mp: a refusal's words with why the map did not read, when it did not.
+fn with_map_read_gap(error: String, gap: Option<&str>) -> String {
+    match gap {
+        Some(gap) if !error.contains(gap) => format!("{error}: the map could not be read ({gap})"),
+        _ => error,
+    }
+}
+
+#[derive(SystemParam)]
+pub struct PreparedMatchSource<'w, 's> {
+    ready: ResMut<'w, PreparedMatchReady>,
+    swap: Res<'w, crate::SessionSwapRequest>,
+    bridge: Option<Res<'w, net::MasterBridge>>,
+    intent: Option<Res<'w, net::MasterLaunchIntent>>,
+    loading: Option<ResMut<'w, LoadingScreen>>,
+    load: Option<Res<'w, assets::MapLoadProcess>>,
+    abort: Option<Res<'w, MatchLoadAbort>>,
+    host_classes: Option<Res<'w, HostClassLoadouts>>,
+    catalog: Option<Res<'w, asset_game::MenuCatalog>>,
+    identity: Option<Res<'w, LaunchIdentity>>,
+    install_stage: Local<'s, Option<asset_transport::StageHandle>>,
+}
+
+#[derive(SystemParam)]
+pub struct MatchInstallConsole<'w> {
+    startup: ResMut<'w, StartupCommands>,
+    pending: ResMut<'w, PendingConsoleLines>,
+}
+
+impl MatchInstallConsole<'_> {
+    fn release_startup(&mut self) {
+        self.pending.0.append(&mut self.startup.lines);
+    }
+}
+
+#[derive(SystemParam)]
+pub struct MatchInstallAuthority<'w> {
+    role: Res<'w, frame::RuntimeRole>,
+    prediction: Option<Res<'w, net::ClientPredictionState>>,
+    input_gate: Res<'w, AuthorityInputGate>,
+}
+
+#[derive(SystemParam)]
+pub struct MatchInstallPresentation<'w> {
+    probe: Option<ResMut<'w, LaunchReport>>,
+    camera: Res<'w, SimCamera>,
+}
+
+#[derive(SystemParam)]
+pub struct MatchInstallOccupancy<'w> {
+    has_world: ResMut<'w, HasWorld>,
+    /// bo2mp: what BO2's front end set up (mode, bots) when it started this.
+    bo2mp: Option<Res<'w, crate::Bo2mpMatchSetup>>,
+}
+
+/// Load speed: the match install's parts, timed for its "match
+/// preparation" line (a cold first map's install is seconds longer).
+struct InstallParts {
+    last: std::time::Instant,
+    line: String,
+}
+
+impl From<std::time::Instant> for InstallParts {
+    fn from(started: std::time::Instant) -> Self {
+        Self { last: started, line: String::new() }
+    }
+}
+
+impl InstallParts {
+    fn mark(&mut self, part: &str) {
+        let now = std::time::Instant::now();
+        if !self.line.is_empty() {
+            self.line.push_str(", ");
+        }
+        self.line.push_str(&format!("{part} {:.0}ms", (now - self.last).as_secs_f32() * 1000.0));
+        self.last = now;
+    }
+}
+
+pub fn apply_prepared_match(
+    mut commands: Commands,
+    source: PreparedMatchSource,
+    mut console: MatchInstallConsole,
+    authority: MatchInstallAuthority,
+    presentation: MatchInstallPresentation,
+    occupancy: MatchInstallOccupancy,
+    mode_selection: Option<Res<sim::HostGameModeSelection>>,
+    rules: Option<Res<frame::HostMatchRules>>,
+    mut failed: MessageWriter<frame::MapLoadFailed>,
+) {
+    let PreparedMatchSource {
+        mut ready,
+        swap,
+        bridge,
+        intent,
+        mut loading,
+        load,
+        abort,
+        host_classes,
+        catalog,
+        identity,
+        mut install_stage,
+    } = source;
+    let MatchInstallAuthority {
+        role,
+        prediction,
+        input_gate,
+    } = authority;
+    let MatchInstallPresentation {
+        mut probe,
+        camera: sim_cam,
+    } = presentation;
+    let MatchInstallOccupancy {
+        mut has_world,
+        bo2mp,
+    } = occupancy;
+    let stale_key = !ready.load_key.match_key.is_none()
+        && bridge.as_ref().is_none_or(|bridge| {
+            let state = bridge.state();
+            !state.in_match()
+                || state.identity().match_key() != ready.load_key.match_key
+                || ready.load_key.incarnation != bridge.incarnation()
+        });
+    if !swap.accepts_install(ready.request_id)
+        || stale_key
+        || ready.load_key.local_load_request_id != ready.request_id
+    {
+        diag::info!(
+            World,
+            "match install: discarded stale load {:?} ({})",
+            ready.load_key,
+            ready.zone
+        );
+        if let Some(stage) = install_stage.take() {
+            stage.cancel();
+        }
+        commands.remove_resource::<PreparedMatchReady>();
+        return;
+    }
+    if ready.load_key.match_key.is_none() && intent.as_ref().is_some_and(|intent| intent.is_join())
+    {
+        return;
+    }
+    if abort.is_some_and(|abort| abort.0 == ready.request_id) {
+        let dropped = ready.request_id;
+        let zone = ready.zone.clone();
+        if let Some(stage) = install_stage.take() {
+            stage.cancel();
+        }
+        commands.remove_resource::<PreparedMatchReady>();
+        commands.remove_resource::<MatchLoadAbort>();
+        diag::info!(
+            World,
+            "match install: aborted request #{dropped} (`{zone}`) — not occupying the menu"
+        );
+        return;
+    }
+    // The stage opens a frame before the work so the row is already up when
+    // the main thread stops answering — the yield is the point, not an
+    // accident of where the handle was created.
+    let live_load = load
+        .as_deref()
+        .filter(|process| !process.is_complete())
+        .map(|process| &process.progress);
+    if live_load.is_some() && install_stage.is_none() {
+        if let Some(progress) = live_load {
+            *install_stage = Some(progress.begin(asset_transport::StageId::Install, None));
+        }
+        diag::info!(
+            World,
+            "match install: yield one frame so the overlay can name the main-thread hitch"
+        );
+        return;
+    }
+    // bo2mp: an online match lays its weapons out as the host's.
+    let bridge_state = bridge.as_deref().map(net::MasterBridge::state);
+    let match_id = |s: &net::MasterBridgeState| {
+        let key = s.identity().match_key();
+        (key.session_id, key.match_epoch)
+    };
+    let hosting = bridge_state
+        .as_ref()
+        .filter(|s| assets::t6_rules() && s.in_match() && matches!(s, net::MasterBridgeState::Hosting { .. }))
+        .map(match_id);
+    let joining = bridge_state
+        .as_ref()
+        .filter(|s| assets::t6_rules() && s.in_match() && matches!(s, net::MasterBridgeState::Joined { .. }))
+        .map(match_id)
+        .filter(|_| !ready.load_key.match_key.is_none());
+    if let Some(id) = joining
+        && crate::guest_layout::hold_for_layout(id, ready.request_id)
+    {
+        return;
+    }
+    let install_stage = install_stage.take();
+    let install_started = std::time::Instant::now();
+    let request_id = ready.request_id;
+    let load_key = ready.load_key;
+    let zone = std::mem::take(&mut ready.zone);
+    let mut prepared = std::mem::take(&mut ready.prepared);
+    let layout = joining.and_then(sim::guest_manifest::received).map(|m| {
+        let (weapons, stand_ins) = crate::guest_layout::conform(&prepared.weapons, &m);
+        prepared.weapons = Arc::new(weapons);
+        prepared.strings.absorb(crate::guest_layout::stand_in_strings(&m, &stand_ins));
+        (m, stand_ins)
+    });
+    let host_numbers = layout.as_ref().map(|(m, stand_ins)| crate::guest_layout::HostNumbers {
+        manifest: m,
+        stand_ins,
+    });
+    commands.remove_resource::<PreparedMatchReady>();
+
+    let world_report = std::mem::take(&mut prepared.report);
+    log_world_report(&world_report);
+    // bo2mp: why the map's world did not read (its lane's gap), told with
+    // a refusal it causes (no collision), so the log line and the front
+    // end's notice say what went wrong with the map.
+    let world_gap = map_read_gap(&world_report);
+    let mut map_shocks: Vec<(String, String)> = prepared
+        .scripts
+        .shocks()
+        .map(|(name, text)| (name.to_owned(), text.to_owned()))
+        .collect();
+    // bo2mp: BO2's own shellshock files (flashbang, concussion_grenade...).
+    if let Some(t6) = prepared.scripts.t6.as_ref() {
+        map_shocks.extend(t6.shocks.iter().cloned());
+    }
+
+    let plan = match preflight_match_install(
+        prepared,
+        &zone,
+        mode_selection.as_deref(),
+        rules.as_deref(),
+        catalog.as_deref(),
+        identity.as_deref(),
+        bo2mp.as_deref(),
+    ) {
+        Ok(plan) => plan,
+        Err(mut refusal) => {
+            refusal.error = with_map_read_gap(refusal.error, world_gap.as_deref());
+            diag::warn!(World, "match install refused: {}", refusal.error);
+            if let Some(probe) = probe.as_deref_mut() {
+                if let Some(gap) = refusal.sim_gap {
+                    probe.sim_gap = gap;
+                }
+                probe.world_report = world_report;
+            }
+            *has_world = HasWorld(false);
+            if let Some(stage) = install_stage {
+                stage.fail();
+            }
+            if let Some(loading) = loading.as_deref_mut() {
+                loading.fail(refusal.error.clone());
+            }
+            failed.write(frame::MapLoadFailed {
+                request_id,
+                load_key,
+                zone,
+                error: refusal.error,
+            });
+            console.release_startup();
+            return;
+        }
+    };
+    let prepared_install = (|| -> Result<bevy::ecs::world::CommandQueue, InstallRefusal> {
+        let mut install = bevy::ecs::world::CommandQueue::default();
+        let mut parts = InstallParts::from(install_started);
+        parts.mark("preflight");
+        let MatchInstallPlan {
+            scripts,
+            t6_scripts,
+            script_level,
+            script_entries,
+            script_dvars,
+            objective_weapons,
+            kind,
+            gametype,
+            scene: loaded_scene,
+            weapons,
+            fpv_meshes,
+            bodies,
+            world_weapons,
+            projectile_meshes,
+            xmodel_walk,
+            xanims,
+            death,
+            player_anim_sources,
+            mut prepared_map,
+            strings,
+            clip,
+            pen_table,
+            pen_table_loaded,
+            lochit_table,
+            tracers,
+            fx_catalog,
+            type10,
+            fx_models,
+            impact_fx,
+            mut authority_models,
+            model_spawns,
+        } = plan;
+        let spawn_count = prepared_map.spawns.len();
+
+        let facts = std::mem::take(&mut prepared_map.facts);
+        let airstrike_height = facts.airstrike_height;
+        stage_resource(
+            &mut install,
+            assets::SessionCompass {
+                corners: facts.minimap_corners,
+                north_yaw: facts.north_yaw,
+                declaration: facts.compass,
+            },
+        );
+        stage_resource(
+            &mut install,
+            asset_audio::SessionMapScriptSound(facts.script_sound),
+        );
+        stage_resource(
+            &mut install,
+            asset_game::SessionTeamSettings(facts.team_settings),
+        );
+        stage_resource(&mut install, facts.t6_hud_icons);
+        stage_resource(&mut install, facts.t6_hud_fonts);
+        stage_resource(&mut install, facts.t6_ui);
+        // bo2mp: other players' third-person animations (BO2's script).
+        let t6_player_anims = sim::t6_playeranim::T6PlayerAnimsRes::from_text(
+            facts.t6_playeranim.as_ref(),
+            &facts.t6_anim_speeds,
+        );
+        stage_resource(&mut install, t6_player_anims.clone());
+        // bo2mp: how a dead body goes limp (ragdoll definition 0).
+        stage_resource(
+            &mut install,
+            sim::t6_ragdoll::T6RagdollRes::from_text(facts.t6_ragdoll.as_deref()),
+        );
+        stage_resource(&mut install, facts.t6_screen_filters);
+        let host_strings = hosting.map(|_| strings.clone());
+        stage_resource(&mut install, assets::PreparedLocalizedStrings(strings));
+        stage_resource(&mut install, fx_catalog);
+        stage_resource(&mut install, type10);
+        stage_resource(&mut install, fx_models);
+        stage_resource(&mut install, impact_fx);
+        stage_resource(&mut install, tracers);
+
+        parts.mark("resources staged");
+        let mut scene = loaded_scene;
+        let mut sim_cam = *sim_cam;
+        let mut input_gate = *input_gate;
+        let mut content = sim::SimContentBuilder::default();
+        let mut sim = sim::SimWorld::new();
+        let mut scales = weapons.0.scales_table();
+        if let Some(n) = &host_numbers {
+            n.scales(&mut scales);
+        }
+        content.set_weapon_def_scales(scales);
+        // bo2mp: under Black Ops II's rules, its own global location table
+        // (the zone's table under the other games' rules).
+        let lochit_table = if assets::t6_rules() { Some(asset_game::bo2_lochit_table()) } else { lochit_table };
+        let mut combat = combat_table::from_registry(&weapons.0, lochit_table);
+        // bo2mp: BO2's script reads a weapon's playerAnimType as its place in
+        // BO2's playeranimtypes.txt; the other games' guns carry their own
+        // game's numbering, so each is given BO2's type of the same name.
+        if assets::t6_rules()
+            && let Some(script) = t6_player_anims.0.as_deref()
+        {
+            combat_table::bo2_player_anim_types(&mut combat, &weapons.0, script);
+        }
+        // bo2mp: on a Zombies map the other games' guns (the Mystery Box's
+        // custom guns) take Zombies' damage and ammo.
+        let stem = zone.rsplit(':').next().unwrap_or(zone.as_str());
+        if assets::t6_rules() && (stem.starts_with("zm_") || sim::is_foreign_zm_map(stem)) {
+            diag::info!(Sim, "{}", combat_table::zombies_guest_proportions(&mut combat, &weapons.0));
+            // (Their Pack-a-Punch upgrades made Black Ops II-style.)
+            diag::info!(Sim, "{}", combat_table::zombies_guest_upgrades(&mut combat, &weapons.0));
+        }
+        let mut runnable = weapons.0.runnable_table();
+        let mut transition_groups = weapons.0.configuration_transition_groups();
+        if let Some(n) = &host_numbers {
+            n.combat(&mut combat);
+            n.runnable(&mut runnable);
+            n.transition_groups(&mut transition_groups);
+        }
+        content.set_weapon_combat_table(combat.clone());
+        content.set_weapon_runnable_table(runnable.clone());
+        content.set_weapon_transition_groups(transition_groups.clone());
+        content.set_bullet_pen_facts(combat_table::pen_from_registry(&weapons.0));
+        content.set_penetration_table(pen_table);
+        content.set_pen_table_loaded(pen_table_loaded);
+        // bo2mp: Ghosts' bullet rules on its maps and for its guns.
+        {
+            let guns: Vec<bool> = (0..=weapons.0.len())
+                .map(|i| weapons.0.namespace_of(i as u32) == Some(asset_core::AssetNamespace::Iw6))
+                .collect();
+            let map = assets::map_game() == Some(asset_core::AssetNamespace::Iw6);
+            let mask_on = !std::env::var("BO2MP_IW6_SHOT_MASK").is_ok_and(|v| v.trim() == "0");
+            let table = asset_world::iw6_pen_table();
+            if map || guns.iter().any(|g| *g) {
+                diag::info!(
+                    Sim,
+                    "iw6 bullets: shot mask {} ({}), {} Ghosts guns, their depth table {}",
+                    if mask_on { "0x0280E831" } else { "Black Ops II's" },
+                    if map { "a Ghosts map: every gun" } else { "Ghosts guns" },
+                    guns.iter().filter(|g| **g).count(),
+                    table.as_ref().map_or_else(|| "Black Ops II's (Ghosts' not found)".to_owned(), |(_, z)| format!("Ghosts' own (from {z})"))
+                );
+            }
+            content.set_iw6_bullet_rules(sim::Iw6BulletRules {
+                map,
+                guns,
+                mask_on,
+                table: table.map(|(t, _)| t),
+            });
+        }
+        parts.mark("sim tables");
+        // bo2mp: a Ghosts map's path nodes, for the bots.
+        if let Some(nodes) = asset_world::iw6_path_nodes() {
+            content.set_iw6_path_nodes(nodes);
+        }
+        content.set_player_kit_collisions(
+            player_kit_collision(&bodies.0, false),
+            player_kit_collision(&bodies.0, true),
+        );
+        if let Some(Ok(tree)) = player_anim_sources.compiled() {
+            if let Ok(definition) = tree.to_runtime_definition(|_, name| {
+                let kit = bodies.0.kits().kit(false)?;
+                let body = bodies.0.get(&kit.body)?;
+                xanims
+                    .0
+                    .body_clip(body.namespace, name, &body.skel.bone_names)
+            }) {
+                let names = tree.nodes().iter().map(|node| node.name.clone()).collect();
+                content.set_player_anim_tree(Some(definition), names);
+            }
+        }
+        let anim_namespace = prepared_map
+            .namespace
+            .unwrap_or(asset_core::AssetNamespace::Iw4);
+        content.set_script_model_anims(xanims.0.names().filter_map(|name| {
+            let parts = &xanims.0.get(anim_namespace, name)?.parts;
+            let frequency = if parts.numframes > 0 && parts.framerate > 0.0 {
+                parts.framerate / f32::from(parts.numframes)
+            } else {
+                0.0
+            };
+            Some((
+                name.to_owned(),
+                sim::ScriptModelPlayAnim {
+                    looping: parts.flags & 1 != 0,
+                    frequency,
+                },
+            ))
+        }));
+        let iw4_mantle_clip = |fast: bool, i: usize| {
+            let name = sim::MantleXAnimBind::clip_name(fast, i)?;
+            xanims
+                .0
+                .clip(asset_core::AssetNamespace::Iw4, name)
+                .map(|clip| (*clip).clone())
+        };
+        let mantle = if anim_namespace == asset_core::AssetNamespace::T6 {
+            // Black Ops II climbs with its own clips; MW2's fill only a gap.
+            let mut bo2 = 0usize;
+            let bind = sim::MantleXAnimBind::from_t6_clips(
+                |i| {
+                    let t6 = sim::MantleXAnimBind::clip_name_t6(i).and_then(|name| {
+                        xanims
+                            .0
+                            .clip_with_root_motion(asset_core::AssetNamespace::T6, name)
+                    });
+                    match t6 {
+                        Some(clip) => {
+                            bo2 += 1;
+                            Some(clip)
+                        }
+                        None => iw4_mantle_clip(false, i),
+                    }
+                },
+                sim::PERK_MANTLE_REDUCTION_DEFAULT,
+            );
+            diag::info!(
+                World,
+                "mantle: {bo2} of {} Black Ops II climb animations",
+                sim::MANTLE_XANIM_NAMES_T6.len()
+            );
+            bind
+        } else {
+            sim::MantleXAnimBind::from_clips(iw4_mantle_clip)
+        };
+        content.set_mantle_xanims(mantle);
+        parts.mark("anim tree and mantle");
+        let mut script_names = weapons.0.script_names_table();
+        if let Some(n) = &host_numbers {
+            n.script_names(&mut script_names);
+        }
+        content.set_weapon_script_names(script_names);
+        content.set_weapon_script_aliases(objective_weapons);
+        content.set_vehicle_turrets(weapons.0.vehicle_turrets());
+        content.set_vehicle_compass(
+            weapons
+                .0
+                .vehicle_compass()
+                .map(|(name, icons, size)| (name.to_owned(), (icons.clone(), size))),
+        );
+        content.set_weapon_setups(
+            (0..weapons.0.script_names_table().len() as u32)
+                .map(|id| {
+                    let selection = weapons.0.describe_configuration(id)?;
+                    let family = selection.family.as_ref()?;
+                    Some(sim::WeaponSetup {
+                        realm: match family.namespace {
+                            asset_core::AssetNamespace::T5 => sim::script::Realm::T5,
+                            asset_core::AssetNamespace::Iw5 => sim::script::Realm::Iw5,
+                            _ => sim::script::Realm::Iw4,
+                        },
+                        base: family.base.clone(),
+                        attachments: selection.attachments.clone(),
+                    })
+                })
+                .collect(),
+        );
+        content.set_weapon_world_models(weapons.0.world_models_table());
+        content.set_weapon_world_parts(
+            weapons
+                .0
+                .world_parts_table()
+                .into_iter()
+                .map(|parts| {
+                    parts
+                        .into_iter()
+                        .map(|(model, tag, offset, rotation)| sim::WeaponPart {
+                            model,
+                            tag,
+                            offset,
+                            rotation,
+                        })
+                        .collect()
+                })
+                .collect(),
+        );
+        content.set_weapon_display_names(weapons.0.display_names_table());
+        content.set_weapon_projectile_models(weapons.0.projectile_models_table());
+        content.set_weapon_melee_only(combat_table::melee_only_from_registry(&weapons.0));
+        content.set_weapon_melee_damage(combat_table::melee_damage_from_registry(&weapons.0));
+        content.set_weapon_script_sounds(combat_table::script_sounds_from_registry(&weapons.0));
+        install_team_voice_prefixes(&mut content, catalog.as_deref(), identity.as_deref(), &zone);
+        install_shocks(&mut content, catalog.as_deref(), &map_shocks);
+        let mut equipment = combat_table::equipment_from_registry(&weapons.0);
+        if let Some(n) = &host_numbers {
+            n.equipment(&mut equipment);
+        }
+        if let (Some(id), Some(strings)) = (hosting, host_strings.as_ref()) {
+            sim::guest_manifest::publish_host(
+                id,
+                &crate::guest_layout::host_manifest(
+                    &weapons.0,
+                    &combat,
+                    &equipment,
+                    runnable.clone(),
+                    transition_groups.clone(),
+                    strings,
+                ),
+            );
+        }
+        content.set_equipment_runtime_table(equipment.clone());
+        let mut primary = Vec::new();
+        let mut secondary = Vec::new();
+        let mut lethal = Vec::new();
+        let mut tactical = Vec::new();
+        let mut excluded = Vec::new();
+        let families = weapons.0.weapon_families();
+        for family in families.offered() {
+            let offer = CacWeaponOffer {
+                key: family.key.asset_key(),
+                item_group: Some(family.item_group.clone()),
+                attachments: family
+                    .attachments
+                    .iter()
+                    .map(|choice| choice.name.clone())
+                    .collect(),
+            };
+            match family.slot {
+                asset_game::FamilySlot::Primary => primary.push(offer),
+                asset_game::FamilySlot::Secondary => secondary.push(offer),
+                asset_game::FamilySlot::Lethal => lethal.push(offer),
+                asset_game::FamilySlot::Tactical => tactical.push(offer),
+                asset_game::FamilySlot::Other => {}
+            }
+        }
+        excluded.extend(families.excluded().iter().cloned());
+        parts.mark("names, voices and loadouts");
+        stage_resource(&mut install, fpv_meshes);
+        stage_resource(&mut install, bodies);
+        stage_resource(&mut install, world_weapons);
+        stage_resource(&mut install, projectile_meshes);
+        stage_resource(&mut install, xmodel_walk);
+        // Modern Warfare 2's player animation script (from MW2's common zone,
+        // the runtime zone of an MW2 map) writes MW2 animation-tree numbers
+        // into legs_anim / torso_anim. Under Black Ops II's rules those
+        // values are BO2's own script picks (t6::playeranim), which every
+        // client reads as places in BO2's mp/playeranim.script: MW2's script
+        // must not run there, or its numbers reach the clients as random BO2
+        // animations.
+        if !assets::t6_rules()
+            && let Some(Ok(parsed)) = player_anim_sources.parsed_script()
+        {
+            let tree = player_anim_sources
+                .compiled()
+                .and_then(|c| c.as_ref().ok())
+                .map(|t| t.as_ref());
+            let slots = map_anim_items(&parsed.slots, tree, &xanims.0);
+            let events = map_event_items(&parsed.events, tree, &xanims.0);
+            content.set_player_anim_script(Some(sim::PlayerAnimScript::from_tables(slots, events)));
+        }
+        stage_resource(&mut install, xanims);
+        stage_resource(&mut install, death);
+        stage_resource(&mut install, player_anim_sources);
+        input_gate.local_cmds_enabled = false;
+
+        stage_resource(&mut install, DynEntPhysWorld::default());
+        stage_resource(&mut install, DynEntPhysClip(clip.clone()));
+        // Modern Warfare Remastered's glass panes ride on the clip.
+        let h1_glass: Vec<([f32; 3], [f32; 3], [f32; 3])> =
+            clip.as_ref().map(|c| c.glass_panes.clone()).unwrap_or_default();
+        parts.mark("models and anims staged");
+        let brush_movers = std::mem::take(&mut authority_models.brush_movers);
+        let (sim_gap, lock_reasons) = install_clip_and_player(
+            &mut sim,
+            content,
+            clip,
+            authority_models,
+            scene.intermission_view.map(|view| sim::AuthoredSpawnPoint {
+                classname: gamemode_iw4::playerlogic::MP_GLOBAL_INTERMISSION.to_owned(),
+                origin: view.origin,
+                angles: view.angles,
+                script_linkto: String::new(),
+                script_destructable_area: String::new(),
+            }),
+            airstrike_height,
+            &prepared_map.spawns,
+            &weapons.0,
+            &combat,
+            &equipment,
+            &mut sim_cam,
+            &mut input_gate,
+            host_classes.as_deref(),
+            kind,
+        )?;
+        parts.mark("clip and player");
+        let script_facts = script_install_facts(&zone, gametype, &scripts, script_entries.len());
+        sim.install_gsc_program(
+            scripts,
+            sim::script::NativeRegistry::default(),
+            script_level,
+        )
+        .map_err(|e| script_refusal(&zone, gametype, "install", &e))?;
+        for (name, value) in &script_dvars {
+            sim.set_gsc_dvar(name, value);
+        }
+        // bo2zm M3: a Black Ops II map runs its own scripts beside the stubs.
+        if let Some(t6) = t6_scripts {
+            match sim.install_t6(t6) {
+                Ok(()) => sim.set_gsc_dvar("bo2zm_t6", "1"),
+                Err(e) => diag::warn!(Sim, "bo2zm t6 scripts not installed: {e}"),
+            }
+        }
+        for entry in script_entries {
+            sim.start_gsc(&entry, sim::script::Value::level(), Vec::new())
+                .map_err(|e| script_refusal(&zone, gametype, "entry", &e))?;
+        }
+        parts.mark("scripts");
+        let load_hold = AuthorityLoadHold(sim.has_world_clip());
+        if !h1_glass.is_empty() {
+            let panes = h1_glass
+                .iter()
+                .enumerate()
+                .map(|(i, &(origin, axis_s, axis_t))| {
+                    (i as u32, sim::GlassPaneBasis { origin, axis_s, axis_t })
+                })
+                .collect();
+            sim.world_objects_mut().install_glass_panes(panes);
+        } else if let Some(glass) = scene.fx_glass.as_ref() {
+            let panes = (0..glass.piece_places.len())
+                .filter_map(|i| {
+                    let (origin, axis_s, axis_t) = glass.pane_basis(i)?;
+                    Some((
+                        i as u32,
+                        sim::GlassPaneBasis {
+                            origin,
+                            axis_s,
+                            axis_t,
+                        },
+                    ))
+                })
+                .collect();
+            sim.world_objects_mut().install_glass_panes(panes);
+        }
+        sim.world_objects_mut()
+            .set_map_round_epoch(load_key.match_key.match_epoch);
+        spawn_script_model_movers(&mut sim, &model_spawns);
+        for (id, cmodel, origin, angles) in brush_movers {
+            sim.spawn_brush_mover(id, cmodel, origin, angles)
+                .expect("no free dynamic entity slot for a brush model");
+        }
+        stamp_script_mover_numbers(&mut scene, &sim);
+        if !model_spawns.is_empty() {
+            diag::info!(
+                World,
+                "script_model spawn: {} ET_SCRIPTMOVER from {}",
+                sim.script_mover_count(),
+                sim::gentity_spawn_base()
+            );
+        }
+
+        let class_handoff = ClassSelectHandoff {
+            pending: !scene.batches.is_empty()
+                || asset_world::t7_native_zone().is_some()
+                || asset_world::jup_native_zone().is_some()
+                || asset_world::h1_native_zones().is_some()
+                || asset_world::iw6_native_zones().is_some()
+                || asset_world::iw7_native_zone().is_some(),
+            primary,
+            secondary,
+            lethal,
+            tactical,
+            excluded,
+            lock_reasons,
+        };
+
+        let manifest = SessionContentManifest::build(
+            &prepared_map,
+            &weapons.0,
+            &combat,
+            &equipment,
+            sim.content_digest(),
+        )
+        .map_err(|error| InstallRefusal::new(format!("Invalid content manifest: {error:?}")))?;
+        stage_resource(&mut install, weapons);
+
+        let components = sim.content_components();
+        diag::info!(
+            Sim,
+            "session manifest: ruleset=iw4 map={:?} weapons={} digest={:016x} \
+         gameplay={:016x} c_map={:016x} c_models={:016x} c_weapons={:016x} c_classes={:016x}",
+            manifest.map,
+            manifest.weapons.len(),
+            manifest.digest,
+            sim.content_digest(),
+            components.map,
+            components.models,
+            components.weapons,
+            components.classes
+        );
+        match manifest.match_descriptor(components) {
+            Some(descriptor) => {
+                diag::info!(
+                    Sim,
+                    "match descriptor: map={:016x} weapons={:016x} classes={:016x}",
+                    descriptor.map,
+                    descriptor.weapons,
+                    descriptor.classes
+                );
+                stage_resource(&mut install, descriptor);
+            }
+            None => return Err(InstallRefusal::new("Required match descriptor is missing")),
+        }
+        stage_resource(&mut install, manifest);
+
+        parts.mark("rest");
+        diag::info!(
+            World,
+            "match preparation: {:.1}ms on the main thread (scene handoff, sim boot, catalogs): {}",
+            install_started.elapsed().as_secs_f32() * 1000.0,
+            parts.line
+        );
+        if role.runs_authority() || *role == frame::RuntimeRole::Replay {
+            if let Some(prediction) = prediction.as_ref() {
+                let mut state = net::ClientPrediction::new(prediction.0.local());
+                state.arm_from_content(&sim);
+                stage_resource(&mut install, net::ClientPredictionState(state));
+            }
+            stage_resource(&mut install, AuthorityWorld(sim));
+        } else if let Some(prediction) = prediction.as_ref() {
+            install.push(|world: &mut World| {
+                world.remove_resource::<AuthorityWorld>();
+            });
+            let mut state = net::ClientPrediction::new(prediction.0.local());
+            // Prediction adopts replicated state at admission; the prepared world's
+            // GSC runtime belongs to authority and cannot be restored by snapshots.
+            state.arm_from_content(&sim);
+            stage_resource(&mut install, net::ClientPredictionState(state));
+        } else {
+            return Err(InstallRefusal::new(
+                "No simulation owner for this execution mode",
+            ));
+        }
+        sim_cam.freeze_fly = true;
+        stage_resource(&mut install, WorldProducts::from_walk(scene.products_id));
+        stage_resource(&mut install, scene);
+        stage_resource(&mut install, sim_cam);
+        stage_resource(&mut install, input_gate);
+        stage_resource(&mut install, load_hold);
+        stage_resource(&mut install, class_handoff);
+        stage_resource(&mut install, crate::LiveWorldIdentity { load_key });
+        stage_resource(&mut install, HasWorld(true));
+        stage_resource(&mut install, WorldGeneration::from_install(request_id));
+        let installed_zone = zone.clone();
+        install.push(move |world: &mut World| {
+            if let Some(mut probe) = world.get_resource_mut::<LaunchReport>() {
+                probe.sim_gap = sim_gap;
+                probe.world_report = world_report;
+            }
+            diag::script_boundary("installed", &script_facts);
+            diag::info!(Sim, "match: {} ({}) — world installed ({} dm spawn points); class select waits for admission", kind.display_name(), kind.token(), spawn_count);
+            perf::match_installed(&installed_zone, 1);
+            world.write_message(MatchInstalled {
+                request_id,
+                load_key,
+                zone: installed_zone,
+                spawn_count,
+            });
+        });
+
+        Ok(install)
+    })();
+    match prepared_install {
+        Ok(mut install) => {
+            commands.queue(move |world: &mut World| {
+                let accepts = world
+                    .resource::<crate::SessionSwapRequest>()
+                    .accepts_install(request_id);
+                let same_match = load_key.match_key.is_none()
+                    || world
+                        .get_resource::<net::MasterBridge>()
+                        .is_some_and(|bridge| {
+                            bridge.state().in_match()
+                                && bridge.state().identity().match_key() == load_key.match_key
+                                && bridge.incarnation() == load_key.incarnation
+                        });
+                if accepts && same_match {
+                    install.apply(world);
+                }
+            });
+            if let Some(stage) = install_stage {
+                stage.done();
+            }
+        }
+        Err(mut refusal) => {
+            refusal.error = with_map_read_gap(refusal.error, world_gap.as_deref());
+            diag::warn!(World, "match install refused: {}", refusal.error);
+            if let Some(stage) = install_stage {
+                stage.fail();
+            }
+            if let Some(loading) = loading.as_deref_mut() {
+                loading.fail(refusal.error.clone());
+            }
+            failed.write(frame::MapLoadFailed {
+                request_id,
+                load_key,
+                zone,
+                error: refusal.error,
+            });
+        }
+    }
+    console.release_startup();
+}
+
+/// Everything the install publishes, assembled while a refusal is still free.
+///
+/// The plan exists so publication cannot start before the checks are done: the
+/// commit half of `apply_prepared_match` has nothing to install until preflight
+/// hands one over.
+struct MatchInstallPlan {
+    scripts: sim::script::Program,
+    /// bo2zm M3: a Black Ops II map's own scripts.
+    t6_scripts: Option<sim::T6Install>,
+    script_level: sim::script::LevelData,
+    script_entries: Vec<String>,
+    script_dvars: Vec<(String, String)>,
+    objective_weapons: Vec<(String, u32)>,
+    kind: gamemode_iw4::GameModeKind,
+    gametype: &'static str,
+    scene: WorldScene,
+    weapons: PreparedWeapons,
+    fpv_meshes: PreparedFpvMeshes,
+    bodies: assets::PreparedBodies,
+    world_weapons: assets::PreparedWorldWeapons,
+    projectile_meshes: assets::PreparedProjectileMeshes,
+    xmodel_walk: assets::PreparedXModelWalkCensus,
+    xanims: PreparedXAnims,
+    death: PreparedDestructibleDeath,
+    player_anim_sources: asset_anim::PlayerAnimSources,
+    prepared_map: assets::PreparedMap,
+    strings: asset_game::LocalizeCatalog,
+    clip: Option<Arc<ClipCollision>>,
+    pen_table: weapon_iw4::PenetrationDepthTable,
+    pen_table_loaded: bool,
+    lochit_table: Option<[f32; weapon_iw4::HITLOC_COUNT]>,
+    tracers: PreparedTracers,
+    fx_catalog: PreparedFxCatalog,
+    type10: MatchType10SoundHints,
+    fx_models: PreparedFxModels,
+    impact_fx: PreparedImpactFx,
+    authority_models: AuthorityEntityModelInstall,
+    model_spawns: Vec<(sim::ScriptModelId, [f32; 3], [f32; 3])>,
+}
+
+/// A refusal of the whole request: the loading screen shows `error`, the swap
+/// completes on it, and nothing of the match has been published.
+struct InstallRefusal {
+    error: String,
+    sim_gap: Option<&'static str>,
+}
+
+impl InstallRefusal {
+    fn new(error: impl Into<String>) -> Self {
+        Self {
+            error: error.into(),
+            sim_gap: None,
+        }
+    }
+
+    fn with_gap(error: impl Into<String>, gap: &'static str) -> Self {
+        Self {
+            error: error.into(),
+            sim_gap: Some(gap),
+        }
+    }
+}
+
+fn script_install_facts(
+    zone: &str,
+    gametype: &str,
+    program: &sim::script::Program,
+    entries: usize,
+) -> String {
+    let fingerprint: String = program
+        .fingerprint()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!(
+        " map={zone} gametype={gametype} fingerprint={fingerprint} modules={} functions={} natives={} entries={entries}",
+        program.modules().len(),
+        program.function_count(),
+        program.native_count(),
+    )
+}
+
+const MATCH_CONFIG: &str = "default_xboxlive.cfg";
+
+fn config_sets(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .filter_map(|line| {
+            let line = line.split("//").next()?.trim();
+            let rest = line
+                .strip_prefix("set ")
+                .or_else(|| line.strip_prefix("seta "))?
+                .trim_start();
+            let (name, value) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+            let value = value.trim().trim_matches('"');
+            (!name.is_empty()).then(|| (name.to_owned(), value.to_owned()))
+        })
+        .collect()
+}
+
+fn script_dvar_overrides() -> Vec<(String, String)> {
+    codlegacy_env::var("CODLEGACY_SCRIPT_DVARS")
+        .map(|text| config_sets(&text.replace(';', "\n")))
+        .unwrap_or_default()
+}
+
+fn script_refusal(
+    zone: &str,
+    gametype: &str,
+    stage: &str,
+    fault: &sim::script::Fault,
+) -> InstallRefusal {
+    let text = fault.to_string();
+    let head = text.lines().next().unwrap_or("").replace('"', "'");
+    diag::script_boundary(
+        "refused",
+        &format!(" map={zone} gametype={gametype} stage={stage} fault=\"{head}\""),
+    );
+    InstallRefusal::new(format!("GSC {stage}: {text}"))
+}
+
+/// bo2mp: how many threads decode the match's Black Ops II actor clips
+/// ahead (the logical cores, at most 8); `BO2MP_T6_CLIP_THREADS=1` = one
+/// by one on the main thread, the old way (`=N` for N threads).
+fn t6_clip_threads() -> usize {
+    std::env::var("BO2MP_T6_CLIP_THREADS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, usize::from).min(8))
+        .max(1)
+}
+
+fn preflight_match_install(
+    mut prepared: assets::PreparedMatch,
+    zone: &str,
+    mode_selection: Option<&sim::HostGameModeSelection>,
+    rules: Option<&frame::HostMatchRules>,
+    catalog: Option<&asset_game::MenuCatalog>,
+    identity: Option<&LaunchIdentity>,
+    bo2mp: Option<&crate::Bo2mpMatchSetup>,
+) -> Result<MatchInstallPlan, InstallRefusal> {
+    // bo2mp (lane C, load speed): the preflight's parts, timed for one
+    // "match preflight laps" line (BO3 Skyjacked spent 7.1 s here with no
+    // breakdown). Timing only; nothing else changes.
+    let mut laps = InstallParts::from(std::time::Instant::now());
+    let weapons = PreparedWeapons(prepared.weapons);
+    let fpv_meshes = PreparedFpvMeshes(prepared.fpv_meshes);
+    let bodies = assets::PreparedBodies(prepared.bodies);
+    let world_weapons = assets::PreparedWorldWeapons(prepared.world_weapons);
+    let projectile_meshes = assets::PreparedProjectileMeshes(prepared.projectile_meshes);
+    let xmodel_walk = std::mem::take(&mut prepared.xmodel_walk);
+    let xanims = PreparedXAnims(prepared.xanims);
+    let death = PreparedDestructibleDeath(std::mem::take(&mut prepared.destructible_death));
+    log_destructible_death_assets(&death);
+    let player_anim_sources = prepared.player_anim_sources;
+    let mut prepared_map = prepared.prepared_map;
+    if prepared_map.namespace == Some(asset_core::AssetNamespace::Iw4)
+        && let Some(catalog) = catalog
+        && let Some(table) = catalog.string_table(gamemode_iw4::FACTION_TABLE)
+    {
+        let arena = catalog
+            .rawfile_text("mp/basemaps.arena")
+            .map(str::to_owned)
+            .or_else(|| identity.and_then(|id| asset_game::read_basemaps_arena(&id.games_root)));
+        prepared_map.facts.team_settings = asset_game::team_settings_for_zone(
+            table,
+            asset_core::AssetNamespace::Iw4,
+            arena.as_deref(),
+            zone,
+        );
+    }
+    let mut objective_weapons = Vec::new();
+    // (Under Black Ops II's rules its own scripts place the objectives.)
+    if !assets::t6_rules()
+        && let Some(namespace @ (asset_core::AssetNamespace::T5 | asset_core::AssetNamespace::Iw5)) =
+            prepared_map.namespace
+    {
+        // bo2mp: without MW2's menu catalog or faction table the map's
+        // objectives keep their own models; the map still plays.
+        'bind: {
+        let Some(catalog) = catalog else {
+            diag::warn!(World, "objective visuals: no IW4 menu catalog; the map's own objective models kept");
+            break 'bind;
+        };
+        let Some(table) = catalog.string_table(gamemode_iw4::FACTION_TABLE) else {
+            diag::warn!(World, "objective visuals: no IW4 faction table; the map's own objective models kept");
+            break 'bind;
+        };
+        let (allies, axis) = iw4_charsets(catalog, identity, zone);
+        let iw4 =
+            asset_game::ObjectiveVisuals::from_faction_table(table, Some(&allies), Some(&axis));
+        let realm = &prepared_map.facts.objective_visuals;
+        if !iw4.is_complete() || !realm.is_complete() {
+            return Err(InstallRefusal::new(
+                "incomplete objective bindings for the map's game".to_owned(),
+            ));
+        }
+        let scene = &mut prepared.world.map_xmodel_scene_assets;
+        let mut served = Vec::new();
+        let mut missing = Vec::new();
+        for (from, to) in iw4.model_pairs(realm) {
+            let native = matches!(
+                (prepared_map.namespace, scene.get_name(to)),
+                (
+                    Some(asset_core::AssetNamespace::Iw5),
+                    Some(asset_world::MapXModelSceneAsset::Iw5(_))
+                ) | (
+                    Some(asset_core::AssetNamespace::T5),
+                    Some(asset_world::MapXModelSceneAsset::T5(_))
+                )
+            );
+            if !native || !scene.alias(from, to) {
+                missing.push(to);
+            } else {
+                served.push(format!("{from}->{to}"));
+            }
+        }
+        for (from, to) in iw4.fx_pairs(realm) {
+            match prepared.fx.alias_for_map(from, to) {
+                true => served.push(format!("{from}->{to}")),
+                false => missing.push(to),
+            }
+        }
+        for (from, to) in iw4.weapon_pairs(realm) {
+            let weapon = (1..weapons.0.len() as u32).find(|&id| {
+                weapons.0.namespace_of(id) == prepared_map.namespace
+                    && weapons.0.script_name_of(id) == to
+                    && [weapons.0.gun_xmodel_of(id), weapons.0.hand_xmodel_of(id)]
+                        .into_iter()
+                        .flatten()
+                        .all(|model| fpv_meshes.0.get(namespace, model).is_some())
+            });
+            match weapon {
+                Some(id) => {
+                    objective_weapons.push((from.to_owned(), id));
+                    served.push(format!("{from}->{}:{to}#{id}", namespace.as_str()));
+                }
+                None => missing.push(to),
+            }
+        }
+        diag::info!(
+            World,
+            "objective visuals from the map's game: served={served:?} missing={missing:?}"
+        );
+        if !missing.is_empty() {
+            return Err(InstallRefusal::new(format!(
+                "objective assets missing from the map's game: {}",
+                missing.join(", ")
+            )));
+        }
+        }
+    }
+    laps.mark("catalogs and objectives");
+    let mut strings = std::mem::take(&mut prepared.strings);
+    let kind = match match_kind(mode_selection) {
+        Ok(kind) => kind,
+        Err(gap) => {
+            diag::info!(Sim, "match install refused: {gap}");
+            return Err(InstallRefusal::with_gap(gap, gap));
+        }
+    };
+    struct Sources(assets::ScriptSources);
+    impl sim::script::SourceResolver for Sources {
+        fn read(&self, module: &str) -> Result<String, String> {
+            self.0
+                .read(module)
+                .map(|bytes| sim::script::decode_source(&bytes))
+        }
+        fn read_bytes(&self, module: &str) -> Result<Vec<u8>, String> {
+            self.0.read(module)
+        }
+    }
+    let sources = Sources(std::mem::take(&mut prepared.scripts));
+    // bo2mp: Black Ops II's own English rows (zone/english/en_*.ff: the
+    // weapon names) for the HUD too, not only its scripts; they win over
+    // a same-named row from the host game.
+    if let Some(set) = sources.0.t6.as_ref() {
+        let mut t6 = asset_game::LocalizeCatalog::from_rows(
+            set.strings.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+        );
+        t6.absorb(strings);
+        strings = t6;
+    }
+    // bo2zm M3: a Black Ops II map's own compiled scripts.
+    // bo2mp: a multiplayer map runs its game type (BO2MP_GAMETYPE, default
+    // Team Deathmatch); its scripts only with BO2MP_SCRIPTS=1 until the
+    // multiplayer engine side is in (lane B) - without them it is a walk.
+    let mp = zone.rsplit(':').next().unwrap_or(zone).starts_with("mp_");
+    // bo2mp: Black Ops II's own scripts always run (no MW2 rule set).
+    let mp_scripts = true;
+    // The front end's lobby choice; BO2MP_GAMETYPE overrides it (a test aid).
+    let setup = bo2mp.filter(|s| zone.rsplit(':').next() == Some(s.zone_stem().as_str()));
+    // bo2zm: the menu's (or test's) start location and game type, else the
+    // map's own (zombies maps only; a multiplayer map has no start location).
+    let start = if mp { None } else { frame::bo2_zm_start(zone) };
+    let mp_gametype = if mp {
+        std::env::var("BO2MP_GAMETYPE")
+            .ok()
+            .or_else(|| setup.map(|s| s.gametype.clone()).filter(|g| !g.is_empty()))
+            .unwrap_or_else(|| "tdm".to_owned())
+    } else {
+        start
+            .as_ref()
+            .map_or_else(|| sim::zm_gametype(zone).to_owned(), |(_, mode)| mode.clone())
+    };
+    // A match the front end started runs BO2's own scripts (no switch).
+    let mp_scripts = mp_scripts || setup.is_some();
+    laps.mark("strings, sources and game type");
+    let t6_scripts = sources.0.t6.as_ref().filter(|_| !mp || mp_scripts).map(|set| sim::T6Install {
+        map: zone.to_owned(),
+        gametype: mp_gametype.clone(),
+        location: start.as_ref().map(|(loc, _)| loc.clone()).unwrap_or_default(),
+        objects: set.objects.clone(),
+        t7_objects: set.t7_objects.clone(),
+        t7_nav: set.t7_nav.clone(),
+        t7_bundles: set.t7_bundles.clone(),
+        t7_cast: set
+            .t7_cast
+            .iter()
+            .map(|c| (c.aitype.clone(), c.characters.iter().map(|ch| (ch.body.clone(), ch.heads.clone(), ch.attached.clone())).collect()))
+            .collect(),
+        tables: set
+            .tables
+            .iter()
+            .map(|(name, columns, rows, cells)| {
+                (
+                    name.to_ascii_lowercase(),
+                    sim::T6Table {
+                        columns: *columns,
+                        rows: *rows,
+                        cells: cells.clone(),
+                    },
+                )
+            })
+            .collect(),
+        entities: set.entities.clone(),
+        path_nodes: set
+            .path_nodes
+            .iter()
+            .map(|n| sim::T6PathNode {
+                ty: n.ty,
+                spawnflags: n.spawnflags,
+                targetname: n.targetname.clone(),
+                target: n.target.clone(),
+                script_noteworthy: n.script_noteworthy.clone(),
+                script_linkname: n.script_linkname.clone(),
+                animscript: n.animscript.clone(),
+                origin: n.origin,
+                angle: n.angle,
+                radius: n.radius,
+                links: n.links.clone(),
+            })
+            .collect(),
+        path_tables: sim::T6PathTables {
+            node_count: set.path_tables.node_count,
+            original_count: set.path_tables.original_count,
+            vis: set.path_tables.vis.clone(),
+            smooth: set.path_tables.smooth.clone(),
+        },
+        anims: set
+            .anims
+            .iter()
+            .map(|a| sim::T6Anim {
+                name: a.name.clone(),
+                numframes: a.numframes,
+                framerate: a.framerate,
+                looping: a.looping,
+                delta_trans: a.delta_trans.clone(),
+                delta_quat: a.delta_quat.clone(),
+                notifies: a.notifies.clone(),
+            })
+            .collect(),
+        animstatedefs: set.animstatedefs.clone(),
+        // bo2zm M3: skeletons and hit boxes of every BO2 model the scripts
+        // can put on an entity, and the clips actors are posed with for hits
+        // (every animation an animstatedef names).
+        models: fpv_meshes
+            .0
+            .names_in(asset_core::AssetNamespace::T6)
+            .filter_map(|name| {
+                let entry = fpv_meshes.0.get(asset_core::AssetNamespace::T6, name)?;
+                Some((name.to_owned(), std::sync::Arc::new(entry.skel.retained_capability()?)))
+            })
+            .collect(),
+        strings: set.strings.iter().cloned().collect(),
+        sound_aliases: set.sound_aliases.iter().cloned().collect(),
+        gamesettings: gamesettings(&set.gamesettings, &mp_gametype),
+        bots: setup.map(|s| (s.bot_friends, s.bot_enemies, s.bot_difficulty)),
+        sound_lengths: set.sound_lengths.iter().cloned().collect(),
+        retrievable_weapons: set.retrievable_weapons.clone(),
+        vehicles: set
+            .vehicles
+            .iter()
+            .map(|v| {
+                let d = v.drive;
+                sim::T6Vehicle {
+                    name: v.name.clone(),
+                    turret: v.turret_weapon.clone(),
+                    gunners: v.gunner_weapons.clone(),
+                    drive: sim::T6VehicleDrive {
+                        camera_mode: d.camera_mode,
+                        max_speed: d.max_speed,
+                        max_speed_vertical: d.max_speed_vertical,
+                        accel: d.accel,
+                        accel_vertical: d.accel_vertical,
+                        reverse_scale: d.reverse_scale,
+                        camera_range: d.camera_range,
+                        camera_height: d.camera_height,
+                        camera_pitch: d.camera_pitch,
+                        camera_fov: d.camera_fov,
+                        turret_pitch: d.turret_pitch,
+                        third_person_driver: d.third_person_driver,
+                        buttons: d.buttons,
+                    },
+                }
+            })
+            .collect(),
+        playeranim: sim::t6_playeranim::T6PlayerAnimsRes::from_text(set.playeranim.as_ref(), &[]).0,
+        destructibles: set.destructibles.clone(),
+        zbarrier_defs: set
+            .zbarriers
+            .iter()
+            .map(|z| sim::T6ZBarrierDef {
+                name: z.name.clone(),
+                taunts: z.taunts,
+                reach_through: z.reach_through,
+                auto_hide_open_pieces: z.auto_hide_open_pieces,
+                taunt_state: z.taunt_state.clone(),
+                reach_through_state: z.reach_through_state.clone(),
+                num_attack_slots: z.num_attack_slots,
+                attack_spot_horz_offset: z.attack_spot_horz_offset,
+                boards: z.boards.clone(),
+            })
+            .collect(),
+        // The AI's animations, and the players' (bo2mp: their hit boxes
+        // are posed on the server).
+        // (bo2mp: decoded ahead on several threads, `t6_clip_threads`.)
+        clips: {
+            let started = std::time::Instant::now();
+            let names: Vec<String> = set
+                .anims
+                .iter()
+                .filter(|a| {
+                    // (bo2mp: and a Black Ops III Zombies map's zombies' own
+                    // clips, `sim::t6::t7_ai::CLIP_KINDS`.)
+                    a.name.starts_with("ai_zombie_base_")
+                        || a.name.starts_with("bo3_ai_zombie_")
+                        || set.animstatedefs.iter().any(|(_, text)| text.contains(a.name.as_str()))
+                })
+                .map(|a| a.name.clone())
+                .chain(
+                    sim::t6_playeranim::T6PlayerAnimsRes::from_text(set.playeranim.as_ref(), &[])
+                        .0
+                        .iter()
+                        .flat_map(|p| p.anims.clone()),
+                )
+                .collect();
+            let threads = t6_clip_threads();
+            let ahead = if threads > 1 {
+                xanims.0.decode_ahead(asset_core::AssetNamespace::T6, names.iter().map(String::as_str), threads)
+            } else {
+                0
+            };
+            let clips: Vec<(String, _)> = names
+                .into_iter()
+                .filter_map(|name| Some((name.to_ascii_lowercase(), xanims.0.clip(asset_core::AssetNamespace::T6, &name)?)))
+                .collect();
+            diag::info!(
+                World,
+                "t6 install: {} actor clips in {:.1} ms ({ahead} decoded ahead on {threads} threads; BO2MP_T6_CLIP_THREADS=1 = one by one on this thread)",
+                clips.len(),
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+            clips
+        },
+    });
+    laps.mark("t6 install tables (anims, model hit boxes, clips)");
+    let gametype = kind
+        .script_tokens()
+        .iter()
+        .copied()
+        .find(|token| {
+            sources
+                .0
+                .read(&format!("maps/mp/gametypes/{token}"))
+                .is_ok()
+        })
+        .unwrap_or(kind.token());
+    let keys = match sources.0.config("radiant/keys.txt") {
+        Some(text) => sim::script::parse_radiant_keys(text).unwrap_or_else(|error| {
+            diag::warn!(Sim, "gsc: radiant/keys.txt: {error}");
+            Default::default()
+        }),
+        None => {
+            diag::warn!(
+                Sim,
+                "gsc: radiant/keys.txt is not in the zones; map keys stay strings"
+            );
+            Default::default()
+        }
+    };
+    let script_level = sim::script::LevelData {
+        entities: sim::script::parse_entity_string(sources.0.entities().unwrap_or("")),
+        keys,
+        tables: sources
+            .0
+            .tables()
+            .iter()
+            .map(|(name, table)| {
+                let table = sim::script::StringTable {
+                    columns: table.columns,
+                    rows: table.rows,
+                    cells: table.cells.clone(),
+                };
+                (name.clone(), table)
+            })
+            .collect(),
+    };
+    let startup = sim::script::Iw4Startup::new(&sources, gametype, zone);
+    let roots: Vec<&str> = startup.roots.iter().map(String::as_str).collect();
+    let scripts = sim::script::Program::load(&sources, &roots, &sim::script::Catalog::iw4())
+        .map_err(|e| script_refusal(zone, gametype, "compile", &e))?;
+    laps.mark("scripts compiled");
+    let config = sources
+        .0
+        .config(MATCH_CONFIG)
+        .or_else(|| catalog.and_then(|c| c.rawfile_text(MATCH_CONFIG)))
+        .map(str::to_owned)
+        .or_else(|| {
+            identity
+                .and_then(|id| asset_game::read_iwd_named(&id.games_root, MATCH_CONFIG))
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+        });
+    let mut script_dvars = match config {
+        Some(text) => config_sets(&text),
+        None => {
+            diag::warn!(
+                Sim,
+                "gsc: {MATCH_CONFIG} is in neither the zones nor the iwds"
+            );
+            Vec::new()
+        }
+    };
+    script_dvars.push(("mapname".into(), zone.to_owned()));
+    script_dvars.push(("g_gametype".into(), gametype.to_owned()));
+    script_dvars.push(("sv_maxclients".into(), "18".into()));
+    for (name, value) in rules.map_or(&[][..], |rules| &rules.0) {
+        match script_dvars
+            .iter_mut()
+            .find(|(set, _)| set.eq_ignore_ascii_case(name))
+        {
+            Some((_, set)) => set.clone_from(value),
+            None => script_dvars.push((name.clone(), value.clone())),
+        }
+    }
+    if let Some(rules) = rules {
+        diag::info!(
+            Sim,
+            "gsc: {} host rule dvars over {MATCH_CONFIG}",
+            rules.0.len()
+        );
+    }
+    script_dvars.extend(script_dvar_overrides());
+    laps.mark("config and dvars");
+    let script_entries = startup.entries;
+    let authority_models = authority_entity_model_install(&prepared.world);
+    let model_spawns = script_model_spawns(&prepared.world.script_model_instances);
+    let fx_catalog = PreparedFxCatalog(std::mem::take(&mut prepared.fx));
+    let type10 = MatchType10SoundHints(
+        fx_catalog
+            .0
+            .unique_type10_sound_hints()
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+    );
+    let fx_models = PreparedFxModels(std::mem::take(&mut prepared.world.fx_models));
+    let impact_fx = PreparedImpactFx(std::mem::take(&mut prepared.world.impact_fx));
+    let tracers = PreparedTracers(std::mem::take(&mut prepared.tracers));
+    laps.mark("entity models, sounds and effects");
+    let mut scene = match world_scene_from_draw(
+        prepared.world,
+        prepared.materials,
+        &authority_models.installed_owners,
+    ) {
+        Ok(scene) => scene,
+        Err(error) => {
+            let gap = format!("match install refused: {error}");
+            diag::info!(World, "{gap}");
+            return Err(InstallRefusal::new(gap));
+        }
+    };
+    scene.t6_sun_sample_size_near = asset_game::sun_sample_size_near(zone);
+    // bo2mp: a Black Ops III map drawn by the native renderer has no converted
+    // world batches by design (the native scene draws it).
+    // (Nor does a Modern Warfare Remastered map: `render_h1` draws it; nor
+    // a Ghosts map: `render_iw6` does.)
+    if scene.batches.is_empty()
+        && asset_world::t7_native_zone().is_none()
+        && asset_world::jup_native_zone().is_none()
+        && asset_world::h1_native_zones().is_none()
+        && asset_world::iw6_native_zones().is_none()
+        && asset_world::iw7_native_zone().is_none()
+    {
+        diag::error!(
+            World,
+            "map load failed: no drawable world; see world report in the game log"
+        );
+        return Err(InstallRefusal::new(
+            "No drawable world. See world report in the game log.",
+        ));
+    }
+    laps.mark("world scene");
+    diag::info!(World, "match preflight laps: {}", laps.line);
+    Ok(MatchInstallPlan {
+        scripts,
+        t6_scripts,
+        script_level,
+        script_entries,
+        script_dvars,
+        objective_weapons,
+        kind,
+        gametype,
+        scene,
+        weapons,
+        fpv_meshes,
+        bodies,
+        world_weapons,
+        projectile_meshes,
+        xmodel_walk,
+        xanims,
+        death,
+        player_anim_sources,
+        prepared_map,
+        strings,
+        clip: prepared.clip,
+        pen_table: prepared.pen_table,
+        pen_table_loaded: prepared.pen_table_loaded,
+        lochit_table: prepared.lochit_table,
+        tracers,
+        fx_catalog,
+        type10,
+        fx_models,
+        impact_fx,
+        authority_models,
+        model_spawns,
+    })
+}
+
+pub fn install_script_model_id(content: asset_world::ScriptModelId) -> sim::ScriptModelId {
+    sim::ScriptModelId::from_authored_source_ordinal(content.source_ordinal())
+}
+
+fn player_kit_collision(
+    bodies: &asset_model::BodyMeshCatalog,
+    axis: bool,
+) -> sim::PlayerKitCollision {
+    let kits = bodies.kits();
+    let kit = kits.kit(axis);
+    let body_key = kit.map(|kit| kit.body.clone()).unwrap_or_default();
+    let head_key = kit.and_then(|kit| kit.head.clone()).unwrap_or_default();
+    let body = (!body_key.is_empty())
+        .then(|| {
+            bodies
+                .get(&body_key)
+                .and_then(|entry| entry.skel.retained_capability())
+                .map(Arc::new)
+        })
+        .flatten();
+    let head = (!head_key.is_empty())
+        .then(|| {
+            bodies
+                .get(&head_key)
+                .and_then(|entry| entry.skel.retained_capability())
+                .map(Arc::new)
+        })
+        .flatten();
+    sim::PlayerKitCollision {
+        body_key,
+        body,
+        head_key,
+        head,
+    }
+}
+
+/// bo2mp: a game type's settings from the zones' settings files: every
+/// `gametype_setting <name> <value>` line of `<mode>/gamesettings_default.cfg`
+/// then of `<mode>/gamesettings_<gametype>.cfg` (its own win), names lower case.
+fn gamesettings(
+    files: &[(String, String)],
+    gametype: &str,
+) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    for want in ["gamesettings_default.cfg".to_owned(), format!("gamesettings_{gametype}.cfg")] {
+        for (_, text) in files.iter().filter(|(n, _)| n.to_ascii_lowercase().ends_with(&want)) {
+            for line in text.lines() {
+                let line = line.split("//").next().unwrap_or("");
+                let mut words = line.split_whitespace();
+                if words.next() != Some("gametype_setting") {
+                    continue;
+                }
+                if let (Some(k), Some(v)) = (words.next(), words.next()) {
+                    out.insert(k.to_ascii_lowercase(), v.trim_matches('"').to_owned());
+                }
+            }
+        }
+    }
+    out
+}
+
+fn match_kind(
+    selection: Option<&sim::HostGameModeSelection>,
+) -> Result<gamemode_iw4::GameModeKind, &'static str> {
+    if let Some(selection) = selection {
+        return Ok(selection.kind());
+    }
+    match codlegacy_env::var("CODLEGACY_GAMETYPE") {
+        Ok(s) if !s.trim().is_empty() => gamemode_iw4::GameModeKind::parse_ascii_ignore_case(&s)
+            .ok_or("CODLEGACY_GAMETYPE names no known gametype (gsc.mode.out-of-scope)"),
+        _ => Ok(gamemode_iw4::GameModeKind::FreeForAll),
+    }
+}
+
+fn script_model_spawns(
+    instances: &[asset_world::ScriptModelSceneInstance],
+) -> Vec<(sim::ScriptModelId, [f32; 3], [f32; 3])> {
+    instances
+        .iter()
+        .map(|instance| {
+            let (yaw, pitch, roll) = instance.transform.rotation.to_euler(EulerRot::ZYX);
+            (
+                install_script_model_id(instance.id),
+                instance.transform.translation.to_array(),
+                [pitch.to_degrees(), yaw.to_degrees(), roll.to_degrees()],
+            )
+        })
+        .collect()
+}
+
+fn spawn_script_model_movers(
+    sim: &mut sim::SimWorld,
+    models: &[(sim::ScriptModelId, [f32; 3], [f32; 3])],
+) {
+    for (id, origin, angles) in models {
+        sim.spawn_script_mover(*id, *origin, *angles)
+            .expect("no free dynamic entity slot for a script model");
+    }
+}
+
+fn stamp_script_mover_numbers(scene: &mut WorldScene, sim: &sim::SimWorld) {
+    for instance in &mut scene.script_model_instances {
+        let id = install_script_model_id(instance.id);
+        instance.gentity_number = sim.gentity_number(id).and_then(|n| u16::try_from(n).ok());
+    }
+}
+
+fn map_anim_items(
+    slots: &[(u8, u8, Vec<asset_anim::ParsedAnimItem>)],
+    tree: Option<&asset_anim::CompiledAnimTreeDefinition>,
+    catalog: &asset_anim::XAnimCatalog,
+) -> Vec<(u8, u8, Vec<sim::AnimScriptItem>)> {
+    slots
+        .iter()
+        .map(|(state, movetype, items)| {
+            (
+                *state,
+                *movetype,
+                items
+                    .iter()
+                    .map(|item| map_script_item(item, tree, catalog))
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+fn map_event_items(
+    events: &[(u8, Vec<asset_anim::ParsedAnimItem>)],
+    tree: Option<&asset_anim::CompiledAnimTreeDefinition>,
+    catalog: &asset_anim::XAnimCatalog,
+) -> Vec<(u8, Vec<sim::AnimScriptItem>)> {
+    events
+        .iter()
+        .map(|(event, items)| {
+            (
+                *event,
+                items
+                    .iter()
+                    .map(|item| map_script_item(item, tree, catalog))
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+fn map_script_item(
+    item: &asset_anim::ParsedAnimItem,
+    tree: Option<&asset_anim::CompiledAnimTreeDefinition>,
+    catalog: &asset_anim::XAnimCatalog,
+) -> sim::AnimScriptItem {
+    sim::AnimScriptItem {
+        skip: item.skip,
+        conditions: item
+            .conditions
+            .iter()
+            .map(|c| sim::AnimScriptCondition {
+                index: c.index,
+                bitflags: c.bitflags,
+                bits: c.bits,
+                value: c.value,
+            })
+            .collect(),
+        commands: item
+            .commands
+            .iter()
+            .map(|cmd| sim::AnimScriptCommand {
+                body_part: cmd.body_part,
+                anim_index: cmd.anim_index,
+                duration_ms: command_duration_ms(tree, catalog, cmd),
+            })
+            .collect(),
+    }
+}
+
+fn command_duration_ms(
+    tree: Option<&asset_anim::CompiledAnimTreeDefinition>,
+    catalog: &asset_anim::XAnimCatalog,
+    cmd: &asset_anim::ParsedAnimCommand,
+) -> i32 {
+    if let Some(ms) = cmd.duration_ms {
+        return if ms <= 0 { 500 } else { ms };
+    }
+    let Some(node) = tree.and_then(|t| t.node(cmd.anim_index)) else {
+        return 500;
+    };
+    let Some(captured) = catalog.get(asset_core::AssetNamespace::Iw4, &node.name) else {
+        return 500;
+    };
+    if captured.parts.framerate > 0.0 {
+        let ms = (captured.parts.numframes as f32 / captured.parts.framerate * 1000.0) as i32;
+        if ms <= 0 { 500 } else { ms }
+    } else {
+        500
+    }
+}
+
+fn log_destructible_death_assets(death: &PreparedDestructibleDeath) {
+    for row in &death.0 {
+        diag::info!(
+            World,
+            "destructible death clip {}: {}",
+            row.clip_hint,
+            row.clip.edge_kind()
+        );
+        diag::info!(
+            World,
+            "destructible death husk {}: {}",
+            row.husk_hint,
+            row.husk.edge_kind()
+        );
+    }
+}
+
+struct AuthorityEntityModelInstall {
+    capabilities: Vec<sim::EntityCollisionCapabilities>,
+    brush_movers: Vec<(sim::ScriptModelId, u32, [f32; 3], [f32; 3])>,
+    models: std::collections::BTreeMap<
+        String,
+        Option<std::sync::Arc<xmodel_runtime::RetainedModelCapability>>,
+    >,
+    installed_owners: Vec<(asset_world::ScriptModelId, sim::AuthorityModelOwner)>,
+    ambiguous_brush_links: usize,
+    standalone_brush_links: usize,
+}
+
+fn retained(
+    asset: Option<&asset_world::MapXModelSceneAsset>,
+) -> Option<std::sync::Arc<xmodel_runtime::RetainedModelCapability>> {
+    match asset {
+        Some(
+            asset_world::MapXModelSceneAsset::Iw4(model)
+            | asset_world::MapXModelSceneAsset::Iw5(model)
+            | asset_world::MapXModelSceneAsset::T5(model),
+        ) => model.retained_capability().map(std::sync::Arc::new),
+        Some(asset_world::MapXModelSceneAsset::Unavailable { .. }) | None => None,
+    }
+}
+
+fn authority_entity_model_install(world: &assets::PreparedWorld) -> AuthorityEntityModelInstall {
+    let mut installed_owners = Vec::new();
+    let mut ambiguous_brush_links = 0;
+    let mut capabilities: Vec<sim::EntityCollisionCapabilities> = world
+        .script_model_instances
+        .iter()
+        .map(|instance| {
+            let sim_id = install_script_model_id(instance.id);
+            let owner = sim::AuthorityModelOwner::ScriptModel(sim_id);
+            installed_owners.push((instance.id, owner));
+            if matches!(
+                instance.metadata.brush_link,
+                asset_world::ScriptBrushModelLink::Ambiguous { .. }
+            ) {
+                ambiguous_brush_links += 1;
+            }
+            let mut dobj = sim::AuthorityDObjState::new_dirty(
+                instance.current_model.0.clone(),
+                retained(world.map_xmodel_scene_assets.get(&instance.current_model)),
+                instance.transform.to_matrix(),
+            );
+            if let Some(definition) = &instance.metadata.t5_destructible {
+                sim::t5_destructible::install(&mut dobj, definition.clone());
+            }
+            dobj.semantic_state.hide_part_bits = instance.dobj_state.hide_part_bits;
+            dobj.pose_request.hide_part_bits = instance.dobj_state.hide_part_bits;
+            sim::EntityCollisionCapabilities::current_tick(owner, Some(dobj), Vec::new())
+        })
+        .collect();
+    let mut brush_movers = Vec::new();
+    for brush in &world.script_brush_models {
+        let sim_id = install_script_model_id(asset_world::ScriptModelId::from_source_ordinal(
+            brush.source_ordinal,
+        ));
+        capabilities.push(sim::EntityCollisionCapabilities::current_tick(
+            sim::AuthorityModelOwner::ScriptModel(sim_id),
+            None,
+            vec![sim::LinkedBrushCollisionBrush {
+                cmodel_handle: brush.cmodel_handle,
+                origin: brush.origin,
+                angles: brush.angles,
+            }],
+        ));
+        brush_movers.push((sim_id, brush.cmodel_handle, brush.origin, brush.angles));
+    }
+    let standalone_brush_links = brush_movers.len();
+    let models = world
+        .map_xmodel_scene_assets
+        .iter()
+        .map(|(key, asset)| (key.0.clone(), retained(Some(asset))))
+        .collect();
+    AuthorityEntityModelInstall {
+        capabilities,
+        brush_movers,
+        models,
+        installed_owners,
+        ambiguous_brush_links,
+        standalone_brush_links,
+    }
+}
+
+/// What the two runtime owners of the map collision are given: one immutable
+/// backing they share, and the static models only the sim traces against.
+fn install_clip_and_player(
+    sim: &mut sim::SimWorld,
+    mut content: sim::SimContentBuilder,
+    clip: Option<Arc<ClipCollision>>,
+    authority_models: AuthorityEntityModelInstall,
+    intermission_view: Option<sim::AuthoredSpawnPoint>,
+    airstrike_height: Option<f32>,
+    spawns_in: &[SpawnPoint],
+    weapons: &WeaponRegistry,
+    combat: &[weapon_iw4::WeaponCombatFacts],
+    equipment: &[sim::EquipmentRuntimeFacts],
+    sim_cam: &mut SimCamera,
+    input_gate: &mut AuthorityInputGate,
+    host_classes: Option<&HostClassLoadouts>,
+    kind: gamemode_iw4::GameModeKind,
+) -> Result<(&'static str, Vec<Option<String>>), InstallRefusal> {
+    let clip = clip.ok_or_else(|| InstallRefusal::new("Required collision geometry is missing"))?;
+    let static_models = &clip.static_models;
+    let count = clip.brushes.len();
+    let node_count = clip.nodes.len();
+    let leaf_count = clip.leaves.len();
+    let vert_count = clip.mesh.verts.len();
+    let tri_count = clip.mesh.tri_count();
+    let smodel_count = static_models.len();
+    let brushes: Vec<sim::SimBrush> = clip
+        .brushes
+        .iter()
+        .map(|brush| sim::SimBrush {
+            planes: brush.planes.clone(),
+            contents: brush.contents,
+            plane_surface_flags: brush.plane_surface_flags.clone(),
+            glass_encoded: brush.glass_encoded,
+        })
+        .collect();
+    if count == 0 && tri_count == 0 {
+        return Err(InstallRefusal::new("Required collision geometry is empty"));
+    }
+    let bsp = sim::SimClipBsp {
+        nodes: clip
+            .nodes
+            .iter()
+            .map(|n| clipmap_iw4::ClipNode {
+                plane: n.plane,
+                children: n.children,
+            })
+            .collect(),
+        leaves: clip
+            .leaves
+            .iter()
+            .map(|l| clipmap_iw4::ClipLeaf {
+                first_brush: l.first_brush,
+                num_brushes: l.num_brushes,
+                first_coll_aabb_index: l.first_coll_aabb_index,
+                coll_aabb_count: l.coll_aabb_count,
+            })
+            .collect(),
+        leafbrushes: clip.leafbrushes.clone(),
+    };
+    let mesh = sim::SimClipMesh {
+        tables: Arc::clone(&clip.mesh),
+        static_models: static_models
+            .iter()
+            .map(|sm| sim::SimStaticModel {
+                index: sm.index,
+                name: sm.name.clone(),
+                model: sm.model.clone(),
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let cmodel_count = clip.cmodels.len();
+    let cmodels = sim::SimClipCmodels {
+        models: clip
+            .cmodels
+            .iter()
+            .map(|c| clipmap_iw4::ClipCmodel {
+                mins: c.mins,
+                maxs: c.maxs,
+                radius: c.radius,
+                first_brush: c.first_brush,
+                num_brushes: c.num_brushes,
+            })
+            .collect(),
+        triggers: clip
+            .trigger_models
+            .iter()
+            .map(|hulls| {
+                hulls
+                    .iter()
+                    .map(|h| sim::SimTriggerHull {
+                        mid: h.mid,
+                        half: h.half,
+                        slabs: h.slabs.clone(),
+                    })
+                    .collect()
+            })
+            .collect(),
+    };
+    content.set_clip_map(brushes, bsp, mesh, cmodels);
+    sim.install_content(content.finish());
+    sim.install_model_library(authority_models.models);
+    let owner_count = authority_models.capabilities.len();
+    let linked_brushes = authority_models
+        .capabilities
+        .iter()
+        .map(|capabilities| capabilities.linked_brushes.len())
+        .sum::<usize>();
+    sim.install_entity_collision_capabilities(authority_models.capabilities);
+    sim::phase_materialize_entity_dobjs(sim);
+    let collision_bones = sim
+        .entity_collision_capabilities()
+        .iter()
+        .filter_map(|capabilities| capabilities.dobj.as_ref())
+        .filter_map(|state| state.current_collision.as_ref())
+        .map(|geometry| geometry.bones.len())
+        .sum::<usize>();
+    diag::info!(
+        Sim,
+        "spawn: {} script collision owners, {} nonzero XBoneInfo OBBs, {} linked brush cmodels, {} ambiguous brush links, {} standalone brush cmodels",
+        owner_count,
+        collision_bones,
+        linked_brushes,
+        authority_models.ambiguous_brush_links,
+        authority_models.standalone_brush_links,
+    );
+
+    diag::info!(
+        Sim,
+        "spawn: {} clip brushes, {} BSP nodes / {} leaves, {} verts / {} tris, {} cmodels, {} smodels",
+        count,
+        node_count,
+        leaf_count,
+        vert_count,
+        tri_count,
+        cmodel_count,
+        smodel_count
+    );
+
+    let spawns: Vec<sim::AuthoredSpawnPoint> = spawns_in
+        .iter()
+        .map(|p| sim::AuthoredSpawnPoint {
+            classname: p.classname.clone(),
+            origin: p.origin,
+            angles: p.angles,
+            script_linkto: p.script_linkto.clone(),
+            script_destructable_area: p.script_destructable_area.clone(),
+        })
+        .collect();
+    let rows = bootstrap_class_rows(host_classes);
+    let projected: Vec<AuthoritativeClassProjection> = rows
+        .iter()
+        .enumerate()
+        .map(|(index, row)| project_class(index as u32, row, weapons, combat, equipment))
+        .collect();
+    let lock_reasons: Vec<Option<String>> = projected
+        .iter()
+        .map(|row| row.lock_reason.clone())
+        .collect();
+    let classes: Vec<sim::ClassDef> = projected.into_iter().map(|row| row.def).collect();
+    let bot_classes: Vec<sim::ClassDef> = frame::showcase_classes()
+        .iter()
+        .enumerate()
+        .map(|(index, preset)| {
+            let row = ClassRow::from(&preset.into());
+            project_class(index as u32, &row, weapons, combat, equipment).def
+        })
+        .collect();
+    let locked_n = lock_reasons.iter().filter(|r| r.is_some()).count();
+    for (index, reason) in lock_reasons.iter().enumerate() {
+        if let Some(reason) = reason {
+            diag::info!(Sim, "spawn: class {index} locked: {reason}");
+        }
+    }
+    let has_intermission_view = intermission_view.is_some();
+    if let Err(err) = sim.bootstrap(sim::MatchBootstrap {
+        spawns,
+        classes,
+        bot_classes,
+        seed: 0,
+        kind,
+        score_limit: codlegacy_env::var("CODLEGACY_SCORE_LIMIT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(match kind {
+                gamemode_iw4::GameModeKind::Domination => gamemode_iw4::dom::SCORE_LIMIT,
+                gamemode_iw4::GameModeKind::Demolition => 0,
+                _ => sim::FFA.score_limit,
+            }),
+        time_limit_ms: match kind {
+            gamemode_iw4::GameModeKind::Domination => gamemode_iw4::dom::TIME_LIMIT_MS,
+            gamemode_iw4::GameModeKind::Demolition => gamemode_iw4::dd::TIME_LIMIT_MS,
+            _ => sim::FFA.time_limit_ms,
+        },
+        allow_debug_actions: true,
+        intermission_view,
+        airstrike_height,
+        ..Default::default()
+    }) {
+        diag::info!(Sim, "bootstrap: {err}");
+        return Err(InstallRefusal::new(format!(
+            "MatchBootstrap refused: {err}"
+        )));
+    }
+
+    sim_cam.enabled = false;
+    input_gate.local_cmds_enabled = false;
+    sim_cam.freeze_fly = has_intermission_view;
+    diag::info!(
+        Sim,
+        "spawn: match bootstrapped with {} clip brushes and {} dm spawns ({} / {} classes Locked by coverage)",
+        count,
+        spawns_in.len(),
+        locked_n,
+        rows.len()
+    );
+    let gap = if has_intermission_view {
+        "player awaits SelectClass; mp_global_intermission holds the camera until Equip ack"
+    } else {
+        "player awaits SelectClass; Equip ack enables sim camera (no authored intermission)"
+    };
+    Ok((gap, lock_reasons))
+}
+
+pub(crate) fn bootstrap_class_rows(host: Option<&HostClassLoadouts>) -> Vec<ClassRow> {
+    let fallback = HostClassLoadouts::default();
+    let host = host.filter(|h| !h.slots.is_empty()).unwrap_or(&fallback);
+    host.slots.iter().map(ClassRow::from).collect()
+}
+
+fn install_shocks(
+    world: &mut sim::SimContentBuilder,
+    catalog: Option<&asset_game::MenuCatalog>,
+    map_shocks: &[(String, String)],
+) {
+    let common = catalog.into_iter().flat_map(|catalog| {
+        catalog.rawfiles.iter().filter_map(|(path, text)| {
+            let lower = path.to_ascii_lowercase();
+            let name = lower
+                .strip_prefix("shock/")?
+                .strip_suffix(".shock")?
+                .to_owned();
+            Some((name, text.as_str()))
+        })
+    });
+    let map = map_shocks
+        .iter()
+        .map(|(name, text)| (name.clone(), text.as_str()));
+    let mut shocks = std::collections::BTreeMap::new();
+    for (name, text) in common.chain(map) {
+        match hud_iw4::ShockParams::parse(text) {
+            Ok(params) => {
+                shocks.insert(name, params);
+            }
+            Err(error) => diag::warn!(Zone, "shock/{name}.shock: {error}"),
+        }
+    }
+    diag::info!(Zone, "shellshocks: {:?}", shocks.keys().collect::<Vec<_>>());
+    world.set_shocks(shocks);
+}
+
+fn charsets(arena_text: Option<&str>, zone: &str) -> (String, String) {
+    let row = arena_text.and_then(|text| asset_game::arena_charsets(text, zone));
+    let allies = row
+        .as_ref()
+        .and_then(|r| r.allieschar.clone())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| gamemode_iw4::DEFAULT_ALLIES_CHARSET.to_owned());
+    let axis = row
+        .as_ref()
+        .and_then(|r| r.axischar.clone())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| gamemode_iw4::DEFAULT_AXIS_CHARSET.to_owned());
+    (allies, axis)
+}
+
+fn iw4_charsets(
+    catalog: &asset_game::MenuCatalog,
+    identity: Option<&LaunchIdentity>,
+    zone: &str,
+) -> (String, String) {
+    let arena_text = catalog
+        .rawfile_text("mp/basemaps.arena")
+        .map(str::to_owned)
+        .or_else(|| identity.and_then(|id| asset_game::read_basemaps_arena(&id.games_root)));
+    charsets(arena_text.as_deref(), zone)
+}
+
+fn install_team_voice_prefixes(
+    world: &mut sim::SimContentBuilder,
+    catalog: Option<&asset_game::MenuCatalog>,
+    identity: Option<&LaunchIdentity>,
+    zone: &str,
+) {
+    let Some(catalog) = catalog else {
+        return;
+    };
+    let Some(table) = catalog.string_table(gamemode_iw4::FACTION_TABLE) else {
+        return;
+    };
+    let arena_text = catalog
+        .rawfile_text("mp/basemaps.arena")
+        .map(str::to_owned)
+        .or_else(|| identity.and_then(|id| asset_game::read_basemaps_arena(&id.games_root)));
+    if let Some(entry) = arena_text
+        .as_deref()
+        .and_then(|text| asset_game::arena_entry(text, zone))
+    {
+        world.set_map_custom(entry);
+    }
+    let (allies_cs, axis_cs) = charsets(arena_text.as_deref(), zone);
+    let allies = table.lookup_col(&allies_cs, gamemode_iw4::FACTION_VOICE_PREFIX_COL);
+    let axis = table.lookup_col(&axis_cs, gamemode_iw4::FACTION_VOICE_PREFIX_COL);
+    world.set_team_voice_prefixes(
+        (!allies.is_empty()).then(|| allies.to_owned()),
+        (!axis.is_empty()).then(|| axis.to_owned()),
+    );
+}
+
+/// bo2mp: tells the MWR renderer which glass panes the match has broken
+/// (a pane whose glass is no longer solid; `render_h1::glass::set_broken`).
+fn export_h1_glass(world: Res<AuthorityWorld>) {
+    let objects = world.0.world_objects();
+    let broken: Vec<u32> = objects
+        .glass_damage_pairs()
+        .into_iter()
+        .filter(|&(id, _)| !objects.glass_is_solid(id))
+        .map(|(id, _)| id)
+        .collect();
+    render_h1::glass::set_broken(broken);
+}
+
+pub fn register_match_apply_systems(app: &mut App) {
+    app.init_resource::<StartupCommands>()
+        .add_systems(
+            Update,
+            export_h1_glass
+                .run_if(resource_exists::<AuthorityWorld>)
+                .in_set(ClientSet::Diag),
+        )
+        .init_resource::<PendingConsoleLines>()
+        .init_resource::<HostClassLoadouts>()
+        .add_systems(
+            Update,
+            apply_prepared_match
+                .run_if(resource_exists::<PreparedMatchReady>)
+                .in_set(ClientSet::Load),
+        );
+}
+
+fn stage_resource<T: Resource>(queue: &mut bevy::ecs::world::CommandQueue, resource: T) {
+    queue.push(move |world: &mut World| {
+        world.insert_resource(resource);
+    });
+}
+
+#[cfg(test)]
+mod map_read_gap_tests {
+    use super::{map_read_gap, with_map_read_gap};
+
+    #[test]
+    fn refusal_says_why_the_map_did_not_read() {
+        let report = vec![
+            "foreign data common: no same-tree common_mp".to_owned(),
+            "lane gap [assets::session_load::load_prepared_match/server_pack]: not this one".to_owned(),
+            "lane gap [assets::lane::t7_map::load_world/zone]: Black Ops III zone: no GfxWorld in the zone".to_owned(),
+        ];
+        let gap = map_read_gap(&report);
+        assert_eq!(gap.as_deref(), Some("Black Ops III zone: no GfxWorld in the zone"));
+        assert_eq!(
+            with_map_read_gap("Required collision geometry is missing".to_owned(), gap.as_deref()),
+            "Required collision geometry is missing: the map could not be read (Black Ops III zone: no GfxWorld in the zone)"
+        );
+        // A map that read: the refusal as it was.
+        assert_eq!(map_read_gap(&report[..2]), None);
+        assert_eq!(with_map_read_gap("x".to_owned(), None), "x");
+    }
+}

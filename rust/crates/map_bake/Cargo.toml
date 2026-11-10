@@ -1,0 +1,15 @@
+[package]
+name = "map_bake"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+codlegacy_env.workspace = true
+lz4_flex.workspace = true
+
+[dev-dependencies]
+fastfile_t7.workspace = true
+
+[lints]
+workspace = true

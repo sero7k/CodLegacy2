@@ -1,0 +1,494 @@
+use std::collections::HashMap;
+
+#[path = "tracer_finished_cache.rs"]
+mod finished_cache;
+pub use finished_cache::{export_tracers, import_tracers};
+
+use crate::asset_graph::AssetEdgeFromPtrs;
+use asset_core::{AssetEdge, AssetEdgeCensus, AssetEdgeReason, MaterialSpace, ZoneOwner};
+use fastfile_iw4::{Ptr, Result, TracerDefGeometry, ZoneStream};
+
+pub type TracerMaterial = AssetEdge<MaterialSpace>;
+
+pub type TracerMaterialReason = AssetEdgeReason;
+
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct OwnedTracerDef {
+    pub namespace: crate::AssetNamespace,
+    pub name: String,
+    pub material: TracerMaterial,
+
+    pub material_hint: Option<String>,
+    pub material_namespace: crate::AssetNamespace,
+
+    /// Whether the zone named a material for this tracer, and whether it did so
+    /// through an alias. The pointers that answered it stop at the walk.
+    pub material_authored: crate::AuthoredRef,
+    pub draw_interval: u32,
+    pub speed: f32,
+    pub beam_length: f32,
+    pub beam_width: f32,
+    pub screw_radius: f32,
+    pub screw_dist: f32,
+    pub colors: [[f32; 4]; 5],
+    /// bo2zm: a Black Ops II smoke tracer (type 1, the DSR-50's): it lies
+    /// along the bullet's whole path and fades out over this long. 0 for a
+    /// tracer that flies.
+    pub fade_msec: u32,
+    /// bo2mp: a guest tracer whose own material is in no zone read draws
+    /// with the material of the first Black Ops II tracer instead (its
+    /// numbers stay its own).
+    pub material_standin: bool,
+}
+
+impl OwnedTracerDef {
+    pub fn material_report(&self) -> &str {
+        match self.material {
+            TracerMaterial::Bound(_) => self.material_hint.as_deref().unwrap_or("bound"),
+            TracerMaterial::Unresolved(_) | TracerMaterial::Absent => self.material.report(),
+        }
+    }
+
+    pub fn present_name(&self) -> Option<&str> {
+        self.material
+            .is_bound()
+            .then(|| self.material_hint.as_deref())
+            .flatten()
+    }
+
+    pub fn decode_hint(&self) -> Option<&str> {
+        self.material_hint
+            .as_deref()
+            .filter(|name| !name.is_empty())
+    }
+}
+
+#[derive(Clone, Debug)]
+enum TracerLink {
+    Direct(usize),
+    Alias(Ptr),
+}
+
+/// The tracers a build finished with: named, material-bound, and with no zone
+/// link map to resolve one more pointer against.
+#[derive(Clone, Debug, Default)]
+pub struct TracerDefinitions {
+    by_key: HashMap<(crate::AssetNamespace, String), usize>,
+    defs: Vec<OwnedTracerDef>,
+    zones: Vec<ZoneOwner>,
+    capture_zone: ZoneOwner,
+    pub capture_gaps: usize,
+}
+
+/// The build, holding the definitions plus what the walk needs to add to them.
+#[derive(Clone, Debug, Default)]
+pub struct TracerCatalog {
+    published: TracerDefinitions,
+    links: HashMap<Ptr, TracerLink>,
+    last_captured: Option<usize>,
+    capture_ns: crate::AssetNamespace,
+}
+
+impl std::ops::Deref for TracerCatalog {
+    type Target = TracerDefinitions;
+
+    fn deref(&self) -> &Self::Target {
+        &self.published
+    }
+}
+
+impl std::ops::DerefMut for TracerCatalog {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.published
+    }
+}
+
+impl TracerCatalog {
+    pub fn note_loaded(&mut self, slot: Ptr, insert_slot: Option<Ptr>) {
+        let Some(index) = self.last_captured.take() else {
+            return;
+        };
+        self.links.insert(slot, TracerLink::Direct(index));
+        if let Some(insert_slot) = insert_slot {
+            self.links.insert(insert_slot, TracerLink::Direct(index));
+        }
+    }
+
+    pub fn note_alias(&mut self, slot: Ptr, target: Ptr) {
+        self.links.insert(slot, TracerLink::Alias(target));
+    }
+
+    pub fn index_at_slot(&self, slot: Ptr) -> Option<usize> {
+        let mut cur = slot;
+        for _ in 0..8 {
+            match self.links.get(&cur)? {
+                TracerLink::Direct(index) => return Some(*index),
+                TracerLink::Alias(next) => cur = *next,
+            }
+        }
+        None
+    }
+
+    pub fn set_capture_ns(&mut self, ns: crate::AssetNamespace) {
+        self.capture_ns = ns;
+    }
+
+    pub fn bind_last_material(&mut self, name: String) {
+        if name.is_empty() {
+            return;
+        }
+        let Some(index) = self.last_captured else {
+            return;
+        };
+        let ns = self.capture_ns;
+        if let Some(def) = self.published.defs.get_mut(index) {
+            def.material_hint = Some(name);
+            def.material_namespace = ns;
+        }
+    }
+
+    /// The zone reached this tracer's material through an alias. Which pointer
+    /// it was does not survive the walk; that it was one does.
+    pub fn note_last_material_alias(&mut self) {
+        let Some(index) = self.last_captured else {
+            return;
+        };
+        if let Some(def) = self.published.defs.get_mut(index) {
+            def.material_authored.alias = true;
+            if !def.material.is_bound() {
+                def.material = def.material_authored.unresolved();
+            }
+        }
+    }
+
+    pub fn capture(&mut self, s: &ZoneStream<'_>, geometry: TracerDefGeometry) -> Result<()> {
+        let name = match geometry.name {
+            Some(ptr) => s.cstr(ptr).unwrap_or("").to_owned(),
+            None => String::new(),
+        };
+        if name.is_empty() {
+            self.capture_gaps += 1;
+            self.last_captured = None;
+            return Ok(());
+        }
+        let captured_name = geometry.material_name.and_then(|ptr| {
+            s.cstr(ptr)
+                .ok()
+                .filter(|n| !n.is_empty())
+                .map(str::to_owned)
+        });
+        let material = TracerMaterial::from_capture(geometry.material_slot, None);
+        let namespace = self.capture_ns;
+        let index = self.published.insert_owned(OwnedTracerDef {
+            namespace,
+            name,
+            material,
+            material_hint: captured_name,
+            material_namespace: namespace,
+            material_authored: crate::AuthoredRef::from_ptrs(geometry.material_slot, None),
+            draw_interval: geometry.draw_interval,
+            speed: geometry.speed,
+            beam_length: geometry.beam_length,
+            beam_width: geometry.beam_width,
+            screw_radius: geometry.screw_radius,
+            screw_dist: geometry.screw_dist,
+            colors: geometry.colors,
+            fade_msec: 0,
+            material_standin: false,
+        });
+        self.last_captured = Some(index);
+        Ok(())
+    }
+
+    /// bo2zm: one Black Ops II tracer. False for a reference stub (a
+    /// comma-named asset another zone defines) or an unnamed one.
+    pub fn capture_t6(&mut self, t: &asset_t6::TracerRef) -> bool {
+        if t.name.is_empty() || t.name.starts_with(',') {
+            return false;
+        }
+        let ns = crate::AssetNamespace::T6;
+        self.published.insert_owned(OwnedTracerDef {
+            namespace: ns,
+            name: t.name.clone(),
+            material: TracerMaterial::Unresolved(AssetEdgeReason::CatalogMiss),
+            material_hint: (!t.material.is_empty()).then(|| t.material.clone()),
+            material_namespace: ns,
+            material_authored: crate::AuthoredRef {
+                slot: !t.material.is_empty(),
+                alias: false,
+            },
+            draw_interval: t.draw_interval.max(0) as u32,
+            speed: t.speed,
+            beam_length: t.beam_length,
+            beam_width: t.beam_width,
+            screw_radius: t.screw_radius,
+            screw_dist: t.screw_dist,
+            colors: t.colors,
+            fade_msec: if t.ty == 1 {
+                (t.fade_time.max(0.0) * 1000.0) as u32
+            } else {
+                0
+            },
+            material_standin: false,
+        });
+        true
+    }
+
+    /// bo2mp: one Advanced Warfare tracer (`TracerDef` bytes, its material's
+    /// name), under the S1 namespace. AW's tracer fields are IW4's in the
+    /// same order (a `FxEffectDef` pointer added before them, unused here).
+    pub fn capture_s1(&mut self, name: &str, material: &str, record: &[u8]) -> bool {
+        self.capture_s1_in(crate::AssetNamespace::S1, name, material, record)
+    }
+
+    /// bo2mp: one tracer of Advanced Warfare's engine under `ns` (H1 keeps
+    /// AW's `TracerDef`).
+    pub fn capture_s1_in(
+        &mut self,
+        ns: crate::AssetNamespace,
+        name: &str,
+        material: &str,
+        record: &[u8],
+    ) -> bool {
+        use fastfile_s1::layout::TracerDef as t;
+        if name.is_empty() || name.starts_with(',') || record.len() < t::SIZE {
+            return false;
+        }
+        let f = |at: usize| f32::from_le_bytes(record[at..at + 4].try_into().unwrap_or([0; 4]));
+        let material = material.trim_start_matches(',');
+        self.published.insert_owned(OwnedTracerDef {
+            namespace: ns,
+            name: name.to_owned(),
+            material: TracerMaterial::Unresolved(AssetEdgeReason::CatalogMiss),
+            material_hint: (!material.is_empty()).then(|| material.to_owned()),
+            material_namespace: ns,
+            material_authored: crate::AuthoredRef {
+                slot: !material.is_empty(),
+                alias: false,
+            },
+            draw_interval: i32::from_le_bytes(
+                record[t::drawInterval..t::drawInterval + 4]
+                    .try_into()
+                    .unwrap_or([0; 4]),
+            )
+            .max(0) as u32,
+            speed: f(t::speed),
+            beam_length: f(t::beamLength),
+            beam_width: f(t::beamWidth),
+            screw_radius: f(t::screwRadius),
+            screw_dist: f(t::screwDist),
+            colors: std::array::from_fn(|c| std::array::from_fn(|k| f(t::colors + 16 * c + 4 * k))),
+            fade_msec: 0,
+            material_standin: false,
+        });
+        true
+    }
+
+    /// bo2mp: one tracer of a guest game from its `TracerDef` numbers, kept
+    /// under `ns`, its material looked up under `material_ns` (Ghosts' guns:
+    /// both the Ghosts namespace).
+    #[allow(clippy::too_many_arguments)]
+    pub fn capture_native_in(
+        &mut self,
+        ns: crate::AssetNamespace,
+        material_ns: crate::AssetNamespace,
+        name: &str,
+        material: &str,
+        draw_interval: u32,
+        speed: f32,
+        beam: [f32; 4],
+        colors: [[f32; 4]; 5],
+        material_standin: bool,
+    ) -> bool {
+        if !self.capture_iw7_in(ns, name, material, draw_interval, speed, beam, colors) {
+            return false;
+        }
+        if let Some(def) = self
+            .published
+            .defs
+            .iter_mut()
+            .rev()
+            .find(|d| d.namespace == ns && d.name == name)
+        {
+            def.material_namespace = material_ns;
+            def.material_standin = material_standin;
+        }
+        true
+    }
+
+    /// bo2mp: one Infinite Warfare tracer (its `TracerDef` numbers and its
+    /// material's name) under `ns`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn capture_iw7_in(
+        &mut self,
+        ns: crate::AssetNamespace,
+        name: &str,
+        material: &str,
+        draw_interval: u32,
+        speed: f32,
+        beam: [f32; 4],
+        colors: [[f32; 4]; 5],
+    ) -> bool {
+        if name.is_empty() || name.starts_with(',') {
+            return false;
+        }
+        let material = material.trim_start_matches(',');
+        self.published.insert_owned(OwnedTracerDef {
+            namespace: ns,
+            name: name.to_owned(),
+            material: TracerMaterial::Unresolved(AssetEdgeReason::CatalogMiss),
+            material_hint: (!material.is_empty()).then(|| material.to_owned()),
+            // (The lane links the sprite materials under Black Ops II's
+            // namespace.)
+            material_namespace: crate::AssetNamespace::T6,
+            material_authored: crate::AuthoredRef {
+                slot: !material.is_empty(),
+                alias: false,
+            },
+            draw_interval,
+            speed,
+            beam_length: beam[0],
+            beam_width: beam[1],
+            screw_radius: beam[2],
+            screw_dist: beam[3],
+            colors,
+            fade_msec: 0,
+            material_standin: false,
+        });
+        true
+    }
+
+    /// bo2zm: tracers a map zone defines (Black Ops II maps carry their
+    /// own) join this catalog; a name already here is replaced.
+    pub fn absorb(&mut self, other: TracerCatalog) {
+        for def in other.published.defs {
+            self.published.insert_owned(def);
+        }
+    }
+
+    /// Ends the build: the tracer definitions travel on without the link map.
+    pub fn publish(self) -> TracerDefinitions {
+        self.published
+    }
+}
+
+impl TracerDefinitions {
+    pub fn len(&self) -> usize {
+        self.defs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.defs.is_empty()
+    }
+
+    pub fn resolve_materials(&mut self, materials: &crate::MaterialDefinitions) {
+        for def in &mut self.defs {
+            let ns = def.material_namespace;
+            let index = def
+                .material_hint
+                .as_deref()
+                .and_then(|name| materials.material_index_by_ns(ns, name));
+            if let Some(index) = index.filter(|i| {
+                materials
+                    .materials
+                    .get(i.order())
+                    .is_some_and(|m| m.name.is_real() && !m.name.is_empty())
+            }) {
+                if def.material_hint.as_ref().is_none_or(|n| n.is_empty()) {
+                    def.material_hint = Some(materials.materials[index.order()].name.to_string());
+                }
+                def.material = TracerMaterial::bind(index, materials.zone_of(index.order()));
+            } else {
+                def.material = def.material_authored.unresolved();
+            }
+        }
+        // bo2mp: stand-in materials (`OwnedTracerDef::material_standin`).
+        let standin = self
+            .defs
+            .iter()
+            .find(|d| d.namespace == crate::AssetNamespace::T6 && d.material.is_bound())
+            .map(|d| (d.material, d.material_hint.clone(), d.material_namespace));
+        if let Some((material, hint, ns)) = standin {
+            for def in self
+                .defs
+                .iter_mut()
+                .filter(|d| d.material_standin && !d.material.is_bound())
+            {
+                def.material = material;
+                def.material_hint = hint.clone();
+                def.material_namespace = ns;
+            }
+        }
+    }
+
+    pub fn defs(&self) -> impl Iterator<Item = &OwnedTracerDef> {
+        self.defs.iter()
+    }
+
+    pub fn set_capture_zone(&mut self, zone: ZoneOwner) {
+        self.capture_zone = zone;
+    }
+
+    pub fn zone_of(&self, index: usize) -> ZoneOwner {
+        self.zones.get(index).copied().unwrap_or(self.capture_zone)
+    }
+
+    fn insert_owned(&mut self, def: OwnedTracerDef) -> usize {
+        let key = (def.namespace, def.name.clone());
+        if let Some(index) = self.by_key.get(&key).copied() {
+            self.zones[index] = self.capture_zone;
+            self.defs[index] = def;
+            index
+        } else {
+            let index = self.defs.len();
+            self.by_key.insert(key, index);
+            self.zones.push(self.capture_zone);
+            self.defs.push(def);
+            index
+        }
+    }
+
+    pub fn def_at(&self, index: usize) -> Option<&OwnedTracerDef> {
+        self.defs.get(index)
+    }
+
+    /// bo2zm: a tracer by name (Black Ops II weapons name theirs).
+    pub fn index_of(&self, ns: crate::AssetNamespace, name: &str) -> Option<usize> {
+        self.by_key.get(&(ns, name.to_owned())).copied()
+    }
+
+    pub fn material_edge_census(&self) -> AssetEdgeCensus {
+        let mut census = AssetEdgeCensus::default();
+        for def in self.defs.iter() {
+            census.push(def.material);
+        }
+        census
+    }
+
+    pub fn bound_count(&self) -> usize {
+        self.defs
+            .iter()
+            .filter(|def| def.material.is_bound())
+            .count()
+    }
+
+    pub fn named_materials(&self) -> impl Iterator<Item = &str> {
+        self.defs.iter().filter_map(OwnedTracerDef::decode_hint)
+    }
+
+    pub fn material_keys(&self) -> impl Iterator<Item = asset_core::MaterialKey> + '_ {
+        self.defs.iter().filter_map(|def| {
+            def.decode_hint().map(|name| asset_core::MaterialKey {
+                namespace: def.material_namespace,
+                name: name.to_owned(),
+            })
+        })
+    }
+
+    pub fn unresolved_count(&self) -> usize {
+        self.defs
+            .iter()
+            .filter(|def| def.material.is_unresolved())
+            .count()
+    }
+}

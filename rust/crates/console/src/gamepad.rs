@@ -1,0 +1,308 @@
+use bevy::input::gamepad::{Gamepad, GamepadAxis, GamepadButton, GamepadConnection, GamepadEvent};
+use bevy::prelude::*;
+use frame::{UiMenuKey, UiMenuRequest};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct Sticks {
+    /// Forward and right.
+    pub movement: Vec2,
+    /// Right and up.
+    pub look: Vec2,
+}
+
+/// The outer dead zone: a stick this close to the rim is all the way over.
+const OUTER_DEADZONE: f32 = 0.01;
+
+fn radial(stick: Vec2, deadzone: f32) -> Vec2 {
+    let length = stick.length();
+    if length <= deadzone || length <= f32::EPSILON {
+        return Vec2::ZERO;
+    }
+    let scaled = ((length - deadzone) / (1.0 - deadzone - OUTER_DEADZONE).max(0.01)).min(1.0);
+    stick / length * scaled
+}
+
+pub(crate) fn sticks(pad: &Gamepad, settings: &frame::GameSettings) -> Sticks {
+    let left = radial(pad.left_stick(), settings.pad_deadzone_left);
+    let right = radial(pad.right_stick(), settings.pad_deadzone_right);
+    match settings.pad_stick_layout {
+        1 => Sticks {
+            movement: Vec2::new(right.y, right.x),
+            look: left,
+        },
+        2 => Sticks {
+            movement: Vec2::new(left.y, right.x),
+            look: Vec2::new(left.x, right.y),
+        },
+        3 => Sticks {
+            movement: Vec2::new(right.y, left.x),
+            look: Vec2::new(right.x, left.y),
+        },
+        _ => Sticks {
+            movement: Vec2::new(left.y, left.x),
+            look: right,
+        },
+    }
+}
+
+/// bo2mp: Black Ops II's view stick response (`aim_assist/view_input_3.graph`,
+/// the `aim_input_graph_index` its gamepads use): stick deflection -> the
+/// fraction of the turn rate, straight lines between the points.
+const BO2_VIEW_INPUT_GRAPH: [(f32, f32); 7] = [
+    (0.0, 0.0),
+    (0.1242, 0.0423),
+    (0.2238, 0.0885),
+    (0.3210, 0.1553),
+    (0.4118, 0.2419),
+    (0.5116, 0.3508),
+    (1.0, 1.0),
+];
+
+fn graph(points: &[(f32, f32)], x: f32) -> f32 {
+    for pair in points.windows(2) {
+        let ((x0, y0), (x1, y1)) = (pair[0], pair[1]);
+        if x <= x1 {
+            let t = if x1 > x0 { (x - x0) / (x1 - x0) } else { 1.0 };
+            return y0 + (y1 - y0) * t.clamp(0.0, 1.0);
+        }
+    }
+    points.last().map_or(x, |p| p.1)
+}
+
+fn curve(deflection: f32, kind: u8) -> f32 {
+    let d = deflection.clamp(0.0, 1.0);
+    match kind {
+        1 => d,
+        2 => 1.0 - (1.0 - d) * (1.0 - d),
+        // (Was 0.35 d + 0.65 d^3, our own: slower than BO2's through the
+        // middle of the stick.)
+        _ => graph(&BO2_VIEW_INPUT_GRAPH, d),
+    }
+}
+
+pub(crate) fn shaped_look(look: Vec2, settings: &frame::GameSettings) -> Vec2 {
+    let deflection = look.length();
+    if deflection <= f32::EPSILON {
+        return Vec2::ZERO;
+    }
+    let shaped = look / deflection * curve(deflection, settings.pad_curve);
+    Vec2::new(
+        shaped.x,
+        if settings.pad_invert {
+            -shaped.y
+        } else {
+            shaped.y
+        },
+    )
+}
+
+#[derive(Default)]
+pub(crate) struct PadActivity {
+    axes: std::collections::HashMap<(Entity, GamepadAxis), f32>,
+    buttons: std::collections::HashMap<(Entity, GamepadButton), f32>,
+}
+
+pub(crate) fn track_active_pad(
+    gamepads: Query<(Entity, &Gamepad, Option<&Name>)>,
+    mut events: MessageReader<GamepadEvent>,
+    mut active: ResMut<frame::ActivePad>,
+    mut devices: ResMut<frame::InputDevices>,
+    settings: Res<frame::GameSettings>,
+    windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
+    mut activity: Local<PadActivity>,
+) {
+    // bo2zm: CODLEGACY_INPUT_UNFOCUSED keeps a test run's console-held keys
+    // (+forward) working while its window is behind others.
+    static UNFOCUSED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    devices.focused = windows.single().map_or(true, |window| window.focused)
+        || *UNFOCUSED.get_or_init(|| codlegacy_env::var_os("CODLEGACY_INPUT_UNFOCUSED").is_some());
+    if active.0.is_some_and(|entity| gamepads.get(entity).is_err()) {
+        active.0 = None;
+    }
+    let PadActivity { axes, buttons } = &mut *activity;
+    axes.retain(|(entity, _), _| gamepads.contains(*entity));
+    buttons.retain(|(entity, _), _| gamepads.contains(*entity));
+    let mut connected = std::collections::HashSet::new();
+    for event in events.read() {
+        let activity = match event {
+            GamepadEvent::Connection(event) => {
+                if matches!(event.connection, GamepadConnection::Connected { .. }) {
+                    connected.insert(event.gamepad);
+                }
+                if matches!(event.connection, GamepadConnection::Disconnected) {
+                    axes.retain(|(entity, _), _| *entity != event.gamepad);
+                    buttons.retain(|(entity, _), _| *entity != event.gamepad);
+                    if active.0 == Some(event.gamepad) {
+                        active.0 = None;
+                    }
+                }
+                if matches!(event.connection, GamepadConnection::Connected { .. })
+                    && let Ok((_, pad, name)) = gamepads.get(event.gamepad)
+                {
+                    // Which pad (its maker and model pick the button pictures).
+                    diag::info!(
+                        Ui,
+                        "gamepad connected: {:?} vendor {:04x?} product {:04x?}",
+                        name.map(|n| n.as_str()),
+                        pad.vendor_id(),
+                        pad.product_id()
+                    );
+                    for axis in [
+                        GamepadAxis::LeftStickX,
+                        GamepadAxis::LeftStickY,
+                        GamepadAxis::RightStickX,
+                        GamepadAxis::RightStickY,
+                    ] {
+                        axes.insert((event.gamepad, axis), pad.get(axis).unwrap_or(0.0));
+                    }
+                }
+                None
+            }
+            GamepadEvent::Button(event) => {
+                let previous = buttons
+                    .insert((event.entity, event.button), event.value)
+                    .unwrap_or(0.0);
+                (event.value >= 0.55 && previous < 0.55).then_some(event.entity)
+            }
+            GamepadEvent::Axis(event) => {
+                let previous = axes.entry((event.entity, event.axis)).or_insert(0.0);
+                let deadzone = match event.axis {
+                    GamepadAxis::LeftStickX | GamepadAxis::LeftStickY => settings.pad_deadzone_left,
+                    _ => settings.pad_deadzone_right,
+                }
+                .max(0.15);
+                let meaningful =
+                    event.value.abs() > deadzone + 0.08 && (event.value - *previous).abs() > 0.12;
+                if meaningful || event.value.abs() < deadzone {
+                    *previous = event.value;
+                }
+                meaningful.then_some(event.entity)
+            }
+        };
+        // (A pad driver that shows one pad twice, such as DS4Windows without
+        // HidHide, sends every press and stick move from both: another pad
+        // takes over only while the one in use rests, so a turn held through
+        // a jump is never handed back and forth.)
+        let activity = activity.filter(|entity| {
+            active.0.filter(|a| a != entity).and_then(|a| gamepads.get(a).ok()).is_none_or(|(_, pad, _)| {
+                pad.left_stick().length() <= settings.pad_deadzone_left.max(0.15)
+                    && pad.right_stick().length() <= settings.pad_deadzone_right.max(0.15)
+            })
+        });
+        if let Some(entity) = activity.filter(|entity| {
+            devices.focused && !connected.contains(entity) && gamepads.contains(*entity)
+        }) {
+            if active.0.is_some_and(|a| a != entity) {
+                diag::info!(Ui, "gamepad: the pad in use changed (two pads connected)");
+            }
+            active.0 = Some(entity);
+            devices.pad_prompts = true;
+        }
+    }
+    if active.0.is_none() {
+        devices.pad_prompts = false;
+    }
+    // Test aid: CODLEGACY_FORCE_PAD_PROMPTS=xbox|ps shows pad prompts with no pad.
+    static FORCE: std::sync::OnceLock<Option<frame::PromptStyle>> = std::sync::OnceLock::new();
+    if let Some(style) = *FORCE.get_or_init(|| {
+        codlegacy_env::var("CODLEGACY_FORCE_PAD_PROMPTS")
+            .ok()
+            .map(|v| {
+                if v.eq_ignore_ascii_case("ps") {
+                    frame::PromptStyle::PlayStation
+                } else {
+                    frame::PromptStyle::Xbox
+                }
+            })
+    }) {
+        devices.pad_prompts = true;
+        devices.style = style;
+        return;
+    }
+    devices.style = match settings.pad_prompts {
+        1 => frame::PromptStyle::Xbox,
+        2 => frame::PromptStyle::PlayStation,
+        3 => frame::PromptStyle::Generic,
+        // bo2mp: Xbox buttons whatever the pad (PlayStation's only when
+        // picked in the options): the guess by the pad's name showed
+        // PlayStation's buttons for pads that are not one.
+        _ => frame::PromptStyle::Xbox,
+    };
+}
+
+const REPEAT_DELAY: f32 = 0.4;
+const REPEAT_EVERY: f32 = 0.12;
+
+pub(crate) fn drive_menus_with_pad(
+    gamepads: Query<&Gamepad>,
+    active: Res<frame::ActivePad>,
+    script_menus: Option<Res<hud::ScriptMenus>>,
+    (devices, console, capture): (
+        Res<frame::InputDevices>,
+        Res<crate::ConsoleState>,
+        Res<frame::UiBindingCapture>,
+    ),
+    time: Res<Time>,
+    mut requests: MessageWriter<UiMenuRequest>,
+    mut repeat: Local<Option<(UiMenuKey, f32)>>,
+) {
+    if !devices.focused || console.open {
+        *repeat = None;
+        return;
+    }
+    let pad = active
+        .0
+        .and_then(|entity| gamepads.get(entity).ok())
+        .filter(|_| capture.command.is_none());
+    let Some(pad) = pad else {
+        *repeat = None;
+        return;
+    };
+    if pad.just_pressed(GamepadButton::Start) {
+        requests.write(UiMenuRequest::Key(UiMenuKey::Escape));
+        *repeat = None;
+        return;
+    }
+    if !script_menus.is_some_and(|menus| menus.captures_input()) {
+        *repeat = None;
+        return;
+    }
+    if pad.just_pressed(GamepadButton::South) {
+        requests.write(UiMenuRequest::Key(UiMenuKey::Enter));
+    }
+    if pad.just_pressed(GamepadButton::East) {
+        requests.write(UiMenuRequest::Key(UiMenuKey::Escape));
+    }
+    let stick = pad.left_stick();
+    let direction = if pad.pressed(GamepadButton::DPadUp) || stick.y > 0.6 {
+        Some(UiMenuKey::Up)
+    } else if pad.pressed(GamepadButton::DPadDown) || stick.y < -0.6 {
+        Some(UiMenuKey::Down)
+    } else if pad.pressed(GamepadButton::DPadLeft) || stick.x < -0.6 {
+        Some(UiMenuKey::Left)
+    } else if pad.pressed(GamepadButton::DPadRight) || stick.x > 0.6 {
+        Some(UiMenuKey::Right)
+    } else {
+        None
+    };
+    let now = time.elapsed_secs();
+    let fire = match (direction, *repeat) {
+        (Some(key), Some((held, next))) if key == held => {
+            if now >= next {
+                *repeat = Some((key, now + REPEAT_EVERY));
+            }
+            now >= next
+        }
+        (Some(key), _) => {
+            *repeat = Some((key, now + REPEAT_DELAY));
+            true
+        }
+        (None, _) => {
+            *repeat = None;
+            false
+        }
+    };
+    if fire && let Some(key) = direction {
+        requests.write(UiMenuRequest::Key(key));
+    }
+}

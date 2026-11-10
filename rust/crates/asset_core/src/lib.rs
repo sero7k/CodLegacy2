@@ -1,0 +1,23 @@
+pub mod asset_key;
+pub mod ident;
+pub mod zone_game;
+pub mod t6_draw; // bo2zm
+pub mod weapon_camos; // bo2mp
+pub mod camo_pack; // bo2mp
+
+pub use asset_key::{AssetKey, AssetKeyError, AssetKind, AssetNamespace, MaterialKey};
+pub use ident::{
+    AssetEdge, AssetEdgeCensus, AssetEdgeReason, AssetRef, AssetRefCensus, BoundTarget,
+    CatalogIndex, FpvMeshIndex, FpvMeshSpace, FxIndex, FxModelIndex, FxModelSpace, FxSpace,
+    IndexSpace, LoadedSoundIndex, LoadedSoundSpace, MapXModelIndex, MapXModelSpace, MaterialIndex,
+    MaterialSpace, ProjectileModelIndex, ProjectileModelSpace, SoundAliasIndex, SoundAliasSpace,
+    TechniqueSetIndex, TechniqueSetSpace, TracerIndex, TracerSpace, WalkLocalMaterialIndex,
+    WorldWeaponIndex, WorldWeaponSpace, XAnimIndex, XAnimSpace, ZoneOwner, bound_zone_names,
+};
+pub use t6_draw::{
+    T6Blend, T6Cull, T6Draw, T6Layers, T6StateBits, T6_ANIM_SHIFT, T6Anim, bo2_shared_look,
+    bo2_shared_look_value, t6_anim_for_scroll_rate,
+    t6_anim_kind, t6_aniso, t6_fast, t6_set_aniso, t6_set_fast, t6_water_kind,
+    t6_world_material_name,
+};
+pub use zone_game::ZoneGame;

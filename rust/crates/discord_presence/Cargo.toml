@@ -1,0 +1,12 @@
+[package]
+name = "discord_presence"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Discord Rich Presence over Discord's local IPC (no SDK): what the player is doing, shown on their Discord profile."
+
+[dependencies]
+serde_json = "1"
+
+[lints]
+workspace = true

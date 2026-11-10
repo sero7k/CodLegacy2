@@ -1,0 +1,35 @@
+index	name	surfaceFlags_hex	table_flag_dword0	extra_contents_hex	note
+0	default	0x00000000	0	0x0	"no surface" / unnamed; also the fallback name returned for any index outside 1..30; BG penetration depth for type 0 is forced to 0
+1	bark	0x00100000	0	0x0	
+2	brick	0x00200000	0	0x0	
+3	carpet	0x00300000	0	0x0	
+4	cloth	0x00400000	0	0x0	
+5	concrete	0x00500000	0	0x0	
+6	dirt	0x00600000	0	0x0	
+7	flesh	0x00700000	0	0x0	
+8	foliage	0x00800000	1	0x2	
+9	glass	0x00900000	1	0x10	
+10	grass	0x00a00000	0	0x0	
+11	gravel	0x00b00000	0	0x0	
+12	ice	0x00c00000	0	0x0	
+13	metal	0x00d00000	0	0x0	
+14	metal_grate	0x00e00000	0	0x0	
+15	mud	0x00f00000	0	0x0	
+16	paper	0x01000000	0	0x0	
+17	plaster	0x01100000	0	0x0	
+18	rock	0x01200000	0	0x0	
+19	sand	0x01300000	0	0x0	
+20	snow	0x01400000	0	0x0	
+21	water	0x01500000	1	0x20	
+22	wood	0x01600000	0	0x0	
+23	asphalt	0x01700000	0	0x0	
+24	ceramic	0x01800000	0	0x0	
+25	plastic	0x01900000	0	0x0	
+26	rubber	0x01a00000	0	0x0	
+27	fruit	0x01b00000	0	0x0	
+28	paintedmetal	0x01c00000	0	0x0	
+29	riotshield	0x01d00000	0	0x0	
+30	slush	0x01e00000	0	0x0	
+31	cushion	0x00400000	0	0x0	alias of cloth(4): material-name keyword "cushion"
+32	opaqueglass	0x00900000	0	0x0	alias of glass(9): material-name keyword "opaqueglass" (no GLASS contents)
+33	clipmissile	0x00000000	1	0x80	not a surface type: material-name keyword "clipmissile" -> contents 0x80 only

@@ -1,0 +1,130 @@
+# Stand-ins for Modern Warfare III (2023) effects.
+#
+# MW3's own effects cannot be played yet (docs/JUP.md, "Effects"). Each MW3
+# effect, by name and category, plays an effect of a game we already play
+# properly: Black Ops III ("t7") or Modern Warfare Remastered / Horizon MW
+# ("h1").
+# Every name below was checked against the effect lists of the retail zones
+# (BO3: core_common, mp_common, mp_patch; MWR: common_mp, patch_common_mp,
+# common_core_mp), see `jup_fx_standin::tests::table_names_are_real_effects`.
+#
+# Columns (whitespace separated; # starts a comment):
+#   kind      override | rule | default
+#   pattern   override: the MW3 effect's whole path, lower case, no ".vfx"
+#             rule:     words that must each start a word of the path,
+#                       joined by + (a gun's request is
+#                       weapon/<item group>/<gun>/<slot>: the group's word
+#                       is assault cqb (shotguns) lmg pistol smg sniper, the
+#                       slot's muzzle flash shell eject impact explosion)
+#             default:  -
+#   category  muzzle_flash shell_eject impact explosion smoke fire spark
+#             dust water light decal vehicle other, or * for any
+#             (default rows: the category they are the default of)
+#   source    t7 | h1 | -   (- = deliberately no stand-in)
+#   effect    =name      the effect of that exact name; for an impact, the
+#                        name of a Black Ops III ImpactFx table
+#                        (bullet_small_enter), whose per-surface effects play
+#                        (its _exit table is the bullet coming out)
+#             =name|view the same with the first-person effect after the |
+#                        (a gun's flash and eject have a world and a view
+#                        effect in the stand-in's game)
+#             ~a+b       the source's effect whose name holds all of a, b
+#                        (shortest first; picked when the source's effect
+#                        list is at hand); `|` as above
+#             -          none
+#
+# Order: the first override that names the path, else the first rule whose
+# words are all in the path (and whose category fits), else the category's
+# default. Rules go before defaults because the keywords see what the
+# category word cannot (a bullet hit on water is an impact to the
+# classifier and a splash to the eye; mud_splash is dust to it).
+
+# ---- overrides: where the keywords pick badly -------------------------------
+# (none yet: add `override <path> <category> <source> <effect>` rows here as
+# paths are checked against a zone)
+
+# ---- rules: what the name says beyond its category ---------------------------
+# water and wet surfaces first (bullet_hit_water is "impact" by name)
+rule  mud+splash       *  h1  =vfx/treadfx/footstep_mud
+rule  splash           *  h1  =vfx/water/water_splash_small
+rule  water+splash     *  h1  =vfx/water/water_splash_small
+rule  impact+water     *  h1  =vfx/water/water_splash_small
+rule  hit+water        *  h1  =vfx/water/water_splash_small
+rule  bullet+water     *  h1  =vfx/water/water_splash_small
+rule  puddle           *  t7  =water/fx_water_impact_ripple_md
+rule  ripple           *  t7  =water/fx_water_impact_ripple_md
+rule  wake             *  t7  =water/fx_water_impact_ripple_md
+# (neither game has rain, drips, steam or mist among the effects it loads)
+rule  rain             *  -   -
+rule  drip             *  -   -
+rule  steam            *  -   -
+rule  mist             *  -   -
+rule  fog              *  -   -
+rule  blood            *  t7  =blood/fx_blood_impact_exp_body_lg
+rule  flesh            *  t7  =blood/fx_blood_impact_exp_body_lg
+rule  gore             *  t7  =blood/fx_blood_impact_exp_body_lg
+# a gun's muzzle flash by item group: world effect | first-person effect
+rule  muzzle+sniper    *  h1  =fx/muzzleflashes/heavy|fx/muzzleflashes/heavy_view
+rule  muzzle+cqb       *  h1  =fx/muzzleflashes/shotgunflash|fx/muzzleflashes/shotgunflash_view
+rule  muzzle+smg       *  h1  =fx/muzzleflashes/light_flash_wv_a|fx/muzzleflashes/mp5_flash_view
+rule  muzzle+lmg       *  h1  =fx/muzzleflashes/saw_flash_wv|fx/muzzleflashes/saw_flash_view
+rule  muzzle+pistol    *  h1  =fx/muzzleflashes/pistolflash|fx/muzzleflashes/pistolflash_view
+rule  muzzle+assault   *  h1  =fx/muzzleflashes/rifleflash|fx/muzzleflashes/rifle_flash_view
+# and its ejected brass
+rule  shell+sniper     *  h1  =vfx/shelleject/sniper_50cal|vfx/shelleject/sniper_view
+rule  shell+cqb        *  h1  =vfx/shelleject/shotgun|vfx/shelleject/shotgun_view
+rule  shell+smg        *  h1  =vfx/shelleject/pistol|vfx/shelleject/pistol_view
+rule  shell+lmg        *  h1  =vfx/shelleject/saw|vfx/shelleject/saw_view
+rule  shell+pistol     *  h1  =vfx/shelleject/pistol|vfx/shelleject/pistol_view
+rule  shell+assault    *  h1  =vfx/shelleject/rifle|vfx/shelleject/rifle_view
+# bullet impacts by item group and by name (ImpactFx tables of Black Ops III)
+rule  impact+cqb       *  t7  =shotgun_enter
+rule  impact+sniper    *  t7  =bullet_large_enter
+rule  impact+shotgun   *  t7  =shotgun_enter
+rule  impact+xlarge    *  t7  =bullet_xlarge_enter
+rule  impact+50cal     *  t7  =bullet_xlarge_enter
+rule  impact+large     *  t7  =bullet_large_enter
+rule  impact+knife     *  t7  =knife_large_enter
+rule  impact+grenade   *  t7  =grenade_bounce
+# explosions
+rule  explosion+launcher *  t7  =explosions/fx_exp_rocket_default
+rule  exp+rocket       *  t7  =explosions/fx_exp_rocket_default
+rule  exp+missile      *  t7  =explosions/fx_exp_rocket_default
+rule  exp+airstrike    *  t7  =explosions/fx_exp_rocket_default
+rule  exp+bomb         *  t7  =explosions/fx_exp_rocket_default
+rule  exp+chopper      *  t7  =explosions/fx_exp_rocket_default
+rule  exp+heli         *  t7  =explosions/fx_exp_rocket_default
+rule  exp+grenade      *  t7  =explosions/fx_exp_grenade_default
+rule  exp+frag         *  t7  =explosions/fx_exp_grenade_default
+rule  exp+c4           *  t7  =explosions/fx_exp_grenade_default
+rule  exp+mine         *  t7  =explosions/fx_exp_grenade_default
+# fire, smoke, sparks, embers
+rule  molotov          *  h1  =vfx/fire/fire_xs_runner_10s
+rule  thermite         *  h1  =vfx/fire/fire_xs_runner_10s
+rule  flame            *  h1  =vfx/fire/fire_xs_runner_10s
+rule  burning          *  h1  =vfx/fire/fire_xs_runner_10s
+rule  smoke+grenade    *  h1  =vfx/smoke/smoke_grenade_mp
+rule  smoke+stack      *  h1  =vfx/trail/trail_smk_black_heli
+rule  weld             *  h1  =vfx/sparks/spark_metalhit_quick_sm
+rule  electr           *  t7  =electric/fx_elec_sparks_burst_xsm_omni_blue_os
+rule  spark            *  h1  =vfx/sparks/spark_metalhit_quick_sm
+rule  ember            *  h1  =vfx/fire/embers_burst_sml_01
+# no good match
+rule  decal            *  -   -
+rule  lens             *  -   -
+rule  veh+dmg          *  -   -
+
+# ---- defaults: one per category ----------------------------------------------
+default  -  muzzle_flash  h1  =fx/muzzleflashes/rifleflash|fx/muzzleflashes/rifle_flash_view
+default  -  shell_eject   h1  =vfx/shelleject/rifle|vfx/shelleject/rifle_view
+default  -  impact        t7  =bullet_small_enter
+default  -  explosion     t7  =explosions/fx_exp_grenade_default
+default  -  smoke         -   -
+default  -  fire          h1  =vfx/fire/fire_xs_runner_10s
+default  -  spark         h1  =vfx/sparks/spark_metalhit_quick_sm
+default  -  dust          -   -
+default  -  water         h1  =vfx/water/water_splash_small
+default  -  light         -   -
+default  -  decal         -   -
+default  -  vehicle       -   -
+default  -  other         -   -

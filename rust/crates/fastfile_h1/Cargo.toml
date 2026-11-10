@@ -1,0 +1,19 @@
+[package]
+name = "fastfile_h1"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Call of Duty: Modern Warfare Remastered (H1, PC x64) zones, incl. Horizon MW usermaps: the exact asset walk, maps and guns."
+
+[dependencies]
+codlegacy_env.workspace = true
+lz4_flex.workspace = true
+miniz_oxide.workspace = true
+bcdec_rs.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+png.workspace = true
+fx_iw4.workspace = true

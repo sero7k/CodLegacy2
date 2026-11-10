@@ -1,0 +1,634 @@
+//! The loader's view of the zone: one stream of bytes read in order, each
+//! allocation landing in the block on top of a block stack.
+//!
+//! Every block keeps its own position. The file has no padding, but the
+//! loader rounds the current block's position up to each allocation's
+//! alignment (`align(mask)`, mask = alignment - 1) before taking it, so
+//! the VIRTUAL offsets that later references name (`ptr.rs`) are the
+//! aligned ones. Blocks that take no file bytes (`STREAMER`, the runtime
+//! blocks) only move their position.
+//!
+//! Read on retail zones (`walk` checks every reference against it, and at
+//! the end of a zone the block positions against the header's sizes):
+//! * the `XAssetList` (48 bytes) and each asset's top-level struct are in
+//!   TEMP (the header's TEMP size is 0x30 + the largest asset header:
+//!   0x220e0 = 0x30 + SndBank's 0x220b0), also for sub-assets loaded
+//!   through a pointer; everything they point to is in VIRTUAL, the script
+//!   string and asset tables included;
+//! * PHYSICAL holds GPU data with file bytes: image pixels, material
+//!   constant buffer init data, non-streamed mesh vertex/index data and
+//!   lens flare buffers (all aligned 256; lens flare curves 16); STREAMER
+//!   (no file bytes) streamed images' pixels (its total is not exact yet);
+//! * strings take no alignment; most arrays their element's natural x64
+//!   one, with type-specific exceptions in the walkers (rawfile buffers
+//!   16, script buffers 32, sampler tables, brushes, collision geoms, FX
+//!   lens flare elements 16, sound snapshots 32, ...); an empty array
+//!   (`-1`, count 0) still aligns (but an empty sound snapshot array);
+//! * an "insert" pointer (`-2`) to an asset first takes an 8-byte,
+//!   8-aligned VIRTUAL slot (no file bytes) that later references name
+//!   (inline technique sets in materials, LOD meshes in models); a `-1`
+//!   asset pointer in a VIRTUAL struct is itself what later references
+//!   name; a `-2` to runtime data (a light description's 0x218) takes none;
+//! * references to PHYSICAL data (`6 << 60 | offset + 1`) occur too
+//!   (shared constant buffer init data; a lens flare's header naming its
+//!   own buffers before loading them, checked at the end of the walk).
+//!
+//! With these rules, `mp_common`, `mp_patch`, `core_post_gfx`,
+//! `en_core_common`, `en_mp_common` and `en_mp_patch` end VIRTUAL and
+//! PHYSICAL exactly at the header's sizes with every reference landing.
+
+use std::collections::{HashMap, HashSet};
+
+use crate::cursor::{MAX_STRING, ReadError, Result};
+use crate::ptr::Ptr;
+
+pub const BLOCK_COUNT: usize = 10;
+// Black Ops III's `XFileBlock`s (the order of the header's block sizes).
+pub const TEMP: u8 = 0;
+pub const RUNTIME_VIRTUAL: u8 = 1;
+pub const RUNTIME_PHYSICAL: u8 = 2;
+pub const DELAY_VIRTUAL: u8 = 3;
+pub const DELAY_PHYSICAL: u8 = 4;
+pub const VIRTUAL: u8 = 5;
+pub const PHYSICAL: u8 = 6;
+pub const STREAMER_RESERVE: u8 = 7;
+pub const STREAMER: u8 = 8;
+pub const MEMMAPPED: u8 = 9;
+
+/// Blocks whose data is not in the file.
+pub const fn is_fileless(block: u8) -> bool {
+    matches!(block, RUNTIME_VIRTUAL | RUNTIME_PHYSICAL | STREAMER_RESERVE | STREAMER)
+}
+
+/// One contiguous run of VIRTUAL data read from the file.
+#[derive(Clone, Copy, Debug)]
+struct Segment {
+    virt: u64,
+    pos: usize,
+    len: u64,
+}
+
+/// File offsets of VIRTUAL data, both ways.
+#[derive(Default, Debug)]
+pub struct VirtualMap {
+    segs: Vec<Segment>,
+}
+
+impl VirtualMap {
+    fn add(&mut self, virt: u64, pos: usize, len: u64) {
+        if len == 0 {
+            return;
+        }
+        if let Some(last) = self.segs.last_mut()
+            && last.virt + last.len == virt
+            && last.pos as u64 + last.len == pos as u64
+        {
+            last.len += len;
+            return;
+        }
+        self.segs.push(Segment { virt, pos, len });
+    }
+
+    /// The file offset of VIRTUAL offset `virt`, if it was read from the file.
+    pub fn file_pos(&self, virt: u64) -> Option<usize> {
+        let i = self.segs.partition_point(|s| s.virt <= virt).checked_sub(1)?;
+        let s = self.segs[i];
+        (virt < s.virt + s.len).then(|| s.pos + (virt - s.virt) as usize)
+    }
+
+    /// The VIRTUAL offset of file offset `pos`, if VIRTUAL data was read there.
+    pub fn virt_of(&self, pos: usize) -> Option<u64> {
+        let i = self.segs.partition_point(|s| s.pos <= pos).checked_sub(1)?;
+        let s = self.segs[i];
+        ((pos - s.pos) < s.len as usize).then(|| s.virt + (pos - s.pos) as u64)
+    }
+}
+
+/// How the references read so far landed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RefStats {
+    /// References to VIRTUAL (or PHYSICAL) data read earlier that land on
+    /// the start of an allocation, a string or a pointer slot.
+    pub resolved: usize,
+    /// References into data read earlier that land elsewhere (drift).
+    pub unresolved: usize,
+    /// References past what has been read by the end of the walk (a
+    /// reference to data the same asset loads later, like a lens flare's
+    /// buffers, is checked once the walk is done and counted as resolved
+    /// or unresolved).
+    pub forward: usize,
+    /// References to blocks other than VIRTUAL and PHYSICAL.
+    pub other_block: usize,
+}
+
+/// Debug: `T7_TRACE=<hex from>,<hex to>` prints every allocation whose
+/// file offset is in the range.
+fn trace_range() -> Option<(usize, usize)> {
+    use std::sync::OnceLock;
+    static RANGE: OnceLock<Option<(usize, usize)>> = OnceLock::new();
+    *RANGE.get_or_init(|| {
+        let v = std::env::var("T7_TRACE").ok()?;
+        let (a, b) = v.split_once(',')?;
+        Some((usize::from_str_radix(a, 16).ok()?, usize::from_str_radix(b, 16).ok()?))
+    })
+}
+
+#[derive(Debug)]
+pub struct Stream<'a> {
+    data: &'a [u8],
+    pos: usize,
+    stack: Vec<u8>,
+    off: [u64; BLOCK_COUNT],
+    pub vmap: VirtualMap,
+    /// bo2mp: file offsets of PHYSICAL data, as `vmap` (a material constant
+    /// buffer's initial data named by a reference to an earlier one's).
+    pub pmap: VirtualMap,
+    /// VIRTUAL offsets where allocations, strings and pointer slots start.
+    starts: HashSet<u64>,
+    /// PHYSICAL offsets where allocations start.
+    phys_starts: HashSet<u64>,
+    pub refs: RefStats,
+    /// The first unresolved reference: (file offset of the pointer, block offset).
+    pub first_unresolved: Option<(usize, u64)>,
+    /// The assets loaded so far by the VIRTUAL slot that later references
+    /// name: (type, name). Table entries and inline sub-assets.
+    pub named: HashMap<u64, (crate::AssetType, String)>,
+    /// Debug (`T7_DRIFT`): the unresolved references (field, target).
+    /// Also kept when `keep_misses` is set (the walk fits the VIRTUAL
+    /// size of the gaps it steps over from them, `walk::gap`).
+    pub misses: Vec<(usize, u64)>,
+    pub keep_misses: bool,
+    /// What the walk keeps (weapons).
+    pub capture: crate::walk::capture::Capture,
+    injected: usize,
+    /// Forward references, checked by `settle_forward`: (field, block, offset).
+    pending: Vec<(usize, u8, u64)>,
+}
+
+impl<'a> Stream<'a> {
+    pub fn new(data: &'a [u8]) -> Self {
+        Self {
+            data,
+            pos: 0,
+            stack: vec![TEMP],
+            off: [0; BLOCK_COUNT],
+            vmap: VirtualMap::default(),
+            pmap: VirtualMap::default(),
+            starts: HashSet::new(),
+            phys_starts: HashSet::new(),
+            named: HashMap::new(),
+            misses: Vec::new(),
+            keep_misses: false,
+            capture: Default::default(),
+            injected: 0,
+            pending: Vec::new(),
+            refs: RefStats::default(),
+            first_unresolved: None,
+        }
+    }
+
+    pub fn data(&self) -> &'a [u8] {
+        self.data
+    }
+    pub fn pos(&self) -> usize {
+        self.pos
+    }
+    /// Debug: moves the stream to file offset `pos`.
+    pub fn seek(&mut self, pos: usize) {
+        self.pos = pos;
+    }
+    pub fn block(&self) -> u8 {
+        *self.stack.last().unwrap_or(&TEMP)
+    }
+    pub fn offset(&self, block: u8) -> u64 {
+        self.off[block as usize]
+    }
+    pub fn depth(&self) -> usize {
+        self.stack.len()
+    }
+
+    pub fn push(&mut self, block: u8) {
+        self.stack.push(block);
+    }
+    pub fn pop(&mut self) {
+        if self.stack.len() > 1 {
+            self.stack.pop();
+        }
+    }
+
+    /// Rounds the current block's position up to `mask + 1`.
+    pub fn align(&mut self, mask: u64) {
+        let b = self.block() as usize;
+        self.off[b] = (self.off[b] + mask) & !mask;
+    }
+
+    /// Takes `len` bytes in the current block after aligning to `mask + 1`;
+    /// the file offset (`None` in a block without file bytes).
+    #[track_caller]
+    pub fn alloc(&mut self, len: usize, mask: u64) -> Result<Option<usize>> {
+        let mask = site_mask(std::panic::Location::caller(), mask, self.pos);
+        if self.block() == VIRTUAL {
+            let list = inject();
+            while self.injected < list.len() && self.pos >= list[self.injected].0 {
+                let n = list[self.injected].1;
+                self.off[VIRTUAL as usize] = (self.off[VIRTUAL as usize] as i64 + n) as u64;
+                self.injected += 1;
+            }
+        }
+        self.align(mask);
+        let b = self.block();
+        let v = self.off[b as usize];
+        self.off[b as usize] += len as u64;
+        if is_fileless(b) {
+            return Ok(None);
+        }
+        let at = self.pos;
+        let end = at.checked_add(len).ok_or(ReadError::Eof(at))?;
+        if end > self.data.len() {
+            return Err(ReadError::Eof(at));
+        }
+        self.pos = end;
+        if let Some((a, z)) = trace_range()
+            && (a..z).contains(&at)
+        {
+            let site = std::panic::Location::caller();
+            eprintln!(
+                "ALLOC file {at:#x} len {len:#x} block {b} off {v:#x} mask {mask:#x} at {}:{}",
+                site.file().rsplit(['/', '\\']).next().unwrap_or(""),
+                site.line()
+            );
+        }
+        if b == VIRTUAL {
+            self.vmap.add(v, at, len as u64);
+            self.starts.insert(v);
+        } else if b == PHYSICAL {
+            self.phys_starts.insert(v);
+            self.pmap.add(v, at, len as u64);
+        }
+        Ok(Some(at))
+    }
+
+    /// `alloc` of data that must be in the file.
+    #[track_caller]
+    pub fn load(&mut self, len: usize, mask: u64) -> Result<usize> {
+        let at = self.pos;
+        self.alloc(len, mask)?.ok_or(ReadError::Invalid("file data in a block without file bytes", at))
+    }
+
+    /// A NUL-terminated string in the current block: (bytes, file offset).
+    #[track_caller]
+    pub fn cstr(&mut self) -> Result<(&'a [u8], usize)> {
+        let at = self.pos;
+        let window = self.data.get(at..).unwrap_or(&[]);
+        let n = window
+            .iter()
+            .take(MAX_STRING * 16)
+            .position(|&b| b == 0)
+            .ok_or(if window.len() < MAX_STRING * 16 { ReadError::Eof(at) } else { ReadError::BadString(at) })?;
+        self.load(n + 1, 0)?;
+        Ok((&self.data[at..at + n], at))
+    }
+
+    /// The VIRTUAL starts (allocations, strings, slots) at or after `from`, sorted.
+    pub fn starts_from(&self, from: u64) -> Vec<u64> {
+        let mut v: Vec<u64> = self.starts.iter().copied().filter(|&x| x >= from).collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// Moves the current block's position without file bytes.
+    pub fn skip(&mut self, len: u64) {
+        let b = self.block() as usize;
+        self.off[b] += len;
+    }
+
+    /// The 8-byte VIRTUAL slot an "insert" pointer takes; its offset.
+    pub fn insert_slot(&mut self) -> u64 {
+        let v = (self.off[VIRTUAL as usize] + 7) & !7;
+        if let Some((a, z)) = trace_range()
+            && (a..z).contains(&self.pos)
+        {
+            eprintln!("SLOT at file {:#x} off {v:#x}", self.pos);
+        }
+        self.off[VIRTUAL as usize] = v + 8;
+        self.starts.insert(v);
+        v
+    }
+
+    /// Checks the forward references against what the walk read after
+    /// them: those that now land on a start count as resolved, those that
+    /// land mid-data as unresolved; the rest stay forward.
+    pub fn settle_forward(&mut self) {
+        for (field, block, offset) in std::mem::take(&mut self.pending) {
+            if offset >= self.off[block as usize] {
+                continue;
+            }
+            self.refs.forward -= 1;
+            let hit = if block == PHYSICAL {
+                self.phys_starts.contains(&offset)
+            } else {
+                self.starts.contains(&offset)
+            };
+            if hit {
+                self.refs.resolved += 1;
+            } else {
+                self.refs.unresolved += 1;
+                if std::env::var_os("T7_MISSES").is_some() {
+                    eprintln!("MISS forward field {field:#x} block {block} want {offset:#x}");
+                }
+                if self.keep_misses && block == VIRTUAL {
+                    self.misses.push((field, offset));
+                }
+                if self.first_unresolved.is_none() {
+                    self.first_unresolved = Some((field, offset));
+                }
+            }
+        }
+    }
+
+    /// Marks the pointer field at file offset `field` as a slot later
+    /// references may name (a field that loaded an asset).
+    pub fn mark_slot(&mut self, field: usize) {
+        if let Some(v) = self.vmap.virt_of(field) {
+            self.starts.insert(v);
+        }
+    }
+
+    /// Records that the asset pointer at file offset `field` loaded `ty` `name`.
+    pub fn name_slot(&mut self, field: usize, ty: crate::AssetType, name: &str) {
+        if let Some(v) = self.vmap.virt_of(field) {
+            self.named.insert(v, (ty, name.to_string()));
+        }
+    }
+
+    /// Debug (`T7_DRIFT`): groups the unresolved references by target, 64
+    /// at a time, and prints the shift that lands most of each group on
+    /// starts (where our VIRTUAL count and the zone's part ways).
+    pub fn print_drift(&self) {
+        // (`T7_DRIFT_EACH=1`: the first 400 misses by target, with the
+        // nearest starts below and above: where a miscount begins.)
+        if std::env::var_os("T7_DRIFT_EACH").is_some() {
+            let mut m = self.misses.clone();
+            m.sort_by_key(|x| x.1);
+            for (f, t) in m.iter().take(400) {
+                let below = (1..0x400u64).find(|d| self.starts.contains(&(t - d)));
+                let above = (1..0x400u64).find(|d| self.starts.contains(&(t + d)));
+                eprintln!("MISS field {f:#x} target {t:#x} start below -{below:x?} above +{above:x?} file {:x?}", self.vmap.file_pos(*t));
+            }
+        }
+        let mut m = self.misses.clone();
+        m.sort_by_key(|x| x.1);
+        for g in m.chunks(32) {
+            let best = (-0x300i64..0x300)
+                .map(|d| (g.iter().filter(|x| self.starts.contains(&((x.1 as i64 - d) as u64))).count(), d))
+                .max_by_key(|x| (x.0, -x.1.abs()));
+            if let Some((n, d)) = best {
+                let at = self.vmap.file_pos((g[0].1 as i64 - d) as u64);
+                eprintln!("DRIFT targets {:#x}..{:#x} (file {:x?}): shift {d:#x} lands {n} of {}", g[0].1, g[g.len() - 1].1, at, g.len());
+            }
+        }
+    }
+
+    /// The asset a reference at VIRTUAL `virt` names, if it was loaded through a slot there.
+    pub fn named_at(&self, virt: u64) -> Option<&(crate::AssetType, String)> {
+        self.named.get(&virt)
+    }
+
+    /// bo2mp: the asset of type `ty` named at the slot nearest `virt`
+    /// within `window` bytes, when exactly one is: a reference whose slot
+    /// our VIRTUAL count put a few bytes off (a mod-tools Workshop zone's
+    /// sky box model naming the shared `t6_skybox` mesh another sky box
+    /// loaded 0x10 before: Summit's sky was not drawn, 2026-10-26).
+    pub fn named_near(&self, virt: u64, ty: crate::AssetType, window: u64) -> Option<&(crate::AssetType, String)> {
+        let mut hits = (virt.saturating_sub(window)..=virt + window).step_by(8).filter_map(|v| self.named.get(&v).filter(|n| n.0 == ty).map(|n| (v.abs_diff(virt), n)));
+        let first = hits.next()?;
+        if hits.next().is_some() {
+            return None;
+        }
+        Some(first.1)
+    }
+
+    /// Counts a reference read at file offset `field`.
+    pub fn note_ref(&mut self, field: usize, p: Ptr) {
+        let Ptr::Ref { block, offset } = p else { return };
+        if let Some(range) = std::env::var("T7_REFLOG").ok().and_then(|r| {
+            let (a, b) = r.split_once(',')?;
+            Some(usize::from_str_radix(a, 16).ok()?..usize::from_str_radix(b, 16).ok()?)
+        }) && range.contains(&field)
+        {
+            let text = self.string_at(offset).map(|t| String::from_utf8_lossy(&t[..t.len().min(40)]).into_owned());
+            eprintln!(
+                "REF field {field:#x} block {block} -> {offset:#x} start {} now {:#x} {text:?}",
+                self.starts.contains(&offset),
+                self.off[VIRTUAL as usize]
+            );
+        }
+        if block == PHYSICAL {
+            if offset >= self.off[PHYSICAL as usize] {
+                self.refs.forward += 1;
+                self.pending.push((field, block, offset));
+            } else if self.phys_starts.contains(&offset) {
+                self.refs.resolved += 1;
+            } else {
+                self.refs.unresolved += 1;
+                if self.first_unresolved.is_none() {
+                    self.first_unresolved = Some((field, offset));
+                }
+            }
+            return;
+        }
+        if block != VIRTUAL {
+            self.refs.other_block += 1;
+            if self.refs.other_block <= 5 && std::env::var_os("T7_MISSES").is_some() {
+                eprintln!("OTHER field {field:#x} block {block} offset {offset:#x} (now {:#x})", self.off[block as usize]);
+            }
+        } else if offset >= self.off[VIRTUAL as usize] {
+            self.refs.forward += 1;
+            self.pending.push((field, block, offset));
+        } else if self.starts.contains(&offset) {
+            self.refs.resolved += 1;
+        } else {
+            self.refs.unresolved += 1;
+            // (`T7_MISSES=all`: every one, not the first 200.)
+            if std::env::var("T7_MISSES").is_ok_and(|v| self.refs.unresolved <= 200 || v == "all") {
+                let near = (offset.saturating_sub(64)..offset + 64).filter(|v| self.starts.contains(v)).collect::<Vec<_>>();
+                eprintln!(
+                    "MISS field {field:#x} (virt {:x?}) want {offset:#x} (file {:x?}) virt now {:#x} starts near {near:x?}",
+                    self.vmap.virt_of(field),
+                    self.vmap.file_pos(offset),
+                    self.off[VIRTUAL as usize]
+                );
+            }
+            if self.keep_misses || std::env::var_os("T7_DRIFT").is_some() {
+                self.misses.push((field, offset));
+            }
+            if self.first_unresolved.is_none() {
+                self.first_unresolved = Some((field, offset));
+            }
+        }
+    }
+
+    /// bo2mp: whether an allocation, string or slot starts at VIRTUAL `virt`.
+    pub fn is_start(&self, virt: u64) -> bool {
+        self.starts.contains(&virt)
+    }
+
+    /// The text of a string read earlier at VIRTUAL `virt`.
+    pub fn string_at(&self, virt: u64) -> Option<&'a [u8]> {
+        self.cstr_at(self.vmap.file_pos(virt)?)
+    }
+
+    /// bo2mp: the NUL-terminated string at file offset `at` (read earlier;
+    /// nothing is loaded).
+    pub fn cstr_at(&self, at: usize) -> Option<&'a [u8]> {
+        let n = self.data.get(at..)?.iter().take(MAX_STRING).position(|&b| b == 0)?;
+        Some(&self.data[at..at + n])
+    }
+
+    fn bytes(&self, at: usize, n: usize) -> Result<&'a [u8]> {
+        self.data.get(at..at.checked_add(n).ok_or(ReadError::Eof(at))?).ok_or(ReadError::Eof(at))
+    }
+    pub fn slice(&self, at: usize, n: usize) -> Result<&'a [u8]> {
+        self.bytes(at, n)
+    }
+    pub fn u8_at(&self, at: usize) -> Result<u8> {
+        Ok(self.bytes(at, 1)?[0])
+    }
+    pub fn u16_at(&self, at: usize) -> Result<u16> {
+        let b = self.bytes(at, 2)?;
+        Ok(u16::from_le_bytes([b[0], b[1]]))
+    }
+    pub fn u32_at(&self, at: usize) -> Result<u32> {
+        let b = self.bytes(at, 4)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+    pub fn i32_at(&self, at: usize) -> Result<i32> {
+        Ok(self.u32_at(at)? as i32)
+    }
+    pub fn f32_at(&self, at: usize) -> Result<f32> {
+        Ok(f32::from_bits(self.u32_at(at)?))
+    }
+    pub fn u64_at(&self, at: usize) -> Result<u64> {
+        let b = self.bytes(at, 8)?;
+        let mut a = [0u8; 8];
+        a.copy_from_slice(b);
+        Ok(u64::from_le_bytes(a))
+    }
+    pub fn ptr_at(&self, at: usize) -> Result<Ptr> {
+        Ok(Ptr::decode(self.u64_at(at)?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blocks_count_apart() {
+        let data = b"abcd\0efghijklmnop".to_vec();
+        let mut s = Stream::new(&data);
+        s.push(VIRTUAL);
+        s.alloc(3, 0).unwrap();
+        s.seek(0);
+        let (str_, at) = s.cstr().unwrap();
+        assert_eq!((str_, at), (&b"abcd"[..], 0));
+        assert_eq!(s.offset(VIRTUAL), 8);
+        assert_eq!(s.vmap.file_pos(3), Some(0));
+        s.push(STREAMER);
+        assert_eq!(s.alloc(100, 0).unwrap(), None);
+        s.pop();
+        assert_eq!(s.alloc(4, 7).unwrap(), Some(5));
+        assert_eq!(s.offset(VIRTUAL), 12);
+        s.note_ref(0, Ptr::Ref { block: VIRTUAL, offset: 3 });
+        s.note_ref(0, Ptr::Ref { block: VIRTUAL, offset: 4 });
+        s.note_ref(0, Ptr::Ref { block: VIRTUAL, offset: 40 });
+        assert_eq!(s.refs, RefStats { resolved: 1, unresolved: 1, forward: 1, other_block: 0 });
+    }
+}
+
+/// Debug: `T7_SITE=file:line=mask;...` overrides the alignment
+/// of the allocations made at a walker line; `T7_SITESTAT=<hex from>,<hex to>`
+/// counts the allocations per line in that file range, and
+/// `T7_SITERANGE=<hex from>,<hex to>` limits `T7_SITE` to that range.
+/// For finding which allocation rule a drift comes from.
+fn site_mask(loc: &std::panic::Location, mask: u64, pos: usize) -> u64 {
+    use std::sync::{Mutex, OnceLock};
+    static MAP: OnceLock<HashMap<String, u64>> = OnceLock::new();
+    static STAT: OnceLock<Option<(usize, usize)>> = OnceLock::new();
+    static COUNTS: Mutex<Vec<(String, u64, usize)>> = Mutex::new(Vec::new());
+    let m = MAP.get_or_init(|| {
+        std::env::var("T7_SITE")
+            .unwrap_or_else(|_| String::new())
+            .split(';')
+            .filter_map(|kv| {
+                let (k, v) = kv.rsplit_once('=')?;
+                Some((k.to_string(), v.parse().ok()?))
+            })
+            .collect()
+    });
+    let key = || {
+        format!(
+            "{}:{}",
+            loc.file().rsplit('/').next().unwrap_or(""),
+            loc.line()
+        )
+    };
+    if let Some((a, b)) = *STAT.get_or_init(|| {
+        let v = std::env::var("T7_SITESTAT").ok()?;
+        let (a, b) = v.split_once(',')?;
+        Some((
+            usize::from_str_radix(a, 16).ok()?,
+            usize::from_str_radix(b, 16).ok()?,
+        ))
+    }) {
+        if (a..b).contains(&pos) {
+            let k = key();
+            let mut c = COUNTS.lock().unwrap();
+            match c.iter_mut().find(|x| x.0 == k && x.1 == mask) {
+                Some(x) => x.2 += 1,
+                None => c.push((k, mask, 1)),
+            }
+        } else if pos >= b {
+            let mut c = COUNTS.lock().unwrap();
+            for (k, m, n) in c.drain(..) {
+                eprintln!("SITE {k} mask {m} count {n}");
+            }
+        }
+    }
+    if m.is_empty() {
+        return mask;
+    }
+    static RANGE: OnceLock<Option<(usize, usize)>> = OnceLock::new();
+    if let Some((a, b)) = *RANGE.get_or_init(|| {
+        let v = std::env::var("T7_SITERANGE").ok()?;
+        let (a, b) = v.split_once(',')?;
+        Some((
+            usize::from_str_radix(a, 16).ok()?,
+            usize::from_str_radix(b, 16).ok()?,
+        ))
+    }) && !(a..b).contains(&pos)
+    {
+        return mask;
+    }
+    m.get(&key()).copied().unwrap_or(mask)
+}
+
+/// Debug: `T7_INJECT=<hex file offset>:<signed decimal bytes>;...`
+/// (sorted) moves VIRTUAL by that many bytes at the first VIRTUAL
+/// allocation from each file offset on.
+fn inject() -> &'static [(usize, i64)] {
+    use std::sync::OnceLock;
+    static V: OnceLock<Vec<(usize, i64)>> = OnceLock::new();
+    V.get_or_init(|| {
+        let mut v: Vec<(usize, i64)> = std::env::var("T7_INJECT")
+            .unwrap_or_else(|_| String::new())
+            .split(';')
+            .filter_map(|kv| {
+                let (a, b) = kv.split_once(':')?;
+                Some((usize::from_str_radix(a, 16).ok()?, b.parse().ok()?))
+            })
+            .collect();
+        v.sort();
+        v
+    })
+}

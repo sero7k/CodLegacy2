@@ -1,0 +1,1818 @@
+#![forbid(unsafe_code)]
+//! The master service: the standalone `codlegacy-master` binary, and the same
+//! service embedded in a game hosting a peer-to-peer custom game
+//! (`run_embedded`): one room, joined only by players holding its invite.
+
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufReader, Write};
+use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+use master_protocol::{
+    ALPN, AdmissionFailure, Advert, AdvertId, Channel, ControlFrame, ControlHello, ControlRequest,
+    ControlResponse, EndpointRole, MAX_BOOTSTRAP_STREAM_BYTES, MAX_CONCURRENT_BOOTSTRAP,
+    FriendStatus, MAX_FRIENDS, MAX_LIST_ADVERTS, MAX_RELAY_UNI_STREAMS, MemberId, PeerEvent, RelayDatagram, RequestBody,
+    ResponseBody, RoomPhase, RoomView, SESSION_IDLE, SESSION_KEEP_ALIVE, ServiceError,
+    SessionCloseReason, StatusResponse, decode_relay, decode_relay_stream, decode_stream_payload,
+    encode_relay, encode_relay_stream, encode_stream_frame, stream_frame_len,
+};
+use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls_platform_verifier::ConfigVerifierExt;
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{Mutex, Semaphore};
+
+pub type Error = Box<dyn std::error::Error + Send + Sync>;
+pub type Result<T> = std::result::Result<T, Error>;
+
+const MAX_ROOMS: usize = 10_000;
+const CONTROL_CAP: usize = 32;
+const CONTROL_PRIORITY: i32 = 0;
+
+const BOOTSTRAP_PRIORITY: i32 = -32;
+const CLI_DEADLINE: Duration = Duration::from_secs(8);
+const BOOTSTRAP_FORWARD: Duration = Duration::from_secs(8);
+const HELLO_DEADLINE: Duration = Duration::from_secs(8);
+const MAX_CONNECTIONS: usize = 256;
+/// A household or a LAN party shares one address.
+const MAX_CONNECTIONS_PER_ADDRESS: usize = 32;
+
+const CLOSE_SERVICE_ERROR: u32 = 1;
+const CLOSE_SERVICE_DONE: u32 = 0;
+
+const MAX_CLOSE_REASON_BYTES: usize = 120;
+
+struct AddressSlot {
+    counts: Arc<std::sync::Mutex<HashMap<IpAddr, usize>>>,
+    ip: IpAddr,
+}
+
+impl AddressSlot {
+    fn claim(counts: &Arc<std::sync::Mutex<HashMap<IpAddr, usize>>>, ip: IpAddr) -> Option<Self> {
+        let mut held = counts.lock().expect("address counts poisoned");
+        let count = held.entry(ip).or_insert(0);
+        if *count >= MAX_CONNECTIONS_PER_ADDRESS {
+            return None;
+        }
+        *count += 1;
+        Some(Self {
+            counts: Arc::clone(counts),
+            ip,
+        })
+    }
+}
+
+impl Drop for AddressSlot {
+    fn drop(&mut self) {
+        let Ok(mut held) = self.counts.lock() else {
+            return;
+        };
+        if let Some(count) = held.get_mut(&self.ip) {
+            *count -= 1;
+            if *count == 0 {
+                held.remove(&self.ip);
+            }
+        }
+    }
+}
+
+enum ConnTask {
+    Writer(Result<()>),
+    Bootstrap,
+}
+
+enum Command {
+    Serve {
+        bind: SocketAddr,
+        cert: PathBuf,
+        key: PathBuf,
+    },
+    Status(ClientTarget),
+    List(ClientTarget),
+    PrintUnit(UnitSpec),
+    /// bo2mp: a private CA and the master's certificate, into this folder.
+    GenCerts(PathBuf),
+}
+
+/// Everything `serve` will be started with. Kept next to the `serve` parser so
+/// a new flag cannot reach one without the other.
+struct UnitSpec {
+    channel: Channel,
+    exec: PathBuf,
+    cert: PathBuf,
+    key: PathBuf,
+    user: String,
+    group: String,
+}
+
+struct ClientTarget {
+    connect: SocketAddr,
+    server_name: String,
+    ca_cert: Option<PathBuf>,
+}
+
+struct Peer {
+    player_name: String,
+    /// bo2mp: his friend code (0: none).
+    friend_code: u32,
+    connection: quinn::Connection,
+    control_tx: tokio::sync::mpsc::Sender<ControlFrame>,
+}
+
+struct Room {
+    view: RoomView,
+    host_connection_id: u64,
+    member_of: HashMap<u64, MemberId>,
+    connection_of: HashMap<MemberId, u64>,
+    /// bo2mp: the open map vote's ballots, and when it closes.
+    ballots: HashMap<MemberId, u8>,
+    vote_until: Option<Instant>,
+}
+
+impl Room {
+    /// The view as sent: the vote's time left as of now.
+    fn wire(&self) -> RoomView {
+        let mut view = self.view.clone();
+        if let (Some(vote), Some(until)) = (view.vote.as_mut(), self.vote_until) {
+            vote.ends_in_ms = u32::try_from(until.saturating_duration_since(Instant::now()).as_millis()).unwrap_or(u32::MAX);
+        }
+        view
+    }
+
+    fn recount(&mut self) {
+        if let Some(vote) = self.view.vote.as_mut() {
+            vote.counts = vec![0; vote.maps.len()];
+            for &k in self.ballots.values() {
+                if let Some(c) = vote.counts.get_mut(usize::from(k)) {
+                    *c = c.saturating_add(1);
+                }
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct ServiceState {
+    rooms: HashMap<AdvertId, Room>,
+    peers: HashMap<u64, Peer>,
+    membership: HashMap<u64, AdvertId>,
+    generation: u64,
+    /// bo2mp: friend codes seen lately (his name, when he was last
+    /// connected): a player in the menus only connects for a moment to
+    /// list the lobbies, so he counts as online for `FRIEND_SEEN_FOR` after.
+    seen: HashMap<u32, (String, std::time::Instant)>,
+    /// Embedded in a peer-to-peer host: its one room is joined whatever room
+    /// id the joiner names.
+    single_room: bool,
+}
+
+/// bo2mp: how long a friend code stays online after its last connection.
+const FRIEND_SEEN_FOR: std::time::Duration = std::time::Duration::from_secs(45);
+
+struct HandleOutcome {
+    response: ControlResponse,
+    publishes: Vec<(u64, ControlFrame)>,
+}
+
+impl ServiceState {
+    fn attach_peer(
+        &mut self,
+        connection_id: u64,
+        player_name: String,
+        friend_code: u32,
+        connection: quinn::Connection,
+        control_tx: tokio::sync::mpsc::Sender<ControlFrame>,
+    ) {
+        if friend_code != 0 {
+            self.seen.insert(friend_code, (player_name.clone(), std::time::Instant::now()));
+        }
+        self.peers.insert(
+            connection_id,
+            Peer {
+                player_name,
+                friend_code,
+                connection,
+                control_tx,
+            },
+        );
+    }
+
+    /// bo2mp: where each friend code's player is: online (a connection
+    /// with that code; the most recent when he has more than one), his
+    /// name, and the lobby he is in.
+    fn friends(&mut self, codes: &[u32]) -> Vec<FriendStatus> {
+        let now = std::time::Instant::now();
+        self.seen.retain(|_, (_, at)| now.duration_since(*at) < FRIEND_SEEN_FOR);
+        let mut out = friend_statuses(
+            codes,
+            self.peers.iter().map(|(id, p)| (*id, p.friend_code, p.player_name.as_str())),
+            |connection_id| {
+                self.membership
+                    .get(&connection_id)
+                    .and_then(|room_id| self.rooms.get(room_id))
+                    .map(|room| room.view.advert())
+            },
+        );
+        // (Seen lately though not connected now: online, in no lobby.)
+        for f in out.iter_mut().filter(|f| !f.online) {
+            if let Some((name, _)) = self.seen.get(&f.code) {
+                f.online = true;
+                f.name = name.clone();
+            }
+        }
+        out
+    }
+
+    fn publish_view(&self, room_id: AdvertId) -> Vec<(u64, ControlFrame)> {
+        let Some(room) = self.rooms.get(&room_id) else {
+            return Vec::new();
+        };
+        let frame = ControlFrame::RoomView(room.wire());
+        room.member_of
+            .keys()
+            .copied()
+            .map(|connection_id| (connection_id, frame.clone()))
+            .collect()
+    }
+
+    fn close_room(
+        &mut self,
+        room_id: AdvertId,
+        reason: SessionCloseReason,
+    ) -> Vec<(u64, ControlFrame)> {
+        let Some(room) = self.rooms.remove(&room_id) else {
+            return Vec::new();
+        };
+        self.generation = self.generation.wrapping_add(1);
+        let frame = ControlFrame::Closed {
+            room_id,
+            epoch: room.view.epoch,
+            reason,
+        };
+        let mut publishes = Vec::new();
+        for connection_id in room.member_of.keys().copied() {
+            self.membership.remove(&connection_id);
+            publishes.push((connection_id, frame.clone()));
+        }
+        publishes
+    }
+
+    fn disconnect(&mut self, connection_id: u64) -> Vec<(u64, ControlFrame)> {
+        if let Some(peer) = self.peers.remove(&connection_id)
+            && peer.friend_code != 0
+        {
+            self.seen.insert(peer.friend_code, (peer.player_name, std::time::Instant::now()));
+        }
+        let Some(room_id) = self.membership.get(&connection_id).copied() else {
+            return Vec::new();
+        };
+        let Some(room) = self.rooms.get(&room_id) else {
+            self.membership.remove(&connection_id);
+            return Vec::new();
+        };
+        if room.host_connection_id == connection_id {
+            return self.close_room(room_id, SessionCloseReason::HostLeft);
+        }
+        self.remove_member(connection_id)
+    }
+
+    fn remove_member(&mut self, connection_id: u64) -> Vec<(u64, ControlFrame)> {
+        let Some(room_id) = self.membership.remove(&connection_id) else {
+            return Vec::new();
+        };
+        let Some(room) = self.rooms.get_mut(&room_id) else {
+            return Vec::new();
+        };
+        let Some(member_id) = room.member_of.remove(&connection_id) else {
+            return Vec::new();
+        };
+        room.connection_of.remove(&member_id);
+        room.view.members.retain(|id| *id != member_id);
+        room.view.member_names.remove(&member_id);
+        if room.ballots.remove(&member_id).is_some() {
+            room.recount();
+        }
+        room.view.revision = room.view.revision.wrapping_add(1).max(1);
+        self.generation = self.generation.wrapping_add(1);
+        self.publish_view(room_id)
+    }
+
+    fn bump_room(&mut self, room_id: AdvertId) {
+        if let Some(room) = self.rooms.get_mut(&room_id) {
+            room.view.revision = room.view.revision.wrapping_add(1).max(1);
+        }
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    fn host_of(&self, connection_id: u64) -> std::result::Result<AdvertId, ServiceError> {
+        let room_id = *self
+            .membership
+            .get(&connection_id)
+            .ok_or(ServiceError::NotMember)?;
+        let room = self
+            .rooms
+            .get(&room_id)
+            .ok_or(ServiceError::UnknownAdvert)?;
+        if room.host_connection_id != connection_id {
+            return Err(ServiceError::NotHost);
+        }
+        Ok(room_id)
+    }
+
+    fn member_of(
+        &self,
+        connection_id: u64,
+    ) -> std::result::Result<(AdvertId, MemberId), ServiceError> {
+        let room_id = *self
+            .membership
+            .get(&connection_id)
+            .ok_or(ServiceError::NotMember)?;
+        let room = self
+            .rooms
+            .get(&room_id)
+            .ok_or(ServiceError::UnknownAdvert)?;
+        let member_id = *room
+            .member_of
+            .get(&connection_id)
+            .ok_or(ServiceError::NotMember)?;
+        Ok((room_id, member_id))
+    }
+
+    fn peer_connection(&self, connection_id: u64) -> Option<quinn::Connection> {
+        self.peers
+            .get(&connection_id)
+            .map(|peer| peer.connection.clone())
+    }
+
+    fn route_target(
+        &self,
+        connection_id: u64,
+        relay: &RelayDatagram<'_>,
+    ) -> Result<(quinn::Connection, Vec<u8>)> {
+        match relay {
+            RelayDatagram::ClientToHost(payload) => {
+                let (room_id, member_id) = self.member_of(connection_id)?;
+                let room = self
+                    .rooms
+                    .get(&room_id)
+                    .ok_or(ServiceError::UnknownAdvert)?;
+                let host = self
+                    .peer_connection(room.host_connection_id)
+                    .ok_or(ServiceError::NotHost)?;
+                let outgoing = encode_relay(RelayDatagram::ServiceToHost { member_id, payload })?;
+                Ok((host, outgoing))
+            }
+            RelayDatagram::HostToMember { member_id, payload } => {
+                let room_id = self.host_of(connection_id)?;
+                let room = self
+                    .rooms
+                    .get(&room_id)
+                    .ok_or(ServiceError::UnknownAdvert)?;
+                let target_id = *room
+                    .connection_of
+                    .get(member_id)
+                    .ok_or(ServiceError::NotMember)?;
+                let target = self
+                    .peer_connection(target_id)
+                    .ok_or(ServiceError::NotMember)?;
+                let outgoing = encode_relay(RelayDatagram::ServiceToMember(payload))?;
+                Ok((target, outgoing))
+            }
+            RelayDatagram::ServiceToHost { .. } | RelayDatagram::ServiceToMember(_) => {
+                Err(ServiceError::Malformed.into())
+            }
+        }
+    }
+
+    fn route_target_stream(
+        &self,
+        connection_id: u64,
+        relay: &RelayDatagram<'_>,
+    ) -> Result<(quinn::Connection, Vec<u8>)> {
+        match relay {
+            RelayDatagram::ClientToHost(payload) => {
+                let (room_id, member_id) = self.member_of(connection_id)?;
+                let room = self
+                    .rooms
+                    .get(&room_id)
+                    .ok_or(ServiceError::UnknownAdvert)?;
+                let host = self
+                    .peer_connection(room.host_connection_id)
+                    .ok_or(ServiceError::NotHost)?;
+                let outgoing =
+                    encode_relay_stream(RelayDatagram::ServiceToHost { member_id, payload })?;
+                Ok((host, outgoing))
+            }
+            RelayDatagram::HostToMember { member_id, payload } => {
+                let room_id = self.host_of(connection_id)?;
+                let room = self
+                    .rooms
+                    .get(&room_id)
+                    .ok_or(ServiceError::UnknownAdvert)?;
+                let target_id = *room
+                    .connection_of
+                    .get(member_id)
+                    .ok_or(ServiceError::NotMember)?;
+                let target = self
+                    .peer_connection(target_id)
+                    .ok_or(ServiceError::NotMember)?;
+                let outgoing = encode_relay_stream(RelayDatagram::ServiceToMember(payload))?;
+                Ok((target, outgoing))
+            }
+            RelayDatagram::ServiceToHost { .. } | RelayDatagram::ServiceToMember(_) => {
+                Err(ServiceError::Malformed.into())
+            }
+        }
+    }
+}
+
+/// The command line of the `codlegacy-master` binary.
+pub async fn cli_main() -> Result<()> {
+    match parse_args()? {
+        Command::Serve { bind, cert, key } => serve(bind, &cert, &key).await,
+        Command::Status(target) => tokio::time::timeout(CLI_DEADLINE, status(&target))
+            .await
+            .map_err(|_| "master status deadline (connect + RPC)")?,
+        Command::List(target) => tokio::time::timeout(CLI_DEADLINE, list(&target))
+            .await
+            .map_err(|_| "master list deadline (connect + RPC)")?,
+        Command::PrintUnit(spec) => print_unit(&spec),
+        Command::GenCerts(out) => gen_certs(&out),
+    }
+}
+
+/// bo2mp: `gen-certs --out DIR`: a private CA (`ca.pem`, to hand to the
+/// players) and the master's identity it signs (`server.pem`,
+/// `server.key`, for `serve`). The server certificate names only the fixed
+/// labels clients check (`iw4l-prod`, `iw4l-dev`; docs/MASTER.md), so it
+/// holds for any address the master moves to. Pure Rust (no openssl), so a
+/// Windows PC can host. An existing set is kept.
+fn gen_certs(out: &Path) -> Result<()> {
+    let (ca_path, cert_path, key_path) = (out.join("ca.pem"), out.join("server.pem"), out.join("server.key"));
+    if ca_path.exists() && cert_path.exists() && key_path.exists() {
+        writeln!(std::io::stderr(), "certificates already in {} (kept)", out.display())?;
+        return Ok(());
+    }
+    std::fs::create_dir_all(out)?;
+    let (ca, cert, key) = mint_certs()?;
+    std::fs::write(&ca_path, ca)?;
+    std::fs::write(&cert_path, cert)?;
+    std::fs::write(&key_path, key)?;
+    writeln!(std::io::stderr(), "wrote {}, {} and {}", ca_path.display(), cert_path.display(), key_path.display())?;
+    Ok(())
+}
+
+/// The CA certificate, the server certificate and the server key, as PEM.
+fn mint_certs() -> Result<(String, String, String)> {
+    use rcgen::{BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose};
+    let ca_key = KeyPair::generate()?;
+    let mut ca_params = CertificateParams::new(Vec::<String>::new())?;
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.distinguished_name.push(DnType::CommonName, "iw4l private CA");
+    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign, KeyUsagePurpose::DigitalSignature];
+    let ca = ca_params.self_signed(&ca_key)?;
+    let key = KeyPair::generate()?;
+    let names: Vec<String> = Channel::ALL.iter().map(|c| c.server_name().to_owned()).collect();
+    let mut params = CertificateParams::new(names)?;
+    params.distinguished_name.push(DnType::CommonName, "iw4l-master");
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    params.key_usages = vec![KeyUsagePurpose::DigitalSignature, KeyUsagePurpose::KeyEncipherment];
+    let cert = params.signed_by(&key, &ca, &ca_key)?;
+    Ok((ca.pem(), cert.pem(), key.serialize_pem()))
+}
+
+fn parse_args() -> Result<Command> {
+    let mut args = std::env::args().skip(1);
+    let command = args
+        .next()
+        .ok_or("usage: codlegacy-master serve|status|list|print-unit|gen-certs ...")?;
+    let mut bind = None;
+    let mut cert = None;
+    let mut key = None;
+    let mut connect = None;
+    let mut server_name = None;
+    let mut ca_cert = None;
+    let mut channel = None;
+    let mut exec = None;
+    let mut user = None;
+    let mut group = None;
+    let mut out = None;
+    while let Some(flag) = args.next() {
+        let value = args
+            .next()
+            .ok_or_else(|| format!("missing value for {flag}"))?;
+        match flag.as_str() {
+            "--bind" => bind = Some(value.parse()?),
+            "--cert" => cert = Some(PathBuf::from(value)),
+            "--key" => key = Some(PathBuf::from(value)),
+            "--connect" => connect = Some(value.parse()?),
+            "--server-name" => server_name = Some(value),
+            "--ca-cert" => ca_cert = Some(PathBuf::from(value)),
+            "--channel" => channel = Some(value.parse()?),
+            "--exec" => exec = Some(PathBuf::from(value)),
+            "--user" => user = Some(value),
+            "--group" => group = Some(value),
+            "--out" => out = Some(PathBuf::from(value)),
+            _ => return Err(format!("unknown option {flag}").into()),
+        }
+    }
+    match command.as_str() {
+        "serve" => Ok(Command::Serve {
+            bind: bind.ok_or("serve requires --bind HOST:PORT")?,
+            cert: cert.ok_or("serve requires --cert PATH")?,
+            key: key.ok_or("serve requires --key PATH")?,
+        }),
+        "status" | "list" => {
+            let target = ClientTarget {
+                connect: connect.ok_or("command requires --connect HOST:PORT")?,
+                server_name: server_name.ok_or("command requires --server-name NAME")?,
+                ca_cert,
+            };
+            if command == "status" {
+                Ok(Command::Status(target))
+            } else {
+                Ok(Command::List(target))
+            }
+        }
+        "print-unit" => Ok(Command::PrintUnit(UnitSpec {
+            channel: channel.ok_or("print-unit requires --channel prod|dev")?,
+            exec: exec.ok_or("print-unit requires --exec PATH")?,
+            cert: cert.ok_or("print-unit requires --cert PATH")?,
+            key: key.ok_or("print-unit requires --key PATH")?,
+            user: user.unwrap_or_else(|| "iw4l".to_string()),
+            group: group.unwrap_or_else(|| "iw4l".to_string()),
+        })),
+        "gen-certs" => Ok(Command::GenCerts(out.ok_or("gen-certs requires --out DIR")?)),
+        _ => Err(format!("unknown command {command}").into()),
+    }
+}
+
+/// The systemd unit for `spec`, on stdout. The binary that parses `serve`
+/// writes the `ExecStart` that invokes it: `cargo xtask master install` pipes
+/// this straight into `/etc/systemd/system/`, so the two cannot disagree about
+/// a flag, and `Channel` alone decides the port.
+fn print_unit(spec: &UnitSpec) -> Result<()> {
+    let UnitSpec {
+        channel,
+        exec,
+        cert,
+        key,
+        user,
+        group,
+    } = spec;
+    let port = channel.port();
+    let exec = exec.display();
+    let cert = cert.display();
+    let key = key.display();
+    write!(
+        std::io::stdout(),
+        "[Unit]
+Description=CodLegacy {channel} master and relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={user}
+Group={group}
+ExecStart={exec} serve --bind 0.0.0.0:{port} --cert {cert} --key {key}
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+
+[Install]
+WantedBy=multi-user.target
+"
+    )?;
+    Ok(())
+}
+
+async fn serve(bind: SocketAddr, cert_path: &Path, key_path: &Path) -> Result<()> {
+    let certs = load_certificates(cert_path)?;
+    let key = load_private_key(key_path)?;
+    let endpoint = quinn::Endpoint::server(server_config(certs, key)?, bind)?;
+    run_service(endpoint, None).await
+}
+
+/// The service's QUIC server configuration for this identity.
+pub fn server_config(
+    certs: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+) -> Result<quinn::ServerConfig> {
+    let mut crypto = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?;
+    crypto.alpn_protocols = vec![ALPN.to_vec()];
+
+    let mut config =
+        quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(crypto)?));
+    let transport = Arc::get_mut(&mut config.transport)
+        .ok_or("new server transport config unexpectedly shared")?;
+    transport.max_concurrent_bidi_streams(1_u8.into());
+    transport.max_concurrent_uni_streams(MAX_RELAY_UNI_STREAMS.into());
+    transport.max_idle_timeout(Some(
+        quinn::IdleTimeout::try_from(SESSION_IDLE).expect("session idle fits QUIC VarInt"),
+    ));
+    transport.keep_alive_interval(Some(SESSION_KEEP_ALIVE));
+    transport.datagram_receive_buffer_size(Some(128 * 1024));
+    transport.datagram_send_buffer_size(128 * 1024);
+    Ok(config)
+}
+
+/// The service embedded in a peer-to-peer host on its own endpoint: one
+/// room, and only connections that name `server_name` (the invite's secret,
+/// as the TLS server name) are served; any other is closed at once.
+pub async fn run_embedded(endpoint: quinn::Endpoint, server_name: String) -> Result<()> {
+    run_service(endpoint, Some(server_name)).await
+}
+
+async fn run_service(endpoint: quinn::Endpoint, gate: Option<String>) -> Result<()> {
+    let state = Arc::new(Mutex::new(ServiceState {
+        single_room: gate.is_some(),
+        ..ServiceState::default()
+    }));
+    let gate = gate.map(Arc::new);
+    let next_connection_id = Arc::new(AtomicU64::new(1));
+    writeln!(
+        std::io::stderr(),
+        "codlegacy-master listening on {}",
+        endpoint.local_addr()?
+    )?;
+    writeln!(
+        std::io::stderr(),
+        "codlegacy-master build={} wire={} alpn={:?}",
+        env!("CARGO_PKG_VERSION"),
+        master_protocol::PROTOCOL_VERSION,
+        ALPN
+    )?;
+    let connection_slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let address_counts = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    while let Some(incoming) = endpoint.accept().await {
+        // No slot before the address is proven: a forged Initial would hold
+        // one until its handshake timed out.
+        if !incoming.remote_address_validated() && incoming.may_retry() {
+            let _ = incoming.retry();
+            continue;
+        }
+        let remote = incoming.remote_address();
+        let Some(address_slot) = AddressSlot::claim(&address_counts, remote.ip()) else {
+            let _ = writeln!(
+                std::io::stderr(),
+                "connection refused: {remote} at per-address cap {MAX_CONNECTIONS_PER_ADDRESS}"
+            );
+            incoming.refuse();
+            continue;
+        };
+        let Ok(permit) = connection_slots.clone().try_acquire_owned() else {
+            let _ = writeln!(
+                std::io::stderr(),
+                "connection refused: at connection cap {MAX_CONNECTIONS}"
+            );
+            incoming.refuse();
+            continue;
+        };
+        let state = Arc::clone(&state);
+        let gate = gate.clone();
+        let connection_id = next_connection_id.fetch_add(1, Ordering::Relaxed);
+        let started = Instant::now();
+        let _ = writeln!(
+            std::io::stderr(),
+            "connection {connection_id} incoming remote={remote}"
+        );
+        tokio::spawn(async move {
+            let _permit = permit;
+            let _address_slot = address_slot;
+            match incoming.await {
+                Ok(connection) => {
+                    if let Some(gate) = gate.as_deref()
+                        && server_name_of(&connection).as_deref() != Some(gate.as_str())
+                    {
+                        let _ = writeln!(std::io::stderr(), "connection {connection_id} refused: no invite remote={remote}");
+                        connection.close(CLOSE_SERVICE_ERROR.into(), b"no invite");
+                        return;
+                    }
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "connection {connection_id} handshake ok remote={remote} elapsed_ms={}",
+                        started.elapsed().as_millis()
+                    );
+                    handle_connection(state, connection_id, connection).await;
+                }
+                Err(error) => {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "connection {connection_id} handshake failed remote={remote} elapsed_ms={}: {error}",
+                        started.elapsed().as_millis()
+                    );
+                }
+            }
+        });
+    }
+    Ok(())
+}
+
+fn server_name_of(connection: &quinn::Connection) -> Option<String> {
+    connection
+        .handshake_data()?
+        .downcast::<quinn::crypto::rustls::HandshakeData>()
+        .ok()?
+        .server_name
+}
+
+async fn handle_connection(
+    state: Arc<Mutex<ServiceState>>,
+    connection_id: u64,
+    connection: quinn::Connection,
+) {
+    let outcome = run_connection(&state, connection_id, connection.clone()).await;
+    let seat = state
+        .lock()
+        .await
+        .member_of(connection_id)
+        .map(|(room_id, member_id)| format!("room={room_id} member={member_id}"))
+        .unwrap_or_else(|_| "room=- member=-".to_owned());
+    match outcome {
+        Ok(()) => connection.close(CLOSE_SERVICE_DONE.into(), b"session closed"),
+        Err(error) => {
+            let reason = error.to_string();
+            let _ = writeln!(
+                std::io::stderr(),
+                "connection {connection_id} closed: {reason} ({seat})"
+            );
+            let mut reason = reason.into_bytes();
+            reason.truncate(MAX_CLOSE_REASON_BYTES);
+            connection.close(CLOSE_SERVICE_ERROR.into(), &reason);
+        }
+    }
+    let publishes = state.lock().await.disconnect(connection_id);
+    dispatch_publishes(&state, publishes).await;
+}
+
+async fn run_connection(
+    state: &Arc<Mutex<ServiceState>>,
+    connection_id: u64,
+    connection: quinn::Connection,
+) -> Result<()> {
+    let (mut send, recv) = tokio::time::timeout(HELLO_DEADLINE, connection.accept_bi())
+        .await
+        .map_err(|_| "hello deadline (accept_bi)")??;
+    send.set_priority(CONTROL_PRIORITY)?;
+    let (recv, hello) = tokio::time::timeout(HELLO_DEADLINE, read_owned_frame(recv))
+        .await
+        .map_err(|_| "hello deadline (first frame)")?;
+    let hello = hello?;
+    let ControlFrame::Hello(hello) = hello else {
+        return Err("first control frame must be Hello".into());
+    };
+    let _ = writeln!(
+        std::io::stderr(),
+        "connection {connection_id} hello role={:?} wire={} game={} build={:?}",
+        hello.role,
+        hello.protocol_version,
+        hello.game_protocol,
+        hello.build
+    );
+    let (control_tx, mut control_rx) = tokio::sync::mpsc::channel::<ControlFrame>(CONTROL_CAP);
+    state.lock().await.attach_peer(
+        connection_id,
+        normalize_player_name(&hello.player_name),
+        hello.friend_code,
+        connection.clone(),
+        control_tx,
+    );
+    let mut children = tokio::task::JoinSet::new();
+    children.spawn(async move {
+        let result = async {
+            while let Some(frame) = control_rx.recv().await {
+                write_frame(&mut send, &frame).await?;
+            }
+            Result::<()>::Ok(())
+        }
+        .await;
+        ConnTask::Writer(result)
+    });
+    let bootstrap_slots = Arc::new(Semaphore::new(MAX_CONCURRENT_BOOTSTRAP as usize));
+    let mut next_control = Box::pin(read_owned_frame(recv));
+    let outcome = loop {
+        tokio::select! {
+            (recv, frame) = &mut next_control => {
+                next_control.set(read_owned_frame(recv));
+                let frame = frame?;
+                match frame {
+                    ControlFrame::Request(request) => {
+                        let outcome = handle_request(state, connection_id, request).await;
+                        let mut publishes = outcome.publishes;
+                        publishes.push((
+                            connection_id,
+                            ControlFrame::Response(outcome.response),
+                        ));
+                        dispatch_publishes(state, publishes).await;
+                    }
+                    ControlFrame::Relay(bytes) => {
+                        let relay = decode_relay_stream(&bytes)?;
+                        let current = state.lock().await;
+                        let (target, outgoing) = current.route_target_stream(connection_id, &relay)?;
+                        let peer = current.peers.values().find(|peer| peer.connection.stable_id() == target.stable_id()).ok_or(ServiceError::NotMember)?;
+                        if peer.control_tx.try_send(ControlFrame::Relay(outgoing)).is_err() {
+                            target.close(0_u8.into(), b"control queue exhausted");
+                            break Err("control queue exhausted".into());
+                        }
+                    }
+                    ControlFrame::Hello(_) => break Err("duplicate Hello".into()),
+                    _ => break Err("client sent a non-request control frame".into()),
+                }
+            }
+            stream = connection.accept_uni() => {
+                let mut recv = stream?;
+                let Ok(permit) = bootstrap_slots.clone().try_acquire_owned() else {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "connection {connection_id} bootstrap refused: no slot"
+                    );
+                    let _ = recv.stop(0_u8.into());
+                    continue;
+                };
+                children.spawn(bootstrap_forward(
+                    Arc::clone(state),
+                    connection_id,
+                    recv,
+                    permit,
+                ));
+            }
+            datagram = connection.read_datagram() => {
+                let bytes = datagram?;
+                if let Err(error) = relay_datagram(state, connection_id, &bytes).await {
+                    let _ = writeln!(std::io::stderr(), "relay datagram: {error}");
+                }
+            }
+            done = children.join_next() => {
+                match done {
+                    None => {}
+                    Some(Ok(ConnTask::Writer(Err(error)))) => {
+                        break Err(error);
+                    }
+                    Some(Ok(ConnTask::Writer(Ok(())))) => {
+                        break Err("control writer ended".into());
+                    }
+                    Some(Ok(ConnTask::Bootstrap)) => {}
+                    Some(Err(join)) => break Err(join.into()),
+                }
+            }
+        }
+    };
+    children.abort_all();
+    while children.join_next().await.is_some() {}
+    outcome
+}
+
+async fn dispatch_publishes(state: &Mutex<ServiceState>, publishes: Vec<(u64, ControlFrame)>) {
+    let mut failed = Vec::new();
+    {
+        let current = state.lock().await;
+        for (connection_id, frame) in publishes {
+            let Some(peer) = current.peers.get(&connection_id) else {
+                continue;
+            };
+            match peer.control_tx.try_send(frame) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) | Err(TrySendError::Closed(_)) => {
+                    failed.push(connection_id);
+                    peer.connection
+                        .close(0_u8.into(), b"control delivery failed");
+                }
+            }
+        }
+    }
+    for connection_id in failed {
+        let extra = state.lock().await.disconnect(connection_id);
+        Box::pin(dispatch_publishes(state, extra)).await;
+    }
+}
+
+async fn handle_request(
+    state: &Mutex<ServiceState>,
+    connection_id: u64,
+    request: ControlRequest,
+) -> HandleOutcome {
+    let request_id = request.request_id;
+    let mut state = state.lock().await;
+    let (body, publishes) = match request.body {
+        RequestBody::Status => (ResponseBody::Status(StatusResponse::CURRENT), Vec::new()),
+        RequestBody::CreateRoom {
+            name,
+            map,
+            mode,
+            max_players,
+            requires,
+        } => create_room(
+            &mut state,
+            connection_id,
+            name,
+            map,
+            mode,
+            max_players,
+            requires,
+        ),
+        RequestBody::JoinRoom { room_id, have } => {
+            join_room(&mut state, connection_id, room_id, have)
+        }
+        RequestBody::LeaveRoom => leave_room(&mut state, connection_id),
+        RequestBody::SetOptions {
+            map,
+            mode,
+            joinable,
+        } => set_options(&mut state, connection_id, map, mode, joinable),
+        RequestBody::StartMatch { map, mode } => start_match(&mut state, connection_id, map, mode),
+        RequestBody::EndMatch { room_id, epoch } => {
+            end_match(&mut state, connection_id, room_id, epoch)
+        }
+        RequestBody::CloseRoom => match state.host_of(connection_id) {
+            Ok(room_id) => (
+                ResponseBody::Ack,
+                state.close_room(room_id, SessionCloseReason::HostLeft),
+            ),
+            Err(error) => (ResponseBody::Error(error), Vec::new()),
+        },
+        RequestBody::Friends { codes } => {
+            (ResponseBody::Friends { friends: state.friends(&codes) }, Vec::new())
+        }
+        RequestBody::ListRooms => {
+            let mut adverts: Vec<Advert> = state
+                .rooms
+                .values()
+                .map(|room| room.view.advert())
+                .collect();
+            adverts.sort_by_key(|advert| advert.id);
+            adverts.truncate(MAX_LIST_ADVERTS);
+            (
+                ResponseBody::RoomList {
+                    generation: state.generation,
+                    adverts,
+                },
+                Vec::new(),
+            )
+        }
+        RequestBody::HostWorldReady {
+            room_id,
+            epoch,
+            map,
+            weapons,
+            classes,
+        } => host_world_ready(
+            &mut state,
+            connection_id,
+            room_id,
+            epoch,
+            map,
+            weapons,
+            classes,
+        ),
+        RequestBody::MapLoaded {
+            epoch,
+            map,
+            weapons,
+            classes,
+        } => forward_to_host(&state, connection_id, |member_id| PeerEvent::MapLoaded {
+            member_id,
+            epoch,
+            map,
+            weapons,
+            classes,
+        }),
+        RequestBody::BootstrapApplied {
+            epoch,
+            bootstrap_id,
+            snapshot_seq,
+            connection,
+        } => forward_to_host(&state, connection_id, |member_id| {
+            PeerEvent::BootstrapApplied {
+                member_id,
+                epoch,
+                bootstrap_id,
+                snapshot_seq,
+                connection,
+            }
+        }),
+        RequestBody::EnterMatch {
+            member_id,
+            epoch,
+            bootstrap_id,
+            connection_id: admitted_connection,
+            client_id,
+        } => enter_match(
+            &state,
+            connection_id,
+            member_id,
+            epoch,
+            bootstrap_id,
+            admitted_connection,
+            client_id,
+        ),
+        RequestBody::AdmissionFailed {
+            member_id,
+            epoch,
+            reason,
+        } => admission_failed(&state, connection_id, member_id, epoch, reason),
+        RequestBody::VoteToSkip => forward_to_host(&state, connection_id, |member_id| {
+            PeerEvent::VoteToSkip { member_id }
+        }),
+        RequestBody::KickMember { member_id } => kick_member(&mut state, connection_id, member_id),
+        RequestBody::OpenVote { maps, seconds } => open_vote(&mut state, connection_id, maps, seconds),
+        RequestBody::CastVote { choice } => cast_vote(&mut state, connection_id, choice),
+    };
+    HandleOutcome {
+        response: ControlResponse { request_id, body },
+        publishes,
+    }
+}
+
+/// bo2mp: the host opens the pre-game map vote; everyone in the room sees
+/// it with each new view.
+fn open_vote(
+    state: &mut ServiceState,
+    connection_id: u64,
+    maps: Vec<String>,
+    seconds: u16,
+) -> (ResponseBody, Vec<(u64, ControlFrame)>) {
+    let room_id = match state.host_of(connection_id) {
+        Ok(room_id) => room_id,
+        Err(error) => return (ResponseBody::Error(error), Vec::new()),
+    };
+    let room = state.rooms.get_mut(&room_id).expect("host room");
+    if room.view.phase.in_match() {
+        return (ResponseBody::Error(ServiceError::Locked), Vec::new());
+    }
+    let counts = vec![0; maps.len()];
+    room.view.vote = Some(master_protocol::MapVote { maps, counts, ends_in_ms: 0 });
+    room.ballots.clear();
+    room.vote_until = Some(Instant::now() + Duration::from_secs(u64::from(seconds)));
+    state.bump_room(room_id);
+    (ResponseBody::Ack, state.publish_view(room_id))
+}
+
+/// bo2mp: a member's vote (a new one replaces his last).
+fn cast_vote(
+    state: &mut ServiceState,
+    connection_id: u64,
+    choice: u8,
+) -> (ResponseBody, Vec<(u64, ControlFrame)>) {
+    let (room_id, member_id) = match state.member_of(connection_id) {
+        Ok(at) => at,
+        Err(error) => return (ResponseBody::Error(error), Vec::new()),
+    };
+    let room = state.rooms.get_mut(&room_id).expect("member room");
+    let open = room.view.vote.as_ref().is_some_and(|v| usize::from(choice) < v.maps.len())
+        && room.vote_until.is_some_and(|t| Instant::now() < t);
+    if !open {
+        return (ResponseBody::Error(ServiceError::Malformed), Vec::new());
+    }
+    room.ballots.insert(member_id, choice);
+    room.recount();
+    state.bump_room(room_id);
+    (ResponseBody::Ack, state.publish_view(room_id))
+}
+
+// bo2zm: BO2's PartyHost_KickPlayer. The host removes one member; that member's session closes
+// as Kicked and the rest see the new lobby.
+fn kick_member(
+    state: &mut ServiceState,
+    connection_id: u64,
+    member_id: MemberId,
+) -> (ResponseBody, Vec<(u64, ControlFrame)>) {
+    let room_id = match state.host_of(connection_id) {
+        Ok(room_id) => room_id,
+        Err(error) => return (ResponseBody::Error(error), Vec::new()),
+    };
+    let Some(room) = state.rooms.get(&room_id) else {
+        return (ResponseBody::Error(ServiceError::UnknownAdvert), Vec::new());
+    };
+    let Some(target) = room.connection_of.get(&member_id).copied() else {
+        return (ResponseBody::Error(ServiceError::NotMember), Vec::new());
+    };
+    if target == connection_id {
+        return (ResponseBody::Error(ServiceError::Malformed), Vec::new());
+    }
+    let epoch = room.view.epoch;
+    let mut publishes = state.remove_member(target);
+    publishes.push((
+        target,
+        ControlFrame::Closed {
+            room_id,
+            epoch,
+            reason: SessionCloseReason::Kicked,
+        },
+    ));
+    (ResponseBody::Ack, publishes)
+}
+
+fn create_room(
+    state: &mut ServiceState,
+    connection_id: u64,
+    name: String,
+    map: String,
+    mode: String,
+    max_players: u8,
+    requires: master_protocol::ContentFlags,
+) -> (ResponseBody, Vec<(u64, ControlFrame)>) {
+    if state.membership.contains_key(&connection_id) {
+        return (
+            ResponseBody::Error(ServiceError::AlreadyHosting),
+            Vec::new(),
+        );
+    }
+    if state.rooms.len() >= MAX_ROOMS {
+        return (
+            ResponseBody::Error(ServiceError::AdvertCapacity),
+            Vec::new(),
+        );
+    }
+    let room_id = AdvertId(random_bytes());
+    let member_id = MemberId(random_bytes());
+    let view = RoomView {
+        room_id,
+        name,
+        host: member_id,
+        members: vec![member_id],
+        member_names: [(member_id, state.peers[&connection_id].player_name.clone())].into(),
+        map,
+        mode,
+        joinable: true,
+        revision: 1,
+        epoch: 0,
+        phase: RoomPhase::Gathering,
+        max_players,
+        requires,
+        vote: None,
+    };
+    let mut member_of = HashMap::new();
+    member_of.insert(connection_id, member_id);
+    let mut connection_of = HashMap::new();
+    connection_of.insert(member_id, connection_id);
+    state.rooms.insert(
+        room_id,
+        Room {
+            view: view.clone(),
+            host_connection_id: connection_id,
+            member_of,
+            connection_of,
+            ballots: HashMap::new(),
+            vote_until: None,
+        },
+    );
+    state.membership.insert(connection_id, room_id);
+    state.generation = state.generation.wrapping_add(1);
+    (
+        ResponseBody::RoomCreated {
+            member_id,
+            view: view.clone(),
+        },
+        vec![(connection_id, ControlFrame::RoomView(view))],
+    )
+}
+
+fn join_room(
+    state: &mut ServiceState,
+    connection_id: u64,
+    room_id: AdvertId,
+    have: master_protocol::ContentFlags,
+) -> (ResponseBody, Vec<(u64, ControlFrame)>) {
+    if let Some(existing) = state.membership.get(&connection_id).copied() {
+        if existing == room_id {
+            let room = state.rooms.get(&room_id).expect("membership names a room");
+            let member_id = *room.member_of.get(&connection_id).expect("host/member map");
+            return (
+                ResponseBody::RoomJoined {
+                    member_id,
+                    view: room.wire(),
+                },
+                Vec::new(),
+            );
+        }
+        return (
+            ResponseBody::Error(ServiceError::AlreadyHosting),
+            Vec::new(),
+        );
+    }
+    let room_id = match state.rooms.keys().next() {
+        Some(only) if state.single_room && state.rooms.len() == 1 => *only,
+        _ => room_id,
+    };
+    let Some(room) = state.rooms.get(&room_id) else {
+        return (ResponseBody::Error(ServiceError::UnknownAdvert), Vec::new());
+    };
+    if !room.view.advert().allows_join_request() {
+        return (ResponseBody::Error(ServiceError::Locked), Vec::new());
+    }
+    if !room.view.requires.missing_from(have).is_empty() {
+        return (
+            ResponseBody::Error(ServiceError::MissingContent {
+                requires: room.view.requires,
+                have,
+            }),
+            Vec::new(),
+        );
+    }
+    if room.view.members.len() >= room.view.max_players as usize {
+        return (ResponseBody::Error(ServiceError::Full), Vec::new());
+    }
+    let member_id = MemberId(random_bytes());
+    let room = state.rooms.get_mut(&room_id).expect("room still present");
+    room.member_of.insert(connection_id, member_id);
+    room.connection_of.insert(member_id, connection_id);
+    room.view.members.push(member_id);
+    room.view
+        .member_names
+        .insert(member_id, state.peers[&connection_id].player_name.clone());
+    room.view.revision = room.view.revision.wrapping_add(1).max(1);
+    state.membership.insert(connection_id, room_id);
+    state.generation = state.generation.wrapping_add(1);
+    let view = room.wire();
+    (
+        ResponseBody::RoomJoined {
+            member_id,
+            view: view.clone(),
+        },
+        state.publish_view(room_id),
+    )
+}
+
+fn leave_room(
+    state: &mut ServiceState,
+    connection_id: u64,
+) -> (ResponseBody, Vec<(u64, ControlFrame)>) {
+    let Some(room_id) = state.membership.get(&connection_id).copied() else {
+        return (ResponseBody::RoomLeft, Vec::new());
+    };
+    let publishes = if state
+        .rooms
+        .get(&room_id)
+        .is_some_and(|room| room.host_connection_id == connection_id)
+    {
+        state.close_room(room_id, SessionCloseReason::HostLeft)
+    } else {
+        state.remove_member(connection_id)
+    };
+    (ResponseBody::RoomLeft, publishes)
+}
+
+fn set_options(
+    state: &mut ServiceState,
+    connection_id: u64,
+    map: String,
+    mode: String,
+    joinable: bool,
+) -> (ResponseBody, Vec<(u64, ControlFrame)>) {
+    match state.host_of(connection_id) {
+        Ok(room_id) => {
+            let room = state.rooms.get_mut(&room_id).expect("host room");
+            if room.view.phase.in_match() && (room.view.map != map || room.view.mode != mode) {
+                return (ResponseBody::Error(ServiceError::InvalidAdvert), Vec::new());
+            }
+            room.view.map = map;
+            room.view.mode = mode;
+            room.view.joinable = joinable;
+            state.bump_room(room_id);
+            let view = state.rooms[&room_id].wire();
+            (
+                ResponseBody::RoomUpdated { view: view.clone() },
+                state.publish_view(room_id),
+            )
+        }
+        Err(error) => (ResponseBody::Error(error), Vec::new()),
+    }
+}
+
+fn start_match(
+    state: &mut ServiceState,
+    connection_id: u64,
+    map: String,
+    mode: String,
+) -> (ResponseBody, Vec<(u64, ControlFrame)>) {
+    match state.host_of(connection_id) {
+        Ok(room_id) => {
+            let room = state.rooms.get_mut(&room_id).expect("host room");
+            if room.view.phase.in_match() && (room.view.map != map || room.view.mode != mode) {
+                return (ResponseBody::Error(ServiceError::InvalidAdvert), Vec::new());
+            }
+            room.view.map = map;
+            room.view.mode = mode;
+            room.view.vote = None;
+            room.ballots.clear();
+            room.vote_until = None;
+            if room.view.phase.in_match() {
+                return (
+                    ResponseBody::RoomUpdated {
+                        view: room.wire(),
+                    },
+                    Vec::new(),
+                );
+            } else {
+                room.view.epoch = room.view.epoch.wrapping_add(1).max(1);
+                room.view.phase = RoomPhase::Loading;
+            }
+            state.bump_room(room_id);
+            let view = state.rooms[&room_id].wire();
+            (
+                ResponseBody::RoomUpdated { view: view.clone() },
+                state.publish_view(room_id),
+            )
+        }
+        Err(error) => (ResponseBody::Error(error), Vec::new()),
+    }
+}
+
+fn end_match(
+    state: &mut ServiceState,
+    connection_id: u64,
+    expected_room: AdvertId,
+    epoch: u32,
+) -> (ResponseBody, Vec<(u64, ControlFrame)>) {
+    match state.host_of(connection_id) {
+        Ok(room_id) => {
+            let room = state.rooms.get_mut(&room_id).expect("host room");
+            if room_id != expected_room
+                || epoch == 0
+                || room.view.epoch != epoch
+                || !room.view.phase.in_match()
+            {
+                return (ResponseBody::Ack, Vec::new());
+            }
+            room.view.phase = RoomPhase::Gathering;
+            state.bump_room(room_id);
+            (ResponseBody::Ack, state.publish_view(room_id))
+        }
+        Err(error) => (ResponseBody::Error(error), Vec::new()),
+    }
+}
+
+fn host_world_ready(
+    state: &mut ServiceState,
+    connection_id: u64,
+    expected_room: AdvertId,
+    epoch: u32,
+    map: u64,
+    weapons: u64,
+    classes: u64,
+) -> (ResponseBody, Vec<(u64, ControlFrame)>) {
+    match state.host_of(connection_id) {
+        Ok(room_id) => {
+            let room = state.rooms.get_mut(&room_id).expect("host room");
+            if room_id != expected_room
+                || epoch == 0
+                || room.view.epoch != epoch
+                || !room.view.phase.in_match()
+            {
+                return (ResponseBody::Ack, Vec::new());
+            }
+            room.view.phase = RoomPhase::Running;
+            state.bump_room(room_id);
+            let mut publishes = state.publish_view(room_id);
+            let event = ControlFrame::PeerEvent(PeerEvent::HostWorldReady {
+                epoch,
+                map,
+                weapons,
+                classes,
+            });
+            if let Some(room) = state.rooms.get(&room_id) {
+                for peer in room.member_of.keys().copied() {
+                    publishes.push((peer, event.clone()));
+                }
+            }
+            (ResponseBody::Ack, publishes)
+        }
+        Err(error) => (ResponseBody::Error(error), Vec::new()),
+    }
+}
+
+fn forward_to_host(
+    state: &ServiceState,
+    connection_id: u64,
+    event: impl FnOnce(MemberId) -> PeerEvent,
+) -> (ResponseBody, Vec<(u64, ControlFrame)>) {
+    match state.member_of(connection_id) {
+        Ok((room_id, member_id)) => {
+            let Some(room) = state.rooms.get(&room_id) else {
+                return (ResponseBody::Error(ServiceError::UnknownAdvert), Vec::new());
+            };
+            (
+                ResponseBody::Ack,
+                vec![(
+                    room.host_connection_id,
+                    ControlFrame::PeerEvent(event(member_id)),
+                )],
+            )
+        }
+        Err(error) => (ResponseBody::Error(error), Vec::new()),
+    }
+}
+
+fn enter_match(
+    state: &ServiceState,
+    connection_id: u64,
+    member_id: MemberId,
+    epoch: u32,
+    bootstrap_id: u32,
+    admitted_connection: u64,
+    client_id: u32,
+) -> (ResponseBody, Vec<(u64, ControlFrame)>) {
+    match state.host_of(connection_id) {
+        Ok(room_id) => {
+            let Some(room) = state.rooms.get(&room_id) else {
+                return (ResponseBody::Error(ServiceError::UnknownAdvert), Vec::new());
+            };
+            let Some(&target) = room.connection_of.get(&member_id) else {
+                return (ResponseBody::Error(ServiceError::NotMember), Vec::new());
+            };
+            (
+                ResponseBody::Ack,
+                vec![(
+                    target,
+                    ControlFrame::PeerEvent(PeerEvent::EnterMatch {
+                        member_id,
+                        epoch,
+                        bootstrap_id,
+                        connection_id: admitted_connection,
+                        client_id,
+                    }),
+                )],
+            )
+        }
+        Err(error) => (ResponseBody::Error(error), Vec::new()),
+    }
+}
+
+fn admission_failed(
+    state: &ServiceState,
+    connection_id: u64,
+    member_id: MemberId,
+    epoch: u32,
+    reason: AdmissionFailure,
+) -> (ResponseBody, Vec<(u64, ControlFrame)>) {
+    match state.host_of(connection_id) {
+        Ok(room_id) => {
+            let Some(room) = state.rooms.get(&room_id) else {
+                return (ResponseBody::Error(ServiceError::UnknownAdvert), Vec::new());
+            };
+            let Some(&target) = room.connection_of.get(&member_id) else {
+                return (ResponseBody::Error(ServiceError::NotMember), Vec::new());
+            };
+            (
+                ResponseBody::Ack,
+                vec![(
+                    target,
+                    ControlFrame::PeerEvent(PeerEvent::AdmissionFailed {
+                        member_id,
+                        epoch,
+                        reason,
+                    }),
+                )],
+            )
+        }
+        Err(error) => (ResponseBody::Error(error), Vec::new()),
+    }
+}
+
+async fn bootstrap_forward(
+    state: Arc<Mutex<ServiceState>>,
+    connection_id: u64,
+    mut recv: quinn::RecvStream,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+) -> ConnTask {
+    let result = tokio::time::timeout(BOOTSTRAP_FORWARD, async {
+        let bytes = recv.read_to_end(MAX_BOOTSTRAP_STREAM_BYTES).await?;
+        let relay = decode_relay_stream(&bytes)?;
+        let (target, outgoing) = {
+            let current = state.lock().await;
+            current.route_target_stream(connection_id, &relay)?
+        };
+        let mut send = target.open_uni().await?;
+        send.set_priority(BOOTSTRAP_PRIORITY)?;
+        send.write_all(&outgoing).await?;
+        send.finish()?;
+        Result::<()>::Ok(())
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            let _ = writeln!(std::io::stderr(), "bootstrap forward: {error}");
+        }
+        Err(_) => {
+            let _ = writeln!(std::io::stderr(), "bootstrap forward: transfer deadline");
+        }
+    }
+    ConnTask::Bootstrap
+}
+
+async fn relay_datagram(
+    state: &Mutex<ServiceState>,
+    connection_id: u64,
+    bytes: &[u8],
+) -> Result<()> {
+    let relay = decode_relay(bytes)?;
+    let (target, outgoing) = {
+        let current = state.lock().await;
+        current.route_target(connection_id, &relay)?
+    };
+    target.send_datagram(outgoing.into())?;
+    Ok(())
+}
+
+async fn status(target: &ClientTarget) -> Result<()> {
+    let (_endpoint, connection) = connect_client(target).await?;
+    let response = rpc(
+        &connection,
+        ControlRequest {
+            request_id: 1,
+            body: RequestBody::Status,
+        },
+        EndpointRole::Cli,
+    )
+    .await?;
+    match response.body {
+        ResponseBody::Status(status) if status == StatusResponse::CURRENT => {
+            writeln!(
+                std::io::stdout(),
+                "protocol={} opaque={} members={}",
+                status.protocol_version,
+                status.max_opaque_payload,
+                status.max_session_members
+            )?;
+        }
+        body => return Err(format!("unexpected Status response: {body:?}").into()),
+    }
+    connection.close(0_u8.into(), b"status complete");
+    Ok(())
+}
+
+async fn list(target: &ClientTarget) -> Result<()> {
+    let (_endpoint, connection) = connect_client(target).await?;
+    let response = rpc(
+        &connection,
+        ControlRequest {
+            request_id: 1,
+            body: RequestBody::ListRooms,
+        },
+        EndpointRole::Cli,
+    )
+    .await?;
+    match response.body {
+        ResponseBody::RoomList {
+            generation,
+            adverts,
+        } => {
+            let mut output = std::io::stdout().lock();
+            writeln!(output, "generation={generation} adverts={}", adverts.len())?;
+            for advert in adverts {
+                writeln!(
+                    output,
+                    "{}\t{}/{}\t{}\t{}\tlocked={}\tin_match={}\tgen={}\trequires=0x{:02x}\t{}",
+                    advert.id,
+                    advert.players,
+                    advert.max_players,
+                    advert.map,
+                    advert.mode,
+                    u8::from(advert.locked),
+                    u8::from(advert.in_match),
+                    advert.generation,
+                    advert.requires.0,
+                    advert.name
+                )?;
+            }
+        }
+        body => return Err(format!("unexpected List response: {body:?}").into()),
+    }
+    connection.close(0_u8.into(), b"list complete");
+    Ok(())
+}
+
+async fn connect_client(target: &ClientTarget) -> Result<(quinn::Endpoint, quinn::Connection)> {
+    let mut crypto = if let Some(path) = target.ca_cert.as_deref() {
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in load_certificates(path)? {
+            roots.add(cert)?;
+        }
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth()
+    } else {
+        rustls::ClientConfig::with_platform_verifier()?
+    };
+    crypto.alpn_protocols = vec![ALPN.to_vec()];
+    let client_config = quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(crypto)?));
+    let bind = if target.connect.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let mut endpoint = quinn::Endpoint::client(bind.parse()?)?;
+    endpoint.set_default_client_config(client_config);
+    let connection = endpoint
+        .connect(target.connect, &target.server_name)?
+        .await?;
+    Ok((endpoint, connection))
+}
+
+async fn rpc(
+    connection: &quinn::Connection,
+    request: ControlRequest,
+    role: EndpointRole,
+) -> Result<ControlResponse> {
+    let request_id = request.request_id;
+    let (mut send, mut recv) = connection.open_bi().await?;
+    send.set_priority(CONTROL_PRIORITY)?;
+    write_frame(
+        &mut send,
+        &ControlFrame::Hello(ControlHello {
+            protocol_version: master_protocol::PROTOCOL_VERSION,
+            game_protocol: 0,
+            role,
+            build: "iw4l-master".into(),
+            player_name: String::new(),
+            friend_code: 0,
+        }),
+    )
+    .await?;
+    write_frame(&mut send, &ControlFrame::Request(request)).await?;
+    loop {
+        match read_frame(&mut recv).await? {
+            ControlFrame::Response(response) if response.request_id == request_id => {
+                return Ok(response);
+            }
+            ControlFrame::RoomView(_)
+            | ControlFrame::Closed { .. }
+            | ControlFrame::PeerEvent(_)
+            | ControlFrame::Relay(_) => {
+                continue;
+            }
+            other => {
+                return Err(format!(
+                    "unexpected control frame while waiting for response: {other:?}"
+                )
+                .into());
+            }
+        }
+    }
+}
+
+async fn read_owned_frame(
+    mut recv: quinn::RecvStream,
+) -> (quinn::RecvStream, Result<ControlFrame>) {
+    let frame = read_frame(&mut recv).await;
+    (recv, frame)
+}
+
+async fn read_frame(recv: &mut quinn::RecvStream) -> Result<ControlFrame> {
+    let mut header = [0_u8; 4];
+    recv.read_exact(&mut header).await?;
+    let len = stream_frame_len(header)?;
+    let mut body = vec![0_u8; len];
+    recv.read_exact(&mut body).await?;
+    Ok(decode_stream_payload(&body)?)
+}
+
+async fn write_frame(send: &mut quinn::SendStream, frame: &ControlFrame) -> Result<()> {
+    send.write_all(&encode_stream_frame(frame)?).await?;
+    Ok(())
+}
+
+fn random_bytes<const N: usize>() -> [u8; N] {
+    let mut bytes = [0; N];
+    getrandom::fill(&mut bytes).expect("OS randomness unavailable");
+    bytes
+}
+
+fn load_certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
+    let mut reader = BufReader::new(File::open(path)?);
+    let certs: Vec<_> = rustls_pemfile::certs(&mut reader).collect::<std::io::Result<_>>()?;
+    if certs.is_empty() {
+        return Err(format!("{} contains no certificates", path.display()).into());
+    }
+    Ok(certs)
+}
+
+fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
+    let mut reader = BufReader::new(File::open(path)?);
+    rustls_pemfile::private_key(&mut reader)?
+        .ok_or_else(|| format!("{} contains no private key", path.display()).into())
+}
+
+fn normalize_player_name(name: &str) -> String {
+    let name: String = name
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(16)
+        .collect();
+    if name.is_empty() {
+        "Player".into()
+    } else {
+        name
+    }
+}
+
+/// bo2mp: the statuses for `codes` (in their order) from the live
+/// connections (`(connection id, friend code, name)`) and the lobby a
+/// connection is in. Code 0 is nobody's; a code seen on more than one
+/// connection is the newest one (the highest id).
+fn friend_statuses<'a>(
+    codes: &[u32],
+    peers: impl Iterator<Item = (u64, u32, &'a str)>,
+    room_of: impl Fn(u64) -> Option<Advert>,
+) -> Vec<FriendStatus> {
+    let peers: Vec<(u64, u32, &str)> = peers.filter(|(_, code, _)| *code != 0).collect();
+    codes
+        .iter()
+        .take(MAX_FRIENDS)
+        .map(|&code| {
+            let found = peers.iter().filter(|(_, c, _)| *c == code).max_by_key(|(id, _, _)| *id);
+            match found {
+                Some((id, _, name)) => FriendStatus {
+                    code,
+                    online: true,
+                    name: (*name).to_owned(),
+                    room: room_of(*id),
+                },
+                None => FriendStatus { code, online: false, name: String::new(), room: None },
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod friends_tests {
+    use super::*;
+    use master_protocol::ContentFlags;
+    use rustls::client::danger::ServerCertVerifier;
+
+    /// The minted server certificate verifies against the minted CA for the
+    /// label clients check (as `CODLEGACY_MASTER_CA_CERT` + `_SERVER_NAME` do),
+    /// and `serve` can load the pair.
+    #[test]
+    fn minted_certificates_verify_as_the_client_checks() {
+        let (ca, cert, key) = mint_certs().unwrap();
+        let dir = std::env::temp_dir().join(format!("iw4lcerts{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (ca_path, cert_path, key_path) = (dir.join("ca.pem"), dir.join("server.pem"), dir.join("server.key"));
+        std::fs::write(&ca_path, &ca).unwrap();
+        std::fs::write(&cert_path, &cert).unwrap();
+        std::fs::write(&key_path, &key).unwrap();
+        let chain = load_certificates(&cert_path).unwrap();
+        let private = load_private_key(&key_path).unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(chain.clone(), private)
+            .expect("serve can use the pair");
+        let mut roots = rustls::RootCertStore::empty();
+        for c in load_certificates(&ca_path).unwrap() {
+            roots.add(c).unwrap();
+        }
+        let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider).build().unwrap();
+        for label in ["iw4l-prod", "iw4l-dev"] {
+            verifier
+                .verify_server_cert(
+                    &chain[0],
+                    &[],
+                    &rustls::pki_types::ServerName::try_from(label).unwrap(),
+                    &[],
+                    rustls::pki_types::UnixTime::now(),
+                )
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn friends_are_found_by_code_with_their_lobby() {
+        let advert = Advert {
+            id: AdvertId([1; 16]),
+            name: "lobby".to_owned(),
+            map: "mp_raid".to_owned(),
+            mode: "tdm".to_owned(),
+            players: 2,
+            max_players: 12,
+            locked: false,
+            in_match: false,
+            requires: ContentFlags(0),
+            generation: 1,
+        };
+        let peers = [(1u64, 11_111_111u32, "old egs"), (5, 11_111_111, "egs"), (3, 22_222_222, "jimbo"), (4, 0, "nobody")];
+        let out = friend_statuses(&[11_111_111, 33_333_333, 22_222_222, 0], peers.into_iter(), |id| (id == 3).then(|| advert.clone()));
+        assert_eq!(out.len(), 4);
+        assert!(out[0].online && out[0].name == "egs" && out[0].room.is_none());
+        assert!(!out[1].online && out[1].room.is_none());
+        assert!(out[2].online && out[2].room.as_ref().is_some_and(|r| r.map == "mp_raid"));
+        assert!(!out[3].online, "code 0 is nobody's");
+    }
+}

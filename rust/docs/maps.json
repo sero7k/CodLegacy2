@@ -1,0 +1,1414 @@
+{
+ "updated": "2026-10-10",
+ "maps": [
+  {
+   "id": "mp_la",
+   "map": "Aftermath",
+   "modes": [
+    "TDM",
+    "FFA",
+    "Domination",
+    "Kill Confirmed",
+    "Hardpoint",
+    "CTF",
+    "Demolition",
+    "HQ",
+    "Search and Destroy"
+   ],
+   "mechanics": {
+    "loads": "pass",
+    "loads_from_menu": "pass",
+    "spawns": "pass",
+    "mode: TDM": "pass",
+    "mode: FFA": "todo",
+    "mode: Domination": "todo",
+    "mode: Kill Confirmed": "todo",
+    "mode: Hardpoint": "todo",
+    "mode: CTF": "todo",
+    "mode: Demolition": "todo",
+    "mode: HQ": "todo",
+    "mode: Search and Destroy": "todo",
+    "bots": "pass",
+    "scorestreaks": "todo",
+    "killcam": "todo",
+    "end_of_match": "pass"
+   },
+   "visuals": {
+    "spawn": "todo",
+    "centre": "todo",
+    "overview south": "todo",
+    "overview west": "todo"
+   },
+   "evidence": {
+    "loads": "shots/maps/mp_la.png",
+    "spawns": "shots/maps/mp_la.game.log",
+    "loads_from_menu": "ui/gate/latest.log",
+    "mode: TDM": "ui/gate/latest.log",
+    "bots": "ui/gate/latest.log",
+    "end_of_match": "ui/gate/latest.log"
+   }
+  },
+  {
+   "id": "mp_dockside",
+   "map": "Cargo",
+   "modes": [
+    "TDM",
+    "FFA",
+    "Domination",
+    "Kill Confirmed",
+    "Hardpoint",
+    "CTF",
+    "Demolition",
+    "HQ",
+    "Search and Destroy"
+   ],
+   "mechanics": {
+    "loads": "pass",
+    "loads_from_menu": "todo",
+    "spawns": "pass",
+    "mode: TDM": "pass",
+    "mode: FFA": "todo",
+    "mode: Domination": "todo",
+    "mode: Kill Confirmed": "todo",
+    "mode: Hardpoint": "todo",
+    "mode: CTF": "todo",
+    "mode: Demolition": "todo",
+    "mode: HQ": "todo",
+    "mode: Search and Destroy": "todo",
+    "bots": "pass",
+    "scorestreaks": "todo",
+    "killcam": "todo",
+    "end_of_match": "todo"
+   },
+   "visuals": {
+    "spawn": "todo",
+    "centre": "todo",
+    "overview south": "todo",
+    "overview west": "todo"
+   },
+   "evidence": {
+    "loads": "shots/maps/mp_dockside.png",
+    "spawns": "shots/maps/mp_dockside.game.log",
+    "mode: TDM": "logs/mp/map_mp_dockside_tdm.log",
+    "bots": "logs/mp/map_mp_dockside_tdm.log"
+   }
+  },
+  {
+   "id": "mp_carrier",
+   "map": "Carrier",
+   "modes": [
+    "TDM",
+    "FFA",
+    "Domination",
+    "Kill Confirmed",
+    "Hardpoint",
+    "CTF",
+    "Demolition",
+    "HQ",
+    "Search and Destroy"
+   ],
+   "mechanics": {
+    "loads": "pass",
+    "loads_from_menu": "todo",
+    "spawns": "pass",
+    "mode: TDM": "pass",
+    "mode: FFA": "todo",
+    "mode: Domination": "todo",
+    "mode: Kill Confirmed": "todo",
+    "mode: Hardpoint": "todo",
+    "mode: CTF": "todo",
+    "mode: Demolition": "todo",
+    "mode: HQ": "todo",
+    "mode: Search and Destroy": "todo",
+    "bots": "pass",
+    "scorestreaks": "todo",
+    "killcam": "todo",
+    "end_of_match": "todo"
+   },
+   "visuals": {
+    "spawn": "todo",
+    "centre": "todo",
+    "overview south": "todo",
+    "overview west": "todo"
+   },
+   "evidence": {
+    "loads": "shots/maps/mp_carrier.png",
+    "spawns": "shots/maps/mp_carrier.game.log",
+    "mode: TDM": "logs/mp/map_mp_carrier_tdm.log",
+    "bots": "logs/mp/map_mp_carrier_tdm.log"
+   }
+  },
+  {
+   "id": "mp_drone",
+   "map": "Drone",
+   "modes": [
+    "TDM",
+    "FFA",
+    "Domination",
+    "Kill Confirmed",
+    "Hardpoint",
+    "CTF",
+    "Demolition",
+    "HQ",
+    "Search and Destroy"
+   ],
+   "mechanics": {
+    "loads": "pass",
+    "loads_from_menu": "todo",
+    "spawns": "pass",
+    "mode: TDM": "pass",
+    "mode: FFA": "todo",
+    "mode: Domination": "todo",
+    "mode: Kill Confirmed": "todo",
+    "mode: Hardpoint": "todo",
+    "mode: CTF": "todo",
+    "mode: Demolition": "todo",
+    "mode: HQ": "todo",
+    "mode: Search and Destroy": "todo",
+    "bots": "pass",
+    "scorestreaks": "todo",
+    "killcam": "todo",
+    "end_of_match": "todo"
+   },
+   "visuals": {
+    "spawn": "todo",
+    "centre": "todo",
+    "overview south": "todo",
+    "overview west": "todo"
+   },
+   "evidence": {
+    "loads": "shots/maps/mp_drone.png",
+    "spawns": "shots/maps/mp_drone.game.log",
+    "mode: TDM": "logs/mp/map_mp_drone_tdm.log",
+    "bots": "logs/mp/map_mp_drone_tdm.log"
+   }
+  },
+  {
+   "id": "mp_express",
+   "map": "Express",
+   "modes": [
+    "TDM",
+    "FFA",
+    "Domination",
+    "Kill Confirmed",
+    "Hardpoint",
+    "CTF",
+    "Demolition",
+    "HQ",
+    "Search and Destroy"
+   ],
+   "mechanics": {
+    "loads": "pass",
+    "loads_from_menu": "todo",
+    "spawns": "pass",
+    "mode: TDM": "pass",
+    "mode: FFA": "todo",
+    "mode: Domination": "todo",
+    "mode: Kill Confirmed": "todo",
+    "mode: Hardpoint": "todo",
+    "mode: CTF": "todo",
+    "mode: Demolition": "todo",
+    "mode: HQ": "todo",
+    "mode: Search and Destroy": "todo",
+    "bots": "pass",
+    "scorestreaks": "todo",
+    "killcam": "todo",
+    "end_of_match": "todo"
+   },
+   "visuals": {
+    "spawn": "todo",
+    "centre": "todo",
+    "overview south": "todo",
+    "overview west": "todo"
+   },
+   "evidence": {
+    "loads": "shots/maps/mp_express.png",
+    "spawns": "shots/maps/mp_express.game.log",
+    "mode: TDM": "logs/mp/map_mp_express_tdm.log",
+    "bots": "logs/mp/map_mp_express_tdm.log"
+   }
+  },
+  {
+   "id": "mp_hijacked",
+   "map": "Hijacked",
+   "modes": [
+    "TDM",
+    "FFA",
+    "Domination",
+    "Kill Confirmed",
+    "Hardpoint",
+    "CTF",
+    "Demolition",
+    "HQ",
+    "Search and Destroy"
+   ],
+   "mechanics": {
+    "loads": "pass",
+    "loads_from_menu": "todo",
+    "spawns": "pass",
+    "mode: TDM": "pass",
+    "mode: FFA": "todo",
+    "mode: Domination": "todo",
+    "mode: Kill Confirmed": "todo",
+    "mode: Hardpoint": "todo",
+    "mode: CTF": "todo",
+    "mode: Demolition": "todo",
+    "mode: HQ": "todo",
+    "mode: Search and Destroy": "todo",
+    "bots": "pass",
+    "scorestreaks": "todo",
+    "killcam": "todo",
+    "end_of_match": "todo"
+   },
+   "visuals": {
+    "spawn": "todo",
+    "centre": "todo",
+    "overview south": "todo",
+    "overview west": "todo"
+   },
+   "evidence": {
+    "loads": "shots/maps/mp_hijacked.png",
+    "spawns": "shots/maps/mp_hijacked.game.log",
+    "mode: TDM": "logs/mp/map_mp_hijacked_tdm.log",
+    "bots": "logs/mp/map_mp_hijacked_tdm.log"
+   }
+  },
+  {
+   "id": "mp_meltdown",
+   "map": "Meltdown",
+   "modes": [
+    "TDM",
+    "FFA",
+    "Domination",
+    "Kill Confirmed",
+    "Hardpoint",
+    "CTF",
+    "Demolition",
+    "HQ",
+    "Search and Destroy"
+   ],
+   "mechanics": {
+    "loads": "pass",
+    "loads_from_menu": "todo",
+    "spawns": "pass",
+    "mode: TDM": "pass",
+    "mode: FFA": "todo",
+    "mode: Domination": "todo",
+    "mode: Kill Confirmed": "todo",
+    "mode: Hardpoint": "todo",
+    "mode: CTF": "todo",
+    "mode: Demolition": "todo",
+    "mode: HQ": "todo",
+    "mode: Search and Destroy": "todo",
+    "bots": "pass",
+    "scorestreaks": "todo",
+    "killcam": "todo",
+    "end_of_match": "todo"
+   },
+   "visuals": {
+    "spawn": "todo",
+    "centre": "todo",
+    "overview south": "todo",
+    "overview west": "todo"
+   },
+   "evidence": {
+    "loads": "shots/maps/mp_meltdown.png",
+    "spawns": "shots/maps/mp_meltdown.game.log",
+    "mode: TDM": "logs/mp/map_mp_meltdown_tdm.log",
+    "bots": "logs/mp/map_mp_meltdown_tdm.log"
+   }
+  },
+  {
+   "id": "mp_overflow",
+   "map": "Overflow",
+   "modes": [
+    "TDM",
+    "FFA",
+    "Domination",
+    "Kill Confirmed",
+    "Hardpoint",
+    "CTF",
+    "Demolition",
+    "HQ",
+    "Search and Destroy"
+   ],
+   "mechanics": {
+    "loads": "pass",
+    "loads_from_menu": "todo",
+    "spawns": "pass",
+    "mode: TDM": "pass",
+    "mode: FFA": "todo",
+    "mode: Domination": "todo",
+    "mode: Kill Confirmed": "todo",
+    "mode: Hardpoint": "todo",
+    "mode: CTF": "todo",
+    "mode: Demolition": "todo",
+    "mode: HQ": "todo",
+    "mode: Search and Destroy": "todo",
+    "bots": "pass",
+    "scorestreaks": "todo",
+    "killcam": "todo",
+    "end_of_match": "todo"
+   },
+   "visuals": {
+    "spawn": "todo",
+    "centre": "todo",
+    "overview south": "todo",
+    "overview west": "todo"
+   },
+   "evidence": {
+    "loads": "shots/maps/mp_overflow.png",
+    "spawns": "shots/maps/mp_overflow.game.log",
+    "mode: TDM": "logs/mp/map_mp_overflow_tdm.log",
+    "bots": "logs/mp/map_mp_overflow_tdm.log"
+   }
+  },
+  {
+   "id": "mp_nightclub",
+   "map": "Plaza",
+   "modes": [
+    "TDM",
+    "FFA",
+    "Domination",
+    "Kill Confirmed",
+    "Hardpoint",
+    "CTF",
+    "Demolition",
+    "HQ",
+    "Search and Destroy"
+   ],
+   "mechanics": {
+    "loads": "pass",
+    "loads_from_menu": "todo",
+    "spawns": "pass",
+    "mode: TDM": "pass",
+    "mode: FFA": "todo",
+    "mode: Domination": "todo",
+    "mode: Kill Confirmed": "todo",
+    "mode: Hardpoint": "todo",
+    "mode: CTF": "todo",
+    "mode: Demolition": "todo",
+    "mode: HQ": "todo",
+    "mode: Search and Destroy": "todo",
+    "bots": "pass",
+    "scorestreaks": "todo",
+    "killcam": "todo",
+    "end_of_match": "todo"
+   },
+   "visuals": {
+    "spawn": "todo",
+    "centre": "todo",
+    "overview south": "todo",
+    "overview west": "todo"
+   },
+   "evidence": {
+    "loads": "shots/maps/mp_nightclub.png",
+    "spawns": "shots/maps/mp_nightclub.game.log",
+    "mode: TDM": "logs/mp/map_mp_nightclub_tdm.log",
+    "bots": "logs/mp/map_mp_nightclub_tdm.log"
+   }
+  },
+  {
+   "id": "mp_raid",
+   "map": "Raid",
+   "modes": [
+    "TDM",
+    "FFA",
+    "Domination",
+    "Kill Confirmed",
+    "Hardpoint",
+    "CTF",
+    "Demolition",
+    "HQ",
+    "Search and Destroy"
+   ],
+   "mechanics": {
+    "loads": "pass",
+    "loads_from_menu": "todo",
+    "spawns": "pass",
+    "mode: TDM": "pass",
+    "mode: FFA": "todo",
+    "mode: Domination": "todo",
+    "mode: Kill Confirmed": "todo",
+    "mode: Hardpoint": "todo",
+    "mode: CTF": "todo",
+    "mode: Demolition": "todo",
+    "mode: HQ": "todo",
+    "mode: Search and Destroy": "todo",
+    "bots": "pass",
+    "scorestreaks": "todo",
+    "killcam": "todo",
+    "end_of_match": "todo"
+   },
+   "visuals": {
+    "spawn": "todo",
+    "centre": "todo",
+    "overview south": "todo",
+    "overview west": "todo"
+   },
+   "evidence": {
+    "loads": "shots/maps/mp_raid.png",
+    "spawns": "shots/maps/mp_raid.game.log",
+    "mode: TDM": "logs/mp/map_mp_raid_tdm.log",
+    "bots": "logs/mp/map_mp_raid_tdm.log"
+   }
+  },
+  {
+   "id": "mp_slums",
+   "map": "Slums",
+   "modes": [
+    "TDM",
+    "FFA",
+    "Domination",
+    "Kill Confirmed",
+    "Hardpoint",
+    "CTF",
+    "Demolition",
+    "HQ",
+    "Search and Destroy"
+   ],
+   "mechanics": {
+    "loads": "pass",
+    "loads_from_menu": "todo",
+    "spawns": "pass",
+    "mode: TDM": "pass",
+    "mode: FFA": "todo",
+    "mode: Domination": "todo",
+    "mode: Kill Confirmed": "todo",
+    "mode: Hardpoint": "todo",
+    "mode: CTF": "todo",
+    "mode: Demolition": "todo",
+    "mode: HQ": "todo",
+    "mode: Search and Destroy": "todo",
+    "bots": "pass",
+    "scorestreaks": "todo",
+    "killcam": "todo",
+    "end_of_match": "todo"
+   },
+   "visuals": {
+    "spawn": "todo",
+    "centre": "todo",
+    "overview south": "todo",
+    "overview west": "todo"
+   },
+   "evidence": {
+    "loads": "shots/maps/mp_slums.png",
+    "spawns": "shots/maps/mp_slums.game.log",
+    "mode: TDM": "logs/mp/map_mp_slums_tdm.log",
+    "bots": "logs/mp/map_mp_slums_tdm.log"
+   }
+  },
+  {
+   "id": "mp_village",
+   "map": "Standoff",
+   "modes": [
+    "TDM",
+    "FFA",
+    "Domination",
+    "Kill Confirmed",
+    "Hardpoint",
+    "CTF",
+    "Demolition",
+    "HQ",
+    "Search and Destroy"
+   ],
+   "mechanics": {
+    "loads": "pass",
+    "loads_from_menu": "todo",
+    "spawns": "pass",
+    "mode: TDM": "pass",
+    "mode: FFA": "todo",
+    "mode: Domination": "todo",
+    "mode: Kill Confirmed": "todo",
+    "mode: Hardpoint": "todo",
+    "mode: CTF": "todo",
+    "mode: Demolition": "todo",
+    "mode: HQ": "todo",
+    "mode: Search and Destroy": "todo",
+    "bots": "pass",
+    "scorestreaks": "todo",
+    "killcam": "todo",
+    "end_of_match": "todo"
+   },
+   "visuals": {
+    "spawn": "todo",
+    "centre": "todo",
+    "overview south": "todo",
+    "overview west": "todo"
+   },
+   "evidence": {
+    "loads": "shots/maps/mp_village.png",
+    "spawns": "shots/maps/mp_village.game.log",
+    "mode: TDM": "logs/mp/map_mp_village_tdm.log",
+    "bots": "logs/mp/map_mp_village_tdm.log"
+   }
+  },
+  {
+   "id": "mp_turbine",
+   "map": "Turbine",
+   "modes": [
+    "TDM",
+    "FFA",
+    "Domination",
+    "Kill Confirmed",
+    "Hardpoint",
+    "CTF",
+    "Demolition",
+    "HQ",
+    "Search and Destroy"
+   ],
+   "mechanics": {
+    "loads": "pass",
+    "loads_from_menu": "todo",
+    "spawns": "pass",
+    "mode: TDM": "pass",
+    "mode: FFA": "todo",
+    "mode: Domination": "todo",
+    "mode: Kill Confirmed": "todo",
+    "mode: Hardpoint": "todo",
+    "mode: CTF": "todo",
+    "mode: Demolition": "todo",
+    "mode: HQ": "todo",
+    "mode: Search and Destroy": "todo",
+    "bots": "pass",
+    "scorestreaks": "todo",
+    "killcam": "todo",
+    "end_of_match": "todo"
+   },
+   "visuals": {
+    "spawn": "todo",
+    "centre": "todo",
+    "overview south": "todo",
+    "overview west": "todo"
+   },
+   "evidence": {
+    "loads": "shots/maps/mp_turbine.png",
+    "spawns": "shots/maps/mp_turbine.game.log",
+    "mode: TDM": "logs/mp/map_mp_turbine_tdm.log",
+    "bots": "logs/mp/map_mp_turbine_tdm.log"
+   }
+  },
+  {
+   "id": "mp_socotra",
+   "map": "Yemen",
+   "modes": [
+    "TDM",
+    "FFA",
+    "Domination",
+    "Kill Confirmed",
+    "Hardpoint",
+    "CTF",
+    "Demolition",
+    "HQ",
+    "Search and Destroy"
+   ],
+   "mechanics": {
+    "loads": "pass",
+    "loads_from_menu": "todo",
+    "spawns": "pass",
+    "mode: TDM": "pass",
+    "mode: FFA": "todo",
+    "mode: Domination": "todo",
+    "mode: Kill Confirmed": "todo",
+    "mode: Hardpoint": "todo",
+    "mode: CTF": "todo",
+    "mode: Demolition": "todo",
+    "mode: HQ": "todo",
+    "mode: Search and Destroy": "todo",
+    "bots": "pass",
+    "scorestreaks": "todo",
+    "killcam": "todo",
+    "end_of_match": "todo"
+   },
+   "visuals": {
+    "spawn": "todo",
+    "centre": "todo",
+    "overview south": "todo",
+    "overview west": "todo"
+   },
+   "evidence": {
+    "loads": "shots/maps/mp_socotra.png",
+    "spawns": "shots/maps/mp_socotra.game.log",
+    "mode: TDM": "logs/mp/map_mp_socotra_tdm.log",
+    "bots": "logs/mp/map_mp_socotra_tdm.log"
+   }
+  },
+  {
+   "id": "mp_nuketown_2020",
+   "map": "Nuketown 2025",
+   "modes": [
+    "TDM",
+    "FFA",
+    "Domination",
+    "Kill Confirmed",
+    "Hardpoint",
+    "CTF",
+    "Demolition",
+    "HQ",
+    "Search and Destroy"
+   ],
+   "mechanics": {
+    "loads": "pass",
+    "loads_from_menu": "pass",
+    "spawns": "pass",
+    "mode: TDM": "pass",
+    "mode: FFA": "pass",
+    "mode: Domination": "pass",
+    "mode: Kill Confirmed": "pass",
+    "mode: Hardpoint": "pass",
+    "mode: CTF": "pass",
+    "mode: Demolition": "part",
+    "mode: HQ": "pass",
+    "mode: Search and Destroy": "part",
+    "bots": "pass",
+    "scorestreaks": "part",
+    "killcam": "pass",
+    "end_of_match": "pass"
+   },
+   "visuals": {
+    "spawn": "todo",
+    "centre": "todo",
+    "overview south": "todo",
+    "overview west": "todo"
+   },
+   "evidence": {
+    "loads": "shots/maps/mp_nuketown_2020.png",
+    "spawns": "shots/maps/mp_nuketown_2020.game.log",
+    "loads_from_menu": "ui/fe_match.log",
+    "mode: TDM": "logs/mp/mode_tdm.log",
+    "mode: FFA": "logs/mp/mode_dm.log",
+    "mode: Domination": "logs/mp/mode_dom.log",
+    "mode: Kill Confirmed": "logs/mp/mode_conf.log",
+    "mode: Hardpoint": "logs/mp/mode_koth.log",
+    "mode: CTF": "logs/mp/mode_ctf.log",
+    "mode: Demolition": "logs/mp/mode_dem.log",
+    "mode: Search and Destroy": "logs/mp/mode_sd.log",
+    "mode: HQ": "logs/mp/mode_hq.log",
+    "bots": "logs/mp/mode_tdm.log",
+    "scorestreaks": "logs/mp/hks_uav.log",
+    "killcam": "logs/mp/death97.game.log",
+    "end_of_match": "ref/ours/60_match_end.png"
+   }
+  },
+  {
+   "id": "mp_downhill",
+   "map": "Downhill",
+   "modes": [
+    "TDM",
+    "FFA",
+    "Domination",
+    "Kill Confirmed",
+    "Hardpoint",
+    "CTF",
+    "Demolition",
+    "HQ",
+    "Search and Destroy"
+   ],
+   "mechanics": {
+    "loads": "pass",
+    "loads_from_menu": "todo",
+    "spawns": "pass",
+    "mode: TDM": "pass",
+    "mode: FFA": "todo",
+    "mode: Domination": "todo",
+    "mode: Kill Confirmed": "todo",
+    "mode: Hardpoint": "todo",
+    "mode: CTF": "todo",
+    "mode: Demolition": "todo",
+    "mode: HQ": "todo",
+    "mode: Search and Destroy": "todo",
+    "bots": "pass",
+    "scorestreaks": "todo",
+    "killcam": "todo",
+    "end_of_match": "todo"
+   },
+   "visuals": {
+    "spawn": "todo",
+    "centre": "todo",
+    "overview south": "todo",
+    "overview west": "todo"
+   },
+   "evidence": {
+    "loads": "shots/maps/mp_downhill.png",
+    "spawns": "shots/maps/mp_downhill.game.log",
+    "mode: TDM": "logs/mp/map_mp_downhill_tdm.log",
+    "bots": "logs/mp/map_mp_downhill_tdm.log"
+   }
+  },
+  {
+   "id": "mp_mirage",
+   "map": "Mirage",
+   "modes": [
+    "TDM",
+    "FFA",
+    "Domination",
+    "Kill Confirmed",
+    "Hardpoint",
+    "CTF",
+    "Demolition",
+    "HQ",
+    "Search and Destroy"
+   ],
+   "mechanics": {
+    "loads": "pass",
+    "loads_from_menu": "todo",
+    "spawns": "pass",
+    "mode: TDM": "pass",
+    "mode: FFA": "todo",
+    "mode: Domination": "todo",
+    "mode: Kill Confirmed": "todo",
+    "mode: Hardpoint": "todo",
+    "mode: CTF": "todo",
+    "mode: Demolition": "todo",
+    "mode: HQ": "todo",
+    "mode: Search and Destroy": "todo",
+    "bots": "pass",
+    "scorestreaks": "todo",
+    "killcam": "todo",
+    "end_of_match": "todo"
+   },
+   "visuals": {
+    "spawn": "todo",
+    "centre": "todo",
+    "overview south": "todo",
+    "overview west": "todo"
+   },
+   "evidence": {
+    "loads": "shots/maps/mp_mirage.png",
+    "spawns": "shots/maps/mp_mirage.game.log",
+    "mode: TDM": "logs/mp/map_mp_mirage_tdm.log",
+    "bots": "logs/mp/map_mp_mirage_tdm.log"
+   }
+  },
+  {
+   "id": "mp_hydro",
+   "map": "Hydro",
+   "modes": [
+    "TDM",
+    "FFA",
+    "Domination",
+    "Kill Confirmed",
+    "Hardpoint",
+    "CTF",
+    "Demolition",
+    "HQ",
+    "Search and Destroy"
+   ],
+   "mechanics": {
+    "loads": "pass",
+    "loads_from_menu": "todo",
+    "spawns": "pass",
+    "mode: TDM": "pass",
+    "mode: FFA": "todo",
+    "mode: Domination": "todo",
+    "mode: Kill Confirmed": "todo",
+    "mode: Hardpoint": "todo",
+    "mode: CTF": "todo",
+    "mode: Demolition": "todo",
+    "mode: HQ": "todo",
+    "mode: Search and Destroy": "todo",
+    "bots": "pass",
+    "scorestreaks": "todo",
+    "killcam": "todo",
+    "end_of_match": "todo"
+   },
+   "visuals": {
+    "spawn": "todo",
+    "centre": "todo",
+    "overview south": "todo",
+    "overview west": "todo"
+   },
+   "evidence": {
+    "loads": "shots/maps/mp_hydro.png",
+    "spawns": "shots/maps/mp_hydro.game.log",
+    "mode: TDM": "logs/mp/map_mp_hydro_tdm.log",
+    "bots": "logs/mp/map_mp_hydro_tdm.log"
+   }
+  },
+  {
+   "id": "mp_skate",
+   "map": "Grind",
+   "modes": [
+    "TDM",
+    "FFA",
+    "Domination",
+    "Kill Confirmed",
+    "Hardpoint",
+    "CTF",
+    "Demolition",
+    "HQ",
+    "Search and Destroy"
+   ],
+   "mechanics": {
+    "loads": "pass",
+    "loads_from_menu": "todo",
+    "spawns": "pass",
+    "mode: TDM": "pass",
+    "mode: FFA": "todo",
+    "mode: Domination": "todo",
+    "mode: Kill Confirmed": "todo",
+    "mode: Hardpoint": "todo",
+    "mode: CTF": "todo",
+    "mode: Demolition": "todo",
+    "mode: HQ": "todo",
+    "mode: Search and Destroy": "todo",
+    "bots": "pass",
+    "scorestreaks": "todo",
+    "killcam": "todo",
+    "end_of_match": "todo"
+   },
+   "visuals": {
+    "spawn": "todo",
+    "centre": "todo",
+    "overview south": "todo",
+    "overview west": "todo"
+   },
+   "evidence": {
+    "loads": "shots/maps/mp_skate.png",
+    "spawns": "shots/maps/mp_skate.game.log",
+    "mode: TDM": "logs/mp/map_mp_skate_tdm.log",
+    "bots": "logs/mp/map_mp_skate_tdm.log"
+   }
+  },
+  {
+   "id": "mp_concert",
+   "map": "Encore",
+   "modes": [
+    "TDM",
+    "FFA",
+    "Domination",
+    "Kill Confirmed",
+    "Hardpoint",
+    "CTF",
+    "Demolition",
+    "HQ",
+    "Search and Destroy"
+   ],
+   "mechanics": {
+    "loads": "pass",
+    "loads_from_menu": "todo",
+    "spawns": "pass",
+    "mode: TDM": "pass",
+    "mode: FFA": "todo",
+    "mode: Domination": "todo",
+    "mode: Kill Confirmed": "todo",
+    "mode: Hardpoint": "todo",
+    "mode: CTF": "todo",
+    "mode: Demolition": "todo",
+    "mode: HQ": "todo",
+    "mode: Search and Destroy": "todo",
+    "bots": "pass",
+    "scorestreaks": "todo",
+    "killcam": "todo",
+    "end_of_match": "todo"
+   },
+   "visuals": {
+    "spawn": "todo",
+    "centre": "todo",
+    "overview south": "todo",
+    "overview west": "todo"
+   },
+   "evidence": {
+    "loads": "shots/maps/mp_concert.png",
+    "spawns": "shots/maps/mp_concert.game.log",
+    "mode: TDM": "logs/mp/map_mp_concert_tdm.log",
+    "bots": "logs/mp/map_mp_concert_tdm.log"
+   }
+  },
+  {
+   "id": "mp_magma",
+   "map": "Magma",
+   "modes": [
+    "TDM",
+    "FFA",
+    "Domination",
+    "Kill Confirmed",
+    "Hardpoint",
+    "CTF",
+    "Demolition",
+    "HQ",
+    "Search and Destroy"
+   ],
+   "mechanics": {
+    "loads": "pass",
+    "loads_from_menu": "todo",
+    "spawns": "pass",
+    "mode: TDM": "pass",
+    "mode: FFA": "todo",
+    "mode: Domination": "todo",
+    "mode: Kill Confirmed": "todo",
+    "mode: Hardpoint": "todo",
+    "mode: CTF": "todo",
+    "mode: Demolition": "todo",
+    "mode: HQ": "todo",
+    "mode: Search and Destroy": "todo",
+    "bots": "pass",
+    "scorestreaks": "todo",
+    "killcam": "todo",
+    "end_of_match": "todo"
+   },
+   "visuals": {
+    "spawn": "todo",
+    "centre": "todo",
+    "overview south": "todo",
+    "overview west": "todo"
+   },
+   "evidence": {
+    "loads": "shots/maps/mp_magma.png",
+    "spawns": "shots/maps/mp_magma.game.log",
+    "mode: TDM": "logs/mp/map_mp_magma_tdm.log",
+    "bots": "logs/mp/map_mp_magma_tdm.log"
+   }
+  },
+  {
+   "id": "mp_vertigo",
+   "map": "Vertigo",
+   "modes": [
+    "TDM",
+    "FFA",
+    "Domination",
+    "Kill Confirmed",
+    "Hardpoint",
+    "CTF",
+    "Demolition",
+    "HQ",
+    "Search and Destroy"
+   ],
+   "mechanics": {
+    "loads": "pass",
+    "loads_from_menu": "todo",
+    "spawns": "pass",
+    "mode: TDM": "pass",
+    "mode: FFA": "todo",
+    "mode: Domination": "todo",
+    "mode: Kill Confirmed": "todo",
+    "mode: Hardpoint": "todo",
+    "mode: CTF": "todo",
+    "mode: Demolition": "todo",
+    "mode: HQ": "todo",
+    "mode: Search and Destroy": "todo",
+    "bots": "pass",
+    "scorestreaks": "todo",
+    "killcam": "todo",
+    "end_of_match": "todo"
+   },
+   "visuals": {
+    "spawn": "todo",
+    "centre": "todo",
+    "overview south": "todo",
+    "overview west": "todo"
+   },
+   "evidence": {
+    "loads": "shots/maps/mp_vertigo.png",
+    "spawns": "shots/maps/mp_vertigo.game.log",
+    "mode: TDM": "logs/mp/map_mp_vertigo_tdm.log",
+    "bots": "logs/mp/map_mp_vertigo_tdm.log"
+   }
+  },
+  {
+   "id": "mp_studio",
+   "map": "Studio",
+   "modes": [
+    "TDM",
+    "FFA",
+    "Domination",
+    "Kill Confirmed",
+    "Hardpoint",
+    "CTF",
+    "Demolition",
+    "HQ",
+    "Search and Destroy"
+   ],
+   "mechanics": {
+    "loads": "pass",
+    "loads_from_menu": "todo",
+    "spawns": "pass",
+    "mode: TDM": "pass",
+    "mode: FFA": "todo",
+    "mode: Domination": "todo",
+    "mode: Kill Confirmed": "todo",
+    "mode: Hardpoint": "todo",
+    "mode: CTF": "todo",
+    "mode: Demolition": "todo",
+    "mode: HQ": "todo",
+    "mode: Search and Destroy": "todo",
+    "bots": "pass",
+    "scorestreaks": "todo",
+    "killcam": "todo",
+    "end_of_match": "todo"
+   },
+   "visuals": {
+    "spawn": "todo",
+    "centre": "todo",
+    "overview south": "todo",
+    "overview west": "todo"
+   },
+   "evidence": {
+    "loads": "shots/maps/mp_studio.png",
+    "spawns": "shots/maps/mp_studio.game.log",
+    "mode: TDM": "logs/mp/map_mp_studio_tdm.log",
+    "bots": "logs/mp/map_mp_studio_tdm.log"
+   }
+  },
+  {
+   "id": "mp_uplink",
+   "map": "Uplink",
+   "modes": [
+    "TDM",
+    "FFA",
+    "Domination",
+    "Kill Confirmed",
+    "Hardpoint",
+    "CTF",
+    "Demolition",
+    "HQ",
+    "Search and Destroy"
+   ],
+   "mechanics": {
+    "loads": "pass",
+    "loads_from_menu": "todo",
+    "spawns": "pass",
+    "mode: TDM": "pass",
+    "mode: FFA": "todo",
+    "mode: Domination": "todo",
+    "mode: Kill Confirmed": "todo",
+    "mode: Hardpoint": "todo",
+    "mode: CTF": "todo",
+    "mode: Demolition": "todo",
+    "mode: HQ": "todo",
+    "mode: Search and Destroy": "todo",
+    "bots": "pass",
+    "scorestreaks": "todo",
+    "killcam": "todo",
+    "end_of_match": "todo"
+   },
+   "visuals": {
+    "spawn": "todo",
+    "centre": "todo",
+    "overview south": "todo",
+    "overview west": "todo"
+   },
+   "evidence": {
+    "loads": "shots/maps/mp_uplink.png",
+    "spawns": "shots/maps/mp_uplink.game.log",
+    "mode: TDM": "logs/mp/map_mp_uplink_tdm.log",
+    "bots": "logs/mp/map_mp_uplink_tdm.log"
+   }
+  },
+  {
+   "id": "mp_bridge",
+   "map": "Detour",
+   "modes": [
+    "TDM",
+    "FFA",
+    "Domination",
+    "Kill Confirmed",
+    "Hardpoint",
+    "CTF",
+    "Demolition",
+    "HQ",
+    "Search and Destroy"
+   ],
+   "mechanics": {
+    "loads": "pass",
+    "loads_from_menu": "todo",
+    "spawns": "pass",
+    "mode: TDM": "pass",
+    "mode: FFA": "todo",
+    "mode: Domination": "todo",
+    "mode: Kill Confirmed": "todo",
+    "mode: Hardpoint": "todo",
+    "mode: CTF": "todo",
+    "mode: Demolition": "todo",
+    "mode: HQ": "todo",
+    "mode: Search and Destroy": "todo",
+    "bots": "pass",
+    "scorestreaks": "todo",
+    "killcam": "todo",
+    "end_of_match": "todo"
+   },
+   "visuals": {
+    "spawn": "todo",
+    "centre": "todo",
+    "overview south": "todo",
+    "overview west": "todo"
+   },
+   "evidence": {
+    "loads": "shots/maps/mp_bridge.png",
+    "spawns": "shots/maps/mp_bridge.game.log",
+    "mode: TDM": "logs/mp/map_mp_bridge_tdm.log",
+    "bots": "logs/mp/map_mp_bridge_tdm.log"
+   }
+  },
+  {
+   "id": "mp_castaway",
+   "map": "Cove",
+   "modes": [
+    "TDM",
+    "FFA",
+    "Domination",
+    "Kill Confirmed",
+    "Hardpoint",
+    "CTF",
+    "Demolition",
+    "HQ",
+    "Search and Destroy"
+   ],
+   "mechanics": {
+    "loads": "pass",
+    "loads_from_menu": "todo",
+    "spawns": "pass",
+    "mode: TDM": "pass",
+    "mode: FFA": "todo",
+    "mode: Domination": "todo",
+    "mode: Kill Confirmed": "todo",
+    "mode: Hardpoint": "todo",
+    "mode: CTF": "todo",
+    "mode: Demolition": "todo",
+    "mode: HQ": "todo",
+    "mode: Search and Destroy": "todo",
+    "bots": "pass",
+    "scorestreaks": "todo",
+    "killcam": "todo",
+    "end_of_match": "todo"
+   },
+   "visuals": {
+    "spawn": "todo",
+    "centre": "todo",
+    "overview south": "todo",
+    "overview west": "todo"
+   },
+   "evidence": {
+    "loads": "shots/maps/mp_castaway.png",
+    "spawns": "shots/maps/mp_castaway.game.log",
+    "mode: TDM": "logs/mp/map_mp_castaway_tdm.log",
+    "bots": "logs/mp/map_mp_castaway_tdm.log"
+   }
+  },
+  {
+   "id": "mp_paintball",
+   "map": "Rush",
+   "modes": [
+    "TDM",
+    "FFA",
+    "Domination",
+    "Kill Confirmed",
+    "Hardpoint",
+    "CTF",
+    "Demolition",
+    "HQ",
+    "Search and Destroy"
+   ],
+   "mechanics": {
+    "loads": "pass",
+    "loads_from_menu": "todo",
+    "spawns": "pass",
+    "mode: TDM": "pass",
+    "mode: FFA": "todo",
+    "mode: Domination": "todo",
+    "mode: Kill Confirmed": "todo",
+    "mode: Hardpoint": "todo",
+    "mode: CTF": "todo",
+    "mode: Demolition": "todo",
+    "mode: HQ": "todo",
+    "mode: Search and Destroy": "todo",
+    "bots": "pass",
+    "scorestreaks": "todo",
+    "killcam": "todo",
+    "end_of_match": "todo"
+   },
+   "visuals": {
+    "spawn": "todo",
+    "centre": "todo",
+    "overview south": "todo",
+    "overview west": "todo"
+   },
+   "evidence": {
+    "loads": "shots/maps/mp_paintball.png",
+    "spawns": "shots/maps/mp_paintball.game.log",
+    "mode: TDM": "logs/mp/map_mp_paintball_tdm.log",
+    "bots": "logs/mp/map_mp_paintball_tdm.log"
+   }
+  },
+  {
+   "id": "mp_dig",
+   "map": "Dig",
+   "modes": [
+    "TDM",
+    "FFA",
+    "Domination",
+    "Kill Confirmed",
+    "Hardpoint",
+    "CTF",
+    "Demolition",
+    "HQ",
+    "Search and Destroy"
+   ],
+   "mechanics": {
+    "loads": "pass",
+    "loads_from_menu": "todo",
+    "spawns": "pass",
+    "mode: TDM": "pass",
+    "mode: FFA": "todo",
+    "mode: Domination": "todo",
+    "mode: Kill Confirmed": "todo",
+    "mode: Hardpoint": "todo",
+    "mode: CTF": "todo",
+    "mode: Demolition": "todo",
+    "mode: HQ": "todo",
+    "mode: Search and Destroy": "todo",
+    "bots": "pass",
+    "scorestreaks": "todo",
+    "killcam": "todo",
+    "end_of_match": "todo"
+   },
+   "visuals": {
+    "spawn": "todo",
+    "centre": "todo",
+    "overview south": "todo",
+    "overview west": "todo"
+   },
+   "evidence": {
+    "loads": "shots/maps/mp_dig.png",
+    "spawns": "shots/maps/mp_dig.game.log",
+    "mode: TDM": "logs/mp/map_mp_dig_tdm.log",
+    "bots": "logs/mp/map_mp_dig_tdm.log"
+   }
+  },
+  {
+   "id": "mp_frostbite",
+   "map": "Frost",
+   "modes": [
+    "TDM",
+    "FFA",
+    "Domination",
+    "Kill Confirmed",
+    "Hardpoint",
+    "CTF",
+    "Demolition",
+    "HQ",
+    "Search and Destroy"
+   ],
+   "mechanics": {
+    "loads": "pass",
+    "loads_from_menu": "todo",
+    "spawns": "pass",
+    "mode: TDM": "pass",
+    "mode: FFA": "todo",
+    "mode: Domination": "todo",
+    "mode: Kill Confirmed": "todo",
+    "mode: Hardpoint": "todo",
+    "mode: CTF": "todo",
+    "mode: Demolition": "todo",
+    "mode: HQ": "todo",
+    "mode: Search and Destroy": "todo",
+    "bots": "pass",
+    "scorestreaks": "todo",
+    "killcam": "todo",
+    "end_of_match": "todo"
+   },
+   "visuals": {
+    "spawn": "todo",
+    "centre": "todo",
+    "overview south": "todo",
+    "overview west": "todo"
+   },
+   "evidence": {
+    "loads": "shots/maps/mp_frostbite.png",
+    "spawns": "shots/maps/mp_frostbite.game.log",
+    "mode: TDM": "logs/mp/map_mp_frostbite_tdm.log",
+    "bots": "logs/mp/map_mp_frostbite_tdm.log"
+   }
+  },
+  {
+   "id": "mp_pod",
+   "map": "Pod",
+   "modes": [
+    "TDM",
+    "FFA",
+    "Domination",
+    "Kill Confirmed",
+    "Hardpoint",
+    "CTF",
+    "Demolition",
+    "HQ",
+    "Search and Destroy"
+   ],
+   "mechanics": {
+    "loads": "pass",
+    "loads_from_menu": "todo",
+    "spawns": "pass",
+    "mode: TDM": "pass",
+    "mode: FFA": "todo",
+    "mode: Domination": "todo",
+    "mode: Kill Confirmed": "todo",
+    "mode: Hardpoint": "todo",
+    "mode: CTF": "todo",
+    "mode: Demolition": "todo",
+    "mode: HQ": "todo",
+    "mode: Search and Destroy": "todo",
+    "bots": "pass",
+    "scorestreaks": "todo",
+    "killcam": "todo",
+    "end_of_match": "todo"
+   },
+   "visuals": {
+    "spawn": "todo",
+    "centre": "todo",
+    "overview south": "todo",
+    "overview west": "todo"
+   },
+   "evidence": {
+    "loads": "shots/maps/mp_pod.png",
+    "spawns": "shots/maps/mp_pod.game.log",
+    "mode: TDM": "logs/mp/map_mp_pod_tdm.log",
+    "bots": "logs/mp/map_mp_pod_tdm.log"
+   }
+  },
+  {
+   "id": "mp_takeoff",
+   "map": "Takeoff",
+   "modes": [
+    "TDM",
+    "FFA",
+    "Domination",
+    "Kill Confirmed",
+    "Hardpoint",
+    "CTF",
+    "Demolition",
+    "HQ",
+    "Search and Destroy"
+   ],
+   "mechanics": {
+    "loads": "pass",
+    "loads_from_menu": "todo",
+    "spawns": "pass",
+    "mode: TDM": "pass",
+    "mode: FFA": "todo",
+    "mode: Domination": "todo",
+    "mode: Kill Confirmed": "todo",
+    "mode: Hardpoint": "todo",
+    "mode: CTF": "todo",
+    "mode: Demolition": "todo",
+    "mode: HQ": "todo",
+    "mode: Search and Destroy": "todo",
+    "bots": "pass",
+    "scorestreaks": "todo",
+    "killcam": "todo",
+    "end_of_match": "todo"
+   },
+   "visuals": {
+    "spawn": "todo",
+    "centre": "todo",
+    "overview south": "todo",
+    "overview west": "todo"
+   },
+   "evidence": {
+    "loads": "shots/maps/mp_takeoff.png",
+    "spawns": "shots/maps/mp_takeoff.game.log",
+    "mode: TDM": "logs/mp/map_mp_takeoff_tdm.log",
+    "bots": "logs/mp/map_mp_takeoff_tdm.log"
+   }
+  }
+ ]
+}

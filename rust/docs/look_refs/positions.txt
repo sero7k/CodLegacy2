@@ -1,0 +1,20 @@
+mp_terminal 552 4424 104.1
+mp_crash intermission 336 60 268 (HMW cg_drawviewpos)
+mp_bog intermission 5688 1608 296
+mp_crossfire intermission 3804 -988 204
+mp_rust intermission -556.5 98 -87.5
+mp_highrise intermission -2632 7384 3352
+mp_terminal intermission 552 4424 288
+mp_favela intermission -872 -112 80
+mp_estate intermission (see shot)
+mp_broadcast: HMW itself drew this one broken on this PC (black sky, black specks) - not a usable reference
+mp_creek: HMW fatal error 0xC0000005 loading it (imagefile31) - no reference
+mp_bog_summer: HMW drew it broken (purple/black, as Broadcast and the menu backdrop) - not usable
+mp_blackbox: HMW drew it broken (purple/black) - not usable
+mp_climate_3: HMW drew it broken (purple/black) - not usable
+mp_dam: partly broken in HMW (black windows, purple cast) - use with care
+mp_liberty: HMW drew it broken (purple/black) - not usable
+mp_lost: magenta patch on the ground is HMW's own bad texture
+mp_perplex_1: did not load in HMW (back to the menu)
+mp_seoul2: did not load in HMW (back to the menu)
+mp_village: did not load in HMW (back to the menu)

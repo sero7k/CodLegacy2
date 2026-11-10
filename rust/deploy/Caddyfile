@@ -1,0 +1,10 @@
+# Caddy gives the service HTTPS (certificates are automatic) and passes it the real
+# client address. Replace the domain, point its DNS A record at the server, and open
+# ports 80 and 443. Then:  sudo caddy reload --config /etc/caddy/Caddyfile
+codlegacy.example.com {
+	encode gzip
+	reverse_proxy 127.0.0.1:8080 {
+		# Overwrites anything a client sends, so ACCOUNTS_TRUST_IP_HEADER=X-Real-IP is safe.
+		header_up X-Real-IP {remote_host}
+	}
+}

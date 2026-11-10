@@ -711,9 +711,9 @@ local function walk(el, depth, fn)
 end
 
 local function realign_label(label)
-    local ts = CoD.TextSettings.TitleFontTiny
-    local h = ts.Height * ((LUI.UIGenericButton and LUI.UIGenericButton.fontScale) or 0.8)
-    local y = -3
+    local ts = CoD.TextSettings.BodyFont or CoD.TextSettings.TitleFontTiny
+    local h = UI.px(30)
+    local y = 0
     local function st(c, a)
         return {
             alignment = LUI.Alignment.Right,
@@ -768,15 +768,40 @@ local function after_build(menu)
         local title = menu:getChildById("generic_title")
         if title and not title.claude_bar then
             title.claude_bar = true
-            -- The bar standing at the title's left (view.rs ghosts_frame).
+            local function find(root, id)
+                local hit = nil
+                walk(root, 0, function(el)
+                    if not hit and el.id == id then
+                        hit = el
+                    end
+                end)
+                return hit
+            end
+            local crumb = find(title, "breadcrumb_text")
+            local head = find(title, "header_text")
+            local function text_of(el)
+                local ok, t = pcall(function()
+                    return el:getText()
+                end)
+                return ok and type(t) == "string" and t or ""
+            end
+            local line = text_of(head)
+            local c = text_of(crumb)
+            if c ~= "" and line ~= "" then
+                line = c .. "  /  " .. line
+            elseif line == "" then
+                line = c
+            end
+            -- (Coordinates inside generic_title, whose corner sits at about
+            -- 101, 43 on a 1080-line screen.)
             title:addElement(LUI.UIImage.new({
                 topAnchor = true,
                 bottomAnchor = false,
                 leftAnchor = true,
                 rightAnchor = false,
-                top = UI.px(90),
-                height = UI.px(34),
-                left = UI.px(84),
+                top = UI.px(45),
+                height = UI.px(40),
+                left = UI.px(-1),
                 width = math.max(3, UI.px(7)),
                 material = UI.material("white"),
                 red = UI.ACCENT.r,
@@ -784,6 +809,34 @@ local function after_build(menu)
                 blue = UI.ACCENT.b,
                 alpha = 1,
             }))
+            if line ~= "" then
+                for _, el in ipairs({ crumb, head }) do
+                    if el then
+                        pcall(function()
+                            el:setAlpha(0)
+                        end)
+                    end
+                end
+                local font = (CoD.TextSettings.BodyFont or CoD.TextSettings.TitleFontTiny).Font
+                local t = LUI.UIText.new({
+                    topAnchor = true,
+                    bottomAnchor = false,
+                    leftAnchor = true,
+                    rightAnchor = false,
+                    top = UI.px(41),
+                    height = UI.px(48),
+                    left = UI.px(21),
+                    width = UI.px(1400),
+                    alignment = LUI.Alignment.Left,
+                    font = font,
+                    red = 1,
+                    green = 1,
+                    blue = 1,
+                    alpha = 1,
+                })
+                t:setText(line)
+                title:addElement(t)
+            end
         end
     end)
     if not logged_trees[key] then

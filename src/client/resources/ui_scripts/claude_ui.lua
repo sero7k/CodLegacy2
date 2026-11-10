@@ -1107,11 +1107,168 @@ if LUI.MenuTemplate then
     LUI.MenuTemplate.AddBuildNumber = function() end
 end
 
--- The player card at the top right, as our shell's (view.rs): x 1130-1708,
--- y 105-205 on a 1080-line screen.
-local card_logged = false
+-- The player banner at the top right, as our shell's (view.rs card): a line
+-- of his numbers over it, his calling card as the banner with his name and
+-- level at its right, a blue strip along its foot with LEVEL / XP and his
+-- progress, his emblem standing beside it, and his line in the party under
+-- it. HMW's own card (found by its picture) is hidden.
+local function stat(group, name)
+    local ok, v = pcall(function()
+        return Engine.GetPlayerData(0, group, name)
+    end)
+    return ok and tonumber(v) or 0
+end
+
+local function player_info()
+    local p = {}
+    p.name = "PLAYER"
+    pcall(function()
+        p.name = Engine.GetUsernameByController(0) or p.name
+    end)
+    p.prestige = stat(CoD.StatsGroup.Ranked, "prestige")
+    p.xp = 0
+    pcall(function()
+        p.xp = tonumber(Engine.GetPlayerDataMPXP(0)) or 0
+    end)
+    p.rank = 0
+    pcall(function()
+        p.rank = Lobby.GetRankForXP(p.xp, p.prestige) or 0
+    end)
+    p.level = tostring(p.rank + 1)
+    pcall(function()
+        p.level = tostring(Rank.GetRankDisplay(p.rank))
+    end)
+    p.frac = 0
+    pcall(function()
+        local lo = Rank.GetRankMinXP(p.rank, p.prestige)
+        local hi = Rank.GetRankMaxXP(p.rank, p.prestige)
+        if hi and lo and hi > lo then
+            p.frac = math.max(0, math.min(1, (p.xp - lo) / (hi - lo)))
+        end
+    end)
+    p.kills = stat(CoD.StatsGroup.Ranked, "kills")
+    p.deaths = stat(CoD.StatsGroup.Ranked, "deaths")
+    p.kd = p.deaths > 0 and p.kills / p.deaths or p.kills
+    p.rank_icon = nil
+    pcall(function()
+        p.rank_icon = UI.material(Rank.GetRankIcon(p.rank, p.prestige))
+    end)
+    p.card = nil
+    pcall(function()
+        local idx = Engine.GetPlayerData(0, CoD.StatsGroup.Common, "callingCardIndex")
+        local img = Engine.TableLookupByRow(CallingCardTable.File, tonumber(idx), CallingCardTable.Cols.Image)
+        if img and img ~= "" then
+            p.card = UI.material(img)
+        end
+    end)
+    p.emblem = nil
+    pcall(function()
+        local idx = Engine.GetPlayerData(0, CoD.StatsGroup.Common, "emblemPatchIndex")
+        local img = Engine.TableLookup(EmblemIconTable.File, EmblemIconTable.Cols.ID, tostring(idx), EmblemIconTable.Cols.Image)
+        if img and img ~= "" then
+            p.emblem = UI.material(img)
+        end
+    end)
+    return p
+end
+
+local function build_banner(menu)
+    local ox, oy = menu:getCurrentGlobalRect()
+    ox, oy = ox or 0, oy or 0
+    local body = (CoD.TextSettings.BodyFont or CoD.TextSettings.TitleFontTiny).Font
+    local bold = (CoD.TextSettings.BodyFontBold or CoD.TextSettings.BodyFont or CoD.TextSettings.TitleFontTiny).Font
+    local function box(x1, y1, x2, y2)
+        return {
+            topAnchor = true, leftAnchor = true, bottomAnchor = false, rightAnchor = false,
+            left = UI.px(x1) - ox, top = UI.px(y1) - oy,
+            width = UI.px(x2 - x1), height = UI.px(y2 - y1),
+        }
+    end
+    local function image(parent, x1, y1, x2, y2, mat, c, a)
+        local st = box(x1, y1, x2, y2)
+        st.material = mat or UI.material("white")
+        st.color = c or UI.WHITE
+        st.alpha = a or 1
+        local el = LUI.UIImage.new(st)
+        parent:addElement(el)
+        return el
+    end
+    local function text(parent, x1, y, h, str, font, c, a, align, w)
+        local st = box(x1, y, x1 + (w or 600), y + h)
+        st.font = font
+        st.alignment = align or LUI.Alignment.Left
+        st.color = c or UI.WHITE
+        st.alpha = a or 1
+        local el = LUI.UIText.new(st)
+        el:setText(str)
+        parent:addElement(el)
+        return el
+    end
+
+    local root = LUI.UIElement.new({
+        topAnchor = true, bottomAnchor = true, leftAnchor = true, rightAnchor = true,
+        top = 0, bottom = 0, left = 0, right = 0,
+    })
+    root.claude = true
+    local p = player_info()
+    local t = {}
+
+    -- His numbers over the banner.
+    image(root, 1138, 78, 1162, 98, p.rank_icon, UI.WHITE, p.rank_icon and 1 or 0)
+    t.level_small = text(root, 1166, 76, 24, p.level, bold, UI.WHITE, 1)
+    t.kills = text(root, 1200, 76, 24, tostring(p.kills), bold, UI.WHITE, 1)
+    text(root, 1214 + string.len(tostring(p.kills)) * 6, 82, 16, "KILLS", body, UI.DIM, 0.6)
+    t.deaths = text(root, 1268, 76, 24, tostring(p.deaths), bold, UI.WHITE, 1)
+    text(root, 1282 + string.len(tostring(p.deaths)) * 6, 82, 16, "DEATHS", body, UI.DIM, 0.6)
+    t.kd = text(root, 1345, 76, 24, string.format("%.2f", p.kd), bold, UI.WHITE, 1)
+    text(root, 1392, 82, 16, "K/D RATIO", body, UI.DIM, 0.6)
+
+    -- The banner: his calling card, a white rule along its top.
+    image(root, 1130, 104, 1708, 206, UI.material("white"), UI.PANEL, 0.9)
+    if p.card then
+        image(root, 1130, 104, 1708, 206, p.card, UI.WHITE, 1)
+    end
+    image(root, 1130, 103, 1708, 105, UI.material("white"), UI.WHITE, 0.9)
+    t.name = text(root, 1300, 118, 34, string.upper(p.name), bold, UI.WHITE, 1, LUI.Alignment.Right, 260)
+    t.level_big = text(root, 1570, 118, 34, p.level, bold, UI.WHITE, 1, LUI.Alignment.Left, 80)
+    -- The strip along its foot.
+    image(root, 1130, 162, 1708, 206, UI.material("white"), UI.ACCENT, 0.82)
+    t.xp = text(root, 1139, 171, 20, "LEVEL " .. p.level .. "  \194\183  " .. tostring(p.xp) .. " XP", bold, UI.WHITE, 1)
+    image(root, 1139, 193, 1700, 196, UI.material("white"), UI.WHITE, 0.25)
+    t.bar = image(root, 1139, 193, 1139 + math.max(1, math.floor(561 * p.frac)), 196, UI.material("white"), UI.WHITE, 1)
+    -- His emblem beside it.
+    image(root, 1717, 104, 1818, 206, UI.material("white"), UI.PANEL, 0.9)
+    image(root, 1717, 104, 1818, 206, p.emblem or p.rank_icon, UI.WHITE, (p.emblem or p.rank_icon) and 1 or 0)
+
+    -- His line in the party.
+    text(root, 1176, 236, 20, ">", body, UI.WHITE, 1)
+    image(root, 1202, 234, 1226, 256, p.rank_icon, UI.WHITE, p.rank_icon and 1 or 0)
+    t.party_level = text(root, 1236, 234, 24, p.level, body, UI.WHITE, 0.9)
+    t.party_name = text(root, 1290, 234, 24, p.name, body, UI.WHITE, 0.9)
+    image(root, 1178, 261, 1758, 262, UI.material("white"), UI.WHITE, 0.25)
+
+    -- Kept current (a match, a prestige, a new card).
+    root:addElement(LUI.UITimer.new(2000, "claude_banner_tick"))
+    root:registerEventHandler("claude_banner_tick", function()
+        pcall(function()
+            local q = player_info()
+            t.level_small:setText(q.level)
+            t.kills:setText(tostring(q.kills))
+            t.deaths:setText(tostring(q.deaths))
+            t.kd:setText(string.format("%.2f", q.kd))
+            t.name:setText(string.upper(q.name))
+            t.level_big:setText(q.level)
+            t.xp:setText("LEVEL " .. q.level .. "  \194\183  " .. tostring(q.xp) .. " XP")
+            t.party_level:setText(q.level)
+            t.party_name:setText(q.name)
+        end)
+    end)
+    menu:addElement(root)
+    return root
+end
+
+local banner_logged = false
 local function place_card(menu)
-    -- (The card: what holds HMW's card picture, h2m_ui_playercard_bg.)
     local bg = UI.card_bg
     if not bg then
         return
@@ -1120,7 +1277,6 @@ local function place_card(menu)
     if not card then
         return
     end
-    -- Only a card inside this menu.
     local inside, p = false, card
     while p do
         if p == menu then
@@ -1132,22 +1288,25 @@ local function place_card(menu)
     if not inside then
         return
     end
+    -- HMW's card and the pieces drawn with it (its rule above) go.
+    hide(card)
     local parent = card:getParent()
-    if not parent then
-        return
+    if parent then
+        local c = parent:getFirstChild()
+        while c do
+            if c.id == "LUIImage" then
+                hide(c)
+            end
+            c = c:getNextSibling()
+        end
     end
-    local pl, pt = parent:getCurrentGlobalRect()
-    if type(pl) ~= "number" then
-        return
-    end
-    local L, T, R, B = UI.px(1130), UI.px(105), UI.px(1708), UI.px(205)
-    card:setLeftRight(true, false, L - pl, R - pl)
-    card:setTopBottom(true, false, T - pt, B - pt)
-    if not card_logged then
-        card_logged = true
-        local cl, ct, cr, cb = card:getCurrentGlobalRect()
-        log("card '" .. tostring(card.id) .. "' in '" .. tostring(parent.id) .. "' parent at " ..
-            tostring(pl) .. "," .. tostring(pt) .. " card now " .. tostring(cl) .. "," .. tostring(ct) .. "," .. tostring(cr) .. "," .. tostring(cb))
+    if not menu.claude_banner then
+        local ok, err = pcall(build_banner, menu)
+        menu.claude_banner = true
+        if not banner_logged then
+            banner_logged = true
+            log("banner: " .. (ok and "built" or tostring(err)))
+        end
     end
 end
 

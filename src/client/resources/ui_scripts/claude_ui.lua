@@ -759,6 +759,8 @@ local ROW_WORDS = {
     ["BARRACKS"] = { "BARRACKS", "Your combat record, calling card, emblem and prestige." },
     ["KILLSTREAKS"] = { "SCORESTREAKS", "Pick the streaks you earn in a match." },
     ["PERSONALIZATION"] = { "PERSONALIZATION", "Your calling card, emblem and faction." },
+    ["CALLING CARD & EMBLEM"] = { "CALLING CARD & EMBLEM", "Your calling card, emblem and faction." },
+    ["SCORESTREAKS"] = { "SCORESTREAKS", "Pick the streaks you earn in a match." },
     ["START GAME"] = { "START MATCH", "Everyone in, the match begins." },
     ["START MATCH"] = { "START MATCH", "Everyone in, the match begins." },
     ["GAME SETUP"] = { "GAME SETTINGS", "The map, the mode, the bots and the rules." },
@@ -856,6 +858,37 @@ local function row_words(menu)
             mark:setAlpha((text and text ~= "") and 1 or 0)
         end)
     end
+    -- (Killstreaks and Personalization are not rows of their own in our
+    -- shell: streaks are picked in Create-a-Class, the card and emblem in
+    -- Barracks. Their actions are kept for those screens.)
+    local moved = {}
+    local c0 = menu.list:getFirstChild()
+    while c0 do
+        local lbl = nil
+        walk(c0, 0, function(el)
+            if not lbl and el.id == "text_label" then
+                lbl = el
+            end
+        end)
+        if lbl then
+            local t = ""
+            pcall(function()
+                t = string.upper(lbl:getText() or "")
+            end)
+            if (t == "KILLSTREAKS" or t == "PERSONALIZATION") and c0.properties and c0.properties.button_action_func then
+                UI.actions = UI.actions or {}
+                UI.actions[t] = c0.properties.button_action_func
+                moved[#moved + 1] = c0
+            end
+        end
+        c0 = c0:getNextSibling()
+    end
+    for _, b in ipairs(moved) do
+        pcall(function()
+            b:close()
+        end)
+    end
+
     local c = menu.list:getFirstChild()
     while c do
         local btn = c
@@ -894,9 +927,34 @@ local function row_words(menu)
     end
 end
 
+-- Rows our shell has on a screen that HMW's lacks (their actions are the
+-- moved rows' own).
+local function add_moved_rows(menu, key)
+    local acts = UI.actions or {}
+    if not menu.AddButton or menu.claude_added then
+        return
+    end
+    menu.claude_added = true
+    local function add(label, act)
+        if act then
+            pcall(function()
+                menu:AddButton(label, function(el, ev)
+                    act(el, ev)
+                end)
+            end)
+        end
+    end
+    if key == "CacMenu_container" then
+        add("SCORESTREAKS", acts.KILLSTREAKS)
+    elseif key == "OperatorMenu_container" then
+        add("CALLING CARD & EMBLEM", acts.PERSONALIZATION)
+    end
+end
+
 local function after_build(menu)
     local key = tostring(menu.id or menu.type or "?")
     local count = 0
+    pcall(add_moved_rows, menu, key)
     pcall(row_words, menu)
     walk(menu, 0, function(el, depth)
         local id = tostring(el.id or "")

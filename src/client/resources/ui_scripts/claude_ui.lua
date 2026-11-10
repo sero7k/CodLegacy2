@@ -766,6 +766,8 @@ local ROW_WORDS = {
     ["PERSONALIZATION"] = { "PERSONALIZATION", "Your calling card, emblem and faction." },
     ["CALLING CARD & EMBLEM"] = { "CALLING CARD & EMBLEM", "Your calling card, emblem and faction." },
     ["SCORESTREAKS"] = { "SCORESTREAKS", "Pick the streaks you earn in a match." },
+    ["CUSTOM CALLING CARDS"] = { "CUSTOM CALLING CARDS", "Our own calling cards, animated, on your banner." },
+    ["CUSTOM EMBLEMS"] = { "CUSTOM EMBLEMS", "Our own emblems, beside your banner." },
     ["START GAME"] = { "START MATCH", "Everyone in, the match begins." },
     ["START MATCH"] = { "START MATCH", "Everyone in, the match begins." },
     ["GAME SETUP"] = { "GAME SETTINGS", "The map, the mode, the bots and the rules." },
@@ -955,6 +957,13 @@ local function add_moved_rows(menu, key)
         add("SCORESTREAKS", acts.KILLSTREAKS)
     elseif key == "OperatorMenu_container" then
         add("CALLING CARD & EMBLEM", acts.PERSONALIZATION)
+        local function open(name)
+            return function(el, ev)
+                LUI.FlowManager.RequestAddMenu(el, name, true, ev and ev.controller or 0, false)
+            end
+        end
+        add("CUSTOM CALLING CARDS", open("claude_custom_cards"))
+        add("CUSTOM EMBLEMS", open("claude_custom_emblems"))
     end
 end
 
@@ -1465,6 +1474,114 @@ local function click_area(parent, st, fn)
     parent:addElement(area)
     return area
 end
+
+-- Our custom cards and emblems in a picker of their own (as our shell's
+-- CUSTOM category): a tile for each, with its first frame and its name, the
+-- one in use marked; a click puts it on the banner (clc_card / clc_emblem).
+-- Opened from Barracks.
+local CUSTOM_TITLES = {
+    card_above_the_clouds = "Above the Clouds", card_freedom = "Freedom", card_awakened_eye = "Awakened Eye",
+    card_the_founder = "The Founder", card_dread = "Dread", card_the_rumbling = "The Rumbling",
+    card_third_impact = "Third Impact", card_frieren_himmel = "The Promise", card_himmel = "Himmel",
+    card_stark = "Stark", card_campfire = "Campfire", card_quiet_forest = "Quiet Forest",
+    card_frieren = "Frieren", card_kittens_look_up = "Stripe", card_sleepy_paws = "Sleepy Paws",
+    card_snuggle = "Snuggle", card_mural = "Mural", emblem_legacy = "Legacy", emblem_berserk = "Berserk",
+}
+
+local function custom_picker(kind)
+    local cards = kind == "cards"
+    local list = cards and CUSTOM_CARDS or CUSTOM_EMBLEMS
+    local dvar = cards and "clc_card" or "clc_emblem"
+    return function(a1, a2, ...)
+        local menu = LUI.MenuTemplate.new(a1, {
+            menu_title = cards and "MULTIPLAYER  /  BARRACKS  /  CUSTOM CALLING CARDS" or "MULTIPLAYER  /  BARRACKS  /  CUSTOM EMBLEMS",
+        })
+        local body = (CoD.TextSettings.BodyFont or CoD.TextSettings.TitleFontTiny).Font
+        local cols = cards and 3 or 5
+        local tw, th = cards and 400 or 170, cards and 100 or 170
+        local gx, gy = cards and 20 or 24, cards and 44 or 52
+        local x0, y0 = 150, 230
+        local tiles = {}
+        local function st(x1, y1, x2, y2)
+            return {
+                topAnchor = true, leftAnchor = true, bottomAnchor = false, rightAnchor = false,
+                left = UI.px(x1), top = UI.px(y1), width = UI.px(x2 - x1), height = UI.px(y2 - y1),
+            }
+        end
+        local entries = { { "", 1 } }
+        for _, e in ipairs(list) do
+            entries[#entries + 1] = e
+        end
+        local function current()
+            local v = ""
+            pcall(function()
+                v = Engine.GetDvarString(dvar) or ""
+            end)
+            return v
+        end
+        local function refresh()
+            local cur = current()
+            for _, t in ipairs(tiles) do
+                pcall(function()
+                    t.mark:setAlpha(t.name == cur and 1 or 0)
+                end)
+            end
+        end
+        for i, e in ipairs(entries) do
+            local c = (i - 1) % cols
+            local r = math.floor((i - 1) / cols)
+            local x = x0 + c * (tw + gx)
+            local y = y0 + r * (th + gy)
+            local holder = LUI.UIElement.new(st(x, y, x + tw, y + th + 30))
+            holder.claude = true
+            local bg = st(0, 0, tw, th)
+            bg.material = UI.material("white")
+            bg.color = UI.PANEL
+            bg.alpha = 0.85
+            holder:addElement(LUI.UIImage.new(bg))
+            if e[1] ~= "" then
+                local im = st(0, 0, tw, th)
+                im.material = custom_frame(kind, e, 0) or UI.material("white")
+                im.alpha = custom_frame(kind, e, 0) and 1 or 0
+                holder:addElement(LUI.UIImage.new(im))
+            end
+            local mk = st(0, th - 4, tw, th)
+            mk.material = UI.material("white")
+            mk.color = UI.ACCENT
+            mk.alpha = 0
+            local mark = LUI.UIImage.new(mk)
+            holder:addElement(mark)
+            local tx = st(0, th + 4, tw, th + 26)
+            tx.font = body
+            tx.alignment = LUI.Alignment.Left
+            tx.color = UI.TEXT
+            local label = LUI.UIText.new(tx)
+            label:setText(e[1] == "" and "Game's own" or (CUSTOM_TITLES[e[1]] or e[1]))
+            holder:addElement(label)
+            holder:setHandleMouseButton(true)
+            local name = e[1]
+            holder:registerEventHandler("leftmouseup", function()
+                pcall(function()
+                    Engine.SetDvarFromString(dvar, name)
+                end)
+                log(dvar .. " = '" .. name .. "'")
+                refresh()
+            end)
+            menu:addElement(holder)
+            tiles[#tiles + 1] = { name = name, mark = mark }
+        end
+        refresh()
+        pcall(function()
+            menu:AddBackButton()
+        end)
+        return menu
+    end
+end
+
+pcall(function()
+    LUI.MenuBuilder.m_types_build.claude_custom_cards = custom_picker("cards")
+    LUI.MenuBuilder.m_types_build.claude_custom_emblems = custom_picker("emblems")
+end)
 
 local function build_banner(menu)
     local ox, oy = menu:getCurrentGlobalRect()

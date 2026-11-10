@@ -1431,8 +1431,14 @@ local function add_after_build(menu)
             -- The lobby room is behind our backdrop: put it in its "obscured"
             -- mode so its soldier stops playing (and making sound) unseen.
             -- (Create-a-Class pushes its own mode and gives this one back.)
+            -- (Off: forcing the lobby into its "obscured" mode outside the
+            -- game's own push/pop is the likeliest cause of the script-string
+            -- memory crash after ~12 minutes in the menus. Set
+            -- clc_vlobby_obscure 1 to try it again.)
             pcall(function()
-                Engine.SetDvarInt("virtualLobbyMode", VirtualLobbyModes.LUI_MODE_OBSCURED)
+                if Engine.GetDvarInt("clc_vlobby_obscure") == 1 then
+                    Engine.SetDvarInt("virtualLobbyMode", VirtualLobbyModes.LUI_MODE_OBSCURED)
+                end
             end)
             local ok, err = pcall(add_backdrop, menu)
             if not ok then

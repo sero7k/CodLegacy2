@@ -746,6 +746,11 @@ local SCREEN_TITLES = {
     PrestigeMenu_container = "MULTIPLAYER  /  BARRACKS  /  PRESTIGE",
     ChallengeCategoryMenu_container = "MULTIPLAYER  /  BARRACKS  /  CHALLENGES",
     OpLeaderboardMain_container = "MULTIPLAYER  /  BARRACKS  /  LEADERBOARDS",
+    PlayercardMenu_container = "MULTIPLAYER  /  BARRACKS  /  CALLING CARD & EMBLEM",
+    EmblemMenu_container = "MULTIPLAYER  /  BARRACKS  /  EMBLEM",
+    CallingCardMenu_container = "MULTIPLAYER  /  BARRACKS  /  CALLING CARD",
+    CombatRecordItemListDetails_container = "MULTIPLAYER  /  BARRACKS  /  COMBAT RECORD",
+    CombatRecordMedalsDetails_container = "MULTIPLAYER  /  BARRACKS  /  COMBAT RECORD",
 }
 
 local ROW_WORDS = {
@@ -876,6 +881,7 @@ local function row_words(menu)
             pcall(function()
                 t = string.upper(lbl:getText() or "")
             end)
+            log("row: '" .. t .. "' action=" .. tostring(c0.properties and c0.properties.button_action_func ~= nil) .. " in " .. tostring(menu.id))
             if (t == "KILLSTREAKS" or t == "PERSONALIZATION") and c0.properties and c0.properties.button_action_func then
                 UI.actions = UI.actions or {}
                 UI.actions[t] = c0.properties.button_action_func
@@ -988,113 +994,93 @@ local function after_build(menu)
             end
         end
     end)
+    -- The title: our bar and one line of text (the trail). The title piece
+    -- can be the same one from screen to screen, so it is pointed at the
+    -- screen now up each time, and its line worked out again.
     pcall(function()
         local title = menu:getChildById("generic_title")
-        if title and not title.claude_bar then
-            title.claude_bar = true
-            local function find(root, id)
-                local hit = nil
-                walk(root, 0, function(el)
-                    if not hit and el.id == id then
-                        hit = el
-                    end
-                end)
-                return hit
-            end
-            local crumb = find(title, "breadcrumb_text")
-            local head = find(title, "header_text")
-            local function text_of(el)
-                local ok, t = pcall(function()
-                    return el:getText()
-                end)
-                return ok and type(t) == "string" and t or ""
-            end
-            local ours = SCREEN_TITLES[tostring(menu.id)]
-            local line = text_of(head)
-            local c = text_of(crumb)
-            log("title texts: crumb='" .. c .. "' head='" .. line .. "' in " .. tostring(menu.id))
-            if c ~= "" and line ~= "" then
-                line = c .. "  /  " .. line
-            elseif line == "" then
-                line = c
-            end
+        if not title then
+            return
+        end
+        local function find(root, id)
+            local hit = nil
+            walk(root, 0, function(el)
+                if not hit and el.id == id then
+                    hit = el
+                end
+            end)
+            return hit
+        end
+        local function text_of(el)
+            local ok, t = pcall(function()
+                return el:getText()
+            end)
+            return ok and type(t) == "string" and t or ""
+        end
+        local crumb = find(title, "breadcrumb_text")
+        local head = find(title, "header_text")
+        title.claude_menu_id = tostring(menu.id)
+        title.claude_ticks = 0
+        local function line_now()
+            local ours = SCREEN_TITLES[title.claude_menu_id or ""]
             if ours then
-                line = ours
+                return ours
             end
+            local l = text_of(head)
+            local c = text_of(crumb)
+            if c ~= "" and l ~= "" then
+                return c .. "  /  " .. l
+            elseif l == "" then
+                return c
+            end
+            return l
+        end
+        if not title.claude_bar then
+            title.claude_bar = true
             -- (Coordinates inside generic_title, whose corner sits at about
             -- 101, 43 on a 1080-line screen.)
             local bar = LUI.UIImage.new({
-                topAnchor = true,
-                bottomAnchor = false,
-                leftAnchor = true,
-                rightAnchor = false,
-                top = UI.px(45),
-                height = UI.px(40),
-                left = UI.px(-1),
-                width = math.max(3, UI.px(7)),
+                topAnchor = true, bottomAnchor = false, leftAnchor = true, rightAnchor = false,
+                top = UI.px(45), height = UI.px(40), left = UI.px(-1), width = math.max(3, UI.px(7)),
                 material = UI.material("white"),
-                red = UI.ACCENT.r,
-                green = UI.ACCENT.g,
-                blue = UI.ACCENT.b,
-                alpha = 1,
+                red = UI.ACCENT.r, green = UI.ACCENT.g, blue = UI.ACCENT.b, alpha = 1,
             })
             bar.claude = true
             title:addElement(bar)
-            if line ~= "" then
-                for _, el in ipairs({ crumb, head }) do
-                    if el then
-                        pcall(function()
-                            el:setAlpha(0)
-                        end)
-                    end
+            local font = (CoD.TextSettings.BodyFont or CoD.TextSettings.TitleFontTiny).Font
+            local t = LUI.UIText.new({
+                topAnchor = true, bottomAnchor = false, leftAnchor = true, rightAnchor = false,
+                top = UI.px(41), height = UI.px(48), left = UI.px(21), width = UI.px(1400),
+                alignment = LUI.Alignment.Left, font = font,
+                red = 1, green = 1, blue = 1, alpha = 1,
+            })
+            t.claude = true
+            title:addElement(t)
+            title.claude_text = t
+            -- (The game types its title in: kept in step for a few seconds
+            -- after each screen comes up.)
+            title:addElement(LUI.UITimer.new(150, "claude_title_tick"))
+            title:registerEventHandler("claude_title_tick", function()
+                title.claude_ticks = (title.claude_ticks or 0) + 1
+                if title.claude_ticks > 40 then
+                    return
                 end
-                local font = (CoD.TextSettings.BodyFont or CoD.TextSettings.TitleFontTiny).Font
-                local t = LUI.UIText.new({
-                    topAnchor = true,
-                    bottomAnchor = false,
-                    leftAnchor = true,
-                    rightAnchor = false,
-                    top = UI.px(41),
-                    height = UI.px(48),
-                    left = UI.px(21),
-                    width = UI.px(1400),
-                    alignment = LUI.Alignment.Left,
-                    font = font,
-                    red = 1,
-                    green = 1,
-                    blue = 1,
-                    alpha = 1,
-                })
-                t:setText(line)
-                t.claude = true
-                title:addElement(t)
-                local ticks = 0
-                title:addElement(LUI.UITimer.new(150, "claude_title_tick"))
-                title:registerEventHandler("claude_title_tick", function()
-                    ticks = ticks + 1
-                    if ticks > 40 then
-                        return
+                pcall(function()
+                    local l2 = line_now()
+                    if l2 ~= "" then
+                        title.claude_text:setText(l2)
                     end
-                    pcall(function()
-                        local l2 = text_of(head)
-                        local c2 = text_of(crumb)
-                        if c2 ~= "" and l2 ~= "" then
-                            l2 = c2 .. "  /  " .. l2
-                        elseif l2 == "" then
-                            l2 = c2
-                        end
-                        if ours then
-                            l2 = ours
-                        end
-                        if l2 ~= "" then
-                            t:setText(l2)
-                        end
-                        if crumb then crumb:setAlpha(0) end
-                        if head then head:setAlpha(0) end
-                    end)
+                    if crumb then crumb:setAlpha(0) end
+                    if head then head:setAlpha(0) end
                 end)
-            end
+            end)
         end
+        pcall(function()
+            title.claude_text:setText(line_now())
+            if crumb then crumb:setAlpha(0) end
+            if head then head:setAlpha(0) end
+        end)
+        log("title: " .. tostring(menu.id) .. " -> '" .. line_now() .. "'")
     end)
     if not logged_trees[key] then
         logged_trees[key] = true
@@ -1521,15 +1507,33 @@ local function build_banner(menu)
     local p = player_info()
     local t = {}
 
-    -- His numbers over the banner.
+    -- His numbers over the banner: each number then its word, laid out by
+    -- their widths so none runs into the next.
     image(root, 1138, 78, 1162, 98, p.rank_icon, UI.WHITE, p.rank_icon and 1 or 0)
-    t.level_small = text(root, 1166, 76, 24, p.level, bold, UI.WHITE, 1)
-    t.kills = text(root, 1200, 76, 24, tostring(p.kills), bold, UI.WHITE, 1)
-    text(root, 1214 + string.len(tostring(p.kills)) * 6, 82, 16, "KILLS", body, UI.DIM, 0.6)
-    t.deaths = text(root, 1268, 76, 24, tostring(p.deaths), bold, UI.WHITE, 1)
-    text(root, 1282 + string.len(tostring(p.deaths)) * 6, 82, 16, "DEATHS", body, UI.DIM, 0.6)
-    t.kd = text(root, 1345, 76, 24, string.format("%.2f", p.kd), bold, UI.WHITE, 1)
-    text(root, 1392, 82, 16, "K/D RATIO", body, UI.DIM, 0.6)
+    t.level_small = text(root, 1166, 76, 24, p.level, bold, UI.WHITE, 1, nil, 120)
+    t.kills = text(root, 1200, 76, 24, "", bold, UI.WHITE, 1, nil, 120)
+    t.kills_w = text(root, 1200, 82, 16, "KILLS", body, UI.DIM, 0.6, nil, 120)
+    t.deaths = text(root, 1268, 76, 24, "", bold, UI.WHITE, 1, nil, 120)
+    t.deaths_w = text(root, 1268, 82, 16, "DEATHS", body, UI.DIM, 0.6, nil, 120)
+    t.kd = text(root, 1345, 76, 24, "", bold, UI.WHITE, 1, nil, 120)
+    t.kd_w = text(root, 1392, 82, 16, "K/D RATIO", body, UI.DIM, 0.6, nil, 160)
+    local function lay_numbers(q)
+        local x = 1166
+        local function put(el, str, font, h, gap)
+            el:setText(str)
+            local w = UI.text_width(str, font, UI.px(h)) / UI.K
+            el:setLeftRight(true, false, UI.px(x) - ox, UI.px(x + w + 4) - ox)
+            x = x + w + gap
+        end
+        put(t.level_small, q.level, bold, 24, 20)
+        put(t.kills, tostring(q.kills), bold, 24, 6)
+        put(t.kills_w, "KILLS", body, 16, 20)
+        put(t.deaths, tostring(q.deaths), bold, 24, 6)
+        put(t.deaths_w, "DEATHS", body, 16, 20)
+        put(t.kd, string.format("%.2f", q.kd), bold, 24, 6)
+        put(t.kd_w, "K/D RATIO", body, 16, 20)
+    end
+    pcall(lay_numbers, p)
 
     -- The banner: his calling card, a white rule along its top.
     image(root, 1130, 104, 1708, 206, UI.material("white"), UI.PANEL, 0.9)
@@ -1560,27 +1564,30 @@ local function build_banner(menu)
         next_custom("clc_emblem", CUSTOM_EMBLEMS)
     end)
 
-    -- His line in the party.
+    -- His line in the party (not on the card / emblem pickers: their grids
+    -- reach under it).
+    local pickers = { EmblemMenu_container = true, CallingCardMenu_container = true, PlayercardMenu_container = true }
+    if not pickers[tostring(menu.id)] then
     text(root, 1176, 236, 20, ">", body, UI.WHITE, 1)
     image(root, 1202, 234, 1226, 256, p.rank_icon, UI.WHITE, p.rank_icon and 1 or 0)
     t.party_level = text(root, 1236, 234, 24, p.level, body, UI.WHITE, 0.9)
     t.party_name = text(root, 1290, 234, 24, p.name, body, UI.WHITE, 0.9)
     image(root, 1178, 261, 1758, 262, UI.material("white"), UI.WHITE, 0.25)
+    end
 
     -- Kept current (a match, a prestige, a new card).
     root:addElement(LUI.UITimer.new(2000, "claude_banner_tick"))
     root:registerEventHandler("claude_banner_tick", function()
         pcall(function()
             local q = player_info()
-            t.level_small:setText(q.level)
-            t.kills:setText(tostring(q.kills))
-            t.deaths:setText(tostring(q.deaths))
-            t.kd:setText(string.format("%.2f", q.kd))
+            lay_numbers(q)
             t.name:setText(string.upper(q.name))
             t.level_big:setText(q.level)
             t.xp:setText("LEVEL " .. q.level .. "  \194\183  " .. tostring(q.xp) .. " XP")
-            t.party_level:setText(q.level)
-            t.party_name:setText(q.name)
+            if t.party_level then
+                t.party_level:setText(q.level)
+                t.party_name:setText(q.name)
+            end
         end)
     end)
     menu:addElement(root)

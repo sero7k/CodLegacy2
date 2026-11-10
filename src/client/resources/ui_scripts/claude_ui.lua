@@ -281,7 +281,7 @@ rule({
 -- HMW's own (h2_) menu art: the rows, the title band, the dividers.
 rule({ "h2_btn_unfocused" }, { color = UI.BLACK, alpha = 0.45 })
 rule({ "h2_btn_unfocused_locked" }, { color = UI.BLACK, alpha = 0.3 })
-rule({ "h2_btn_focused_fill" }, { color = UI.ACCENT, alpha = 0.9 })
+rule({ "h2_btn_focused_fill" }, { hide = true })
 rule({ "h2_btn_focused_locked" }, { color = UI.ACCENT, alpha = 0.35 })
 rule({
     "h2_btn_focused_stroke", "h2_btn_focused_outerglow", "h2_btn_dot_pattern", "btn_focused_rect_innerglow",
@@ -482,6 +482,33 @@ end
 ----------------------------------------------------------------------------
 
 local function row_marks(bg)
+    -- The band in focus (our accent), driven by the row's own focus events so
+    -- only the row in focus is lit.
+    local band = LUI.UIImage.new({
+        topAnchor = true, bottomAnchor = true, leftAnchor = true, rightAnchor = true,
+        top = 0, bottom = 0, left = 0, right = 0,
+        material = UI.material("white"),
+        color = UI.ACCENT,
+        alpha = 0,
+    })
+    band:registerAnimationState("claude_over", {
+        topAnchor = true, bottomAnchor = true, leftAnchor = true, rightAnchor = true,
+        top = 0, bottom = 0, left = 0, right = 0,
+        color = UI.ACCENT,
+        alpha = 0.88,
+    })
+    band:registerAnimationState("claude_up", {
+        topAnchor = true, bottomAnchor = true, leftAnchor = true, rightAnchor = true,
+        top = 0, bottom = 0, left = 0, right = 0,
+        color = UI.ACCENT,
+        alpha = 0,
+    })
+    band:registerEventHandler("button_over", function(el) pcall(function() el:animateToState("claude_over", 60) end) end)
+    band:registerEventHandler("button_up", function(el) pcall(function() el:animateToState("claude_up", 90) end) end)
+    band:registerEventHandler("button_disable", function(el) pcall(function() el:animateToState("claude_up", 0) end) end)
+    band:registerEventHandler("lose_focus", function(el) pcall(function() el:animateToState("claude_up", 90) end) end)
+    bg:addElement(band)
+
     local bar_w = math.max(3, UI.px(6))
     local bar = LUI.UIImage.new({
         topAnchor = true,
@@ -836,6 +863,28 @@ local function after_build(menu)
                 })
                 t:setText(line)
                 title:addElement(t)
+                local ticks = 0
+                title:addElement(LUI.UITimer.new(150, "claude_title_tick"))
+                title:registerEventHandler("claude_title_tick", function()
+                    ticks = ticks + 1
+                    if ticks > 40 then
+                        return
+                    end
+                    pcall(function()
+                        local l2 = text_of(head)
+                        local c2 = text_of(crumb)
+                        if c2 ~= "" and l2 ~= "" then
+                            l2 = c2 .. "  /  " .. l2
+                        elseif l2 == "" then
+                            l2 = c2
+                        end
+                        if l2 ~= "" then
+                            t:setText(l2)
+                        end
+                        if crumb then crumb:setAlpha(0) end
+                        if head then head:setAlpha(0) end
+                    end)
+                end)
             end
         end
     end)
@@ -852,7 +901,47 @@ local function after_build(menu)
     end
 end
 
+-- The player card at the top right, as our shell's (view.rs): x 1130-1708,
+-- y 105-205 on a 1080-line screen.
+local card_logged = false
+local function place_card(menu)
+    local card = nil
+    walk(menu, 0, function(el)
+        if not card and type(el.id) == "string" and string.find(string.lower(el.id), "playercard") then
+            card = el
+        end
+    end)
+    if not card then
+        return
+    end
+    local parent = card:getParent()
+    if not parent then
+        return
+    end
+    local pl, pt = parent:getCurrentGlobalRect()
+    if type(pl) ~= "number" then
+        return
+    end
+    local L, T, R, B = UI.px(1130), UI.px(105), UI.px(1708), UI.px(205)
+    card:setLeftRight(true, false, L - pl, R - pl)
+    card:setTopBottom(true, false, T - pt, B - pt)
+    if not card_logged then
+        card_logged = true
+        local cl, ct, cr, cb = card:getCurrentGlobalRect()
+        log("card '" .. tostring(card.id) .. "' in '" .. tostring(parent.id) .. "' parent at " ..
+            tostring(pl) .. "," .. tostring(pt) .. " card now " .. tostring(cl) .. "," .. tostring(ct) .. "," .. tostring(cr) .. "," .. tostring(cb))
+    end
+end
+
 local function add_after_build(menu)
+    menu:addElement(LUI.UITimer.new(400, "claude_card_tick"))
+    menu:registerEventHandler("claude_card_tick", function()
+        local ok, err = pcall(place_card, menu)
+        if not ok and not card_logged then
+            card_logged = true
+            log("card: " .. tostring(err))
+        end
+    end)
     menu:addElement(LUI.UITimer.new(50, "claude_after_build", nil, true))
     menu:registerEventHandler("claude_after_build", function()
         local ok, err = pcall(after_build, menu)
@@ -866,23 +955,6 @@ local function decorate(menu)
     if not in_frontend then
         -- (In a match the pause menu sits over the game: no shade.)
         return
-    end
-    -- The shade, in three steps (a fade to the right).
-    for i, step in ipairs({ { 0, 0.30 }, { 1, 0.18 }, { 2, 0.10 } }) do
-        local w = UI.px(560) + step[1] * UI.px(170)
-        insert_behind(menu, LUI.UIImage.new({
-            topAnchor = true,
-            bottomAnchor = true,
-            leftAnchor = true,
-            rightAnchor = false,
-            top = -200,
-            bottom = 200,
-            left = -400,
-            width = w + 400,
-            material = UI.material("white"),
-            color = UI.SHADE,
-            alpha = step[2],
-        }))
     end
     -- The lit band: grey into the accent, across the left of the screen.
     local band = LUI.UIElement.new({

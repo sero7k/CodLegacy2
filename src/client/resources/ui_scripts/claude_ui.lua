@@ -821,7 +821,7 @@ local function after_build(menu)
             end
             -- (Coordinates inside generic_title, whose corner sits at about
             -- 101, 43 on a 1080-line screen.)
-            title:addElement(LUI.UIImage.new({
+            local bar = LUI.UIImage.new({
                 topAnchor = true,
                 bottomAnchor = false,
                 leftAnchor = true,
@@ -835,7 +835,9 @@ local function after_build(menu)
                 green = UI.ACCENT.g,
                 blue = UI.ACCENT.b,
                 alpha = 1,
-            }))
+            })
+            bar.claude = true
+            title:addElement(bar)
             if line ~= "" then
                 for _, el in ipairs({ crumb, head }) do
                     if el then
@@ -862,6 +864,7 @@ local function after_build(menu)
                     alpha = 1,
                 })
                 t:setText(line)
+                t.claude = true
                 title:addElement(t)
                 local ticks = 0
                 title:addElement(LUI.UITimer.new(150, "claude_title_tick"))
@@ -947,6 +950,7 @@ local function add_backdrop(menu)
         topAnchor = true, bottomAnchor = true, leftAnchor = true, rightAnchor = true,
         top = 0, bottom = 0, left = 0, right = 0,
     })
+    holder.claude = true
     -- Black first: the room and its soldier are covered even between pictures.
     holder:addElement(LUI.UIImage.new({
         topAnchor = true, bottomAnchor = true, leftAnchor = true, rightAnchor = true,
@@ -1026,6 +1030,47 @@ local function add_backdrop(menu)
     end
 end
 
+-- What is left of HMW's old look: the title's art (backgrounds, glow, dots,
+-- arrow, the dividers), the list's dividers and, where our backdrop is up,
+-- the menu's own background art. Our own pieces carry `claude`.
+local function hide(el)
+    if el and not el.claude then
+        pcall(function()
+            el:setAlpha(0)
+        end)
+    end
+end
+
+local function sweep_old_look(menu, backdrop)
+    local title = menu:getChildById("generic_title")
+    if title then
+        local c = title:getFirstChild()
+        while c do
+            if c.id ~= "generic_menu_title_id" then
+                hide(c)
+            end
+            c = c:getNextSibling()
+        end
+    end
+    hide(menu.listDivider)
+    if menu.list then
+        hide(menu.list.bottomDivider)
+    end
+    if backdrop then
+        -- (The menu's children before its title are its background art.)
+        local c = menu:getFirstChild()
+        while c and c.id ~= "generic_title" do
+            hide(c)
+            c = c:getNextSibling()
+        end
+    end
+end
+
+-- No build number over the title.
+if LUI.MenuTemplate then
+    LUI.MenuTemplate.AddBuildNumber = function() end
+end
+
 -- The player card at the top right, as our shell's (view.rs): x 1130-1708,
 -- y 105-205 on a 1080-line screen.
 local card_logged = false
@@ -1059,6 +1104,15 @@ local function place_card(menu)
 end
 
 local function add_after_build(menu)
+    local key0 = tostring(menu.id or menu.type or "?")
+    local sweeps = 0
+    menu:addElement(LUI.UITimer.new(120, "claude_sweep_tick"))
+    menu:registerEventHandler("claude_sweep_tick", function()
+        sweeps = sweeps + 1
+        if sweeps <= 50 or sweeps % 10 == 0 then
+            pcall(sweep_old_look, menu, backdrop_wanted(key0))
+        end
+    end)
     pcall(function()
         local key = tostring(menu.id or menu.type or "?")
         if backdrop_wanted(key) then

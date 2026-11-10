@@ -259,7 +259,7 @@ local function rule(list, r)
 end
 
 -- The menu rows.
-rule({ "h1_ui_btn_unfocused", "h1_btn_unfocused" }, { color = UI.BLACK, alpha = 0.42 })
+rule({ "h1_ui_btn_unfocused", "h1_btn_unfocused" }, { color = UI.SHADE, alpha = 0.28 })
 rule({ "h1_btn_locked_unfocused" }, { color = UI.BLACK, alpha = 0.28 })
 rule({ "h1_ui_btn_focused_fill", "h1_btn_reg_selected", "h1_btn_reg_current_selected", "h1_btn_option_popup_btn_selected" },
     { color = UI.ACCENT, alpha = 0.95 })
@@ -279,7 +279,7 @@ rule({
 }, { hide = true })
 
 -- HMW's own (h2_) menu art: the rows, the title band, the dividers.
-rule({ "h2_btn_unfocused" }, { color = UI.BLACK, alpha = 0.45 })
+rule({ "h2_btn_unfocused" }, { color = UI.SHADE, alpha = 0.28 })
 rule({ "h2_btn_unfocused_locked" }, { color = UI.BLACK, alpha = 0.3 })
 rule({ "h2_btn_focused_fill" }, { hide = true })
 rule({ "h2_btn_focused_locked" }, { color = UI.ACCENT, alpha = 0.35 })
@@ -515,7 +515,7 @@ local function row_marks(bg)
         topAnchor = true, bottomAnchor = true, leftAnchor = true, rightAnchor = true,
         top = 0, bottom = 0, left = 0, right = 0,
         color = UI.ACCENT,
-        alpha = 0.88,
+        alpha = 0.8,
     })
     band:registerAnimationState("claude_up", {
         topAnchor = true, bottomAnchor = true, leftAnchor = true, rightAnchor = true,
@@ -540,8 +540,8 @@ local function row_marks(bg)
         left = 0,
         width = bar_w,
         material = UI.material("white"),
-        color = UI.WHITE,
-        alpha = 0.88,
+        color = UI.ACCENT_LIFT,
+        alpha = 0,
     })
     bar:registerAnimationState("claude_over", {
         topAnchor = true,
@@ -564,8 +564,8 @@ local function row_marks(bg)
         bottom = 0,
         left = 0,
         width = bar_w,
-        color = UI.WHITE,
-        alpha = 0.88,
+        color = UI.ACCENT_LIFT,
+        alpha = 0,
     })
     bar:registerAnimationState("claude_locked", {
         topAnchor = true,
@@ -577,8 +577,32 @@ local function row_marks(bg)
         left = 0,
         width = bar_w,
         color = UI.WHITE,
-        alpha = 0.35,
+        alpha = 0.2,
     })
+
+    -- The thin line along the row's top (our rows' border): faint, and the
+    -- lifted accent on the row in focus.
+    local line = LUI.UIImage.new({
+        topAnchor = true, bottomAnchor = false, leftAnchor = true, rightAnchor = true,
+        top = 0, left = 0, right = 0, height = math.max(1, UI.px(1)),
+        material = UI.material("white"),
+        color = { r = 0.70, g = 0.80, b = 0.95 },
+        alpha = 0.14,
+    })
+    line:registerAnimationState("claude_over", {
+        topAnchor = true, bottomAnchor = false, leftAnchor = true, rightAnchor = true,
+        top = 0, left = 0, right = 0, height = math.max(1, UI.px(1)),
+        color = UI.ACCENT_LIFT, alpha = 0.9,
+    })
+    line:registerAnimationState("claude_up", {
+        topAnchor = true, bottomAnchor = false, leftAnchor = true, rightAnchor = true,
+        top = 0, left = 0, right = 0, height = math.max(1, UI.px(1)),
+        color = { r = 0.70, g = 0.80, b = 0.95 }, alpha = 0.14,
+    })
+    line:registerEventHandler("button_over", function(el) pcall(function() el:animateToState("claude_over", 60) end) end)
+    line:registerEventHandler("button_up", function(el) pcall(function() el:animateToState("claude_up", 90) end) end)
+    line:registerEventHandler("lose_focus", function(el) pcall(function() el:animateToState("claude_up", 90) end) end)
+    bg:addElement(line)
 
     -- The point: a square turned on its corner, half out past the end.
     local s = 18
@@ -2173,7 +2197,7 @@ local function cac_item(cat, ref)
     return name, img
 end
 
-function build_cac_panel(menu)
+function build_cac_panel(menu, fixed_index)
     local ox, oy = menu:getCurrentGlobalRect()
     ox, oy = ox or 0, oy or 0
     local body = (CoD.TextSettings.BodyFont or CoD.TextSettings.TitleFontTiny).Font
@@ -2302,7 +2326,7 @@ function build_cac_panel(menu)
     end
 
     -- The class in focus: each class row says when it is in focus.
-    local c = menu.list:getFirstChild()
+    local c = menu.list and menu.list:getFirstChild() or nil
     while c do
         local id = tostring(c.id or "")
         local index = tonumber(string.match(id, "cac_class_button_(%d+)"))
@@ -2321,9 +2345,51 @@ function build_cac_panel(menu)
         end
         c = c:getNextSibling()
     end
-    pcall(render, 0)
+    pcall(render, fixed_index or 0)
     menu:addElement(root)
-    log("cac panel: built")
+    if fixed_index then
+        -- (The editor of one slot: its loadout is shown again as it changes.)
+        root:addElement(LUI.UITimer.new(500, "claude_cac_refresh"))
+        root:registerEventHandler("claude_cac_refresh", function()
+            pcall(render, fixed_index)
+        end)
+    end
+    log("cac panel: built" .. (fixed_index and (" for slot " .. tostring(fixed_index + 1)) or ""))
+end
+
+-- The editor of one class (CREATE A CLASS / CUSTOM SLOT n) gets the same
+-- panel at the right, as our shell's editor keeps the loadout beside its
+-- pickers. Found by its title, whatever the menu is called.
+local function probe_cac_editor(menu)
+    if menu.claude_cac or menu.claude_cac_editor then
+        return
+    end
+    local title = menu:getChildById("generic_title")
+    if not title then
+        return
+    end
+    local found = nil
+    walk(title, 0, function(el)
+        if not found and el.id == "header_text" then
+            found = el
+        end
+    end)
+    if not found then
+        return
+    end
+    local t = ""
+    pcall(function()
+        t = string.upper(found:getText() or "")
+    end)
+    local n = tonumber(string.match(t, "CUSTOM%s+SLOT%s+(%d+)"))
+        or tonumber(string.match(t, "CUSTOM%s+(%d+)$"))
+    if n then
+        menu.claude_cac_editor = true
+        local ok, err = pcall(build_cac_panel, menu, n - 1)
+        if not ok then
+            log("cac editor panel: " .. tostring(err))
+        end
+    end
 end
 
 local banner_logged = false
@@ -2359,6 +2425,61 @@ local function place_card(menu)
     end
 end
 
+-- The key hints along the foot (ESC BACK, ENTER SELECT, ...), as our shell's
+-- footer draws them: small capitals, the key in the accent and what it does
+-- dim. They are found by where they are (the bottom of the screen), not by
+-- name, and done again when HMW changes their words.
+local HINT_KEYS = { ESC = true, ENTER = true, TAB = true, SPACE = true, DEL = true, DELETE = true }
+local function is_key_word(w)
+    if HINT_KEYS[w] then
+        return true
+    end
+    -- F1.., single letters, and combinations like Q / E or A / D.
+    return string.match(w, "^F%d+$") ~= nil or string.match(w, "^%a$") ~= nil or string.match(w, "^[%a%d]%s*/%s*[%a%d]$") ~= nil
+end
+
+local function restyle_footer(menu)
+    if not frontend_now() then
+        return
+    end
+    local top_of_foot = UI.px(930)
+    walk(menu, 0, function(el)
+        if el.claude or type(el.getText) ~= "function" or type(el.getCurrentGlobalRect) ~= "function" then
+            return
+        end
+        local ok, _, y1 = pcall(function()
+            return el:getCurrentGlobalRect()
+        end)
+        if not ok or type(y1) ~= "number" or y1 < top_of_foot then
+            return
+        end
+        local text = ""
+        pcall(function()
+            text = el:getText() or ""
+        end)
+        if text == "" then
+            return
+        end
+        local upper = string.upper(text)
+        if upper ~= text then
+            pcall(function()
+                el:setText(upper)
+            end)
+        end
+        local c, a = UI.DIM, 0.85
+        if is_key_word(upper) then
+            c, a = UI.ACCENT_LIFT, 1
+        end
+        pcall(function()
+            el:setRGB(c.r, c.g, c.b)
+        end)
+        pcall(function()
+            el:setAlpha(a)
+        end)
+        el.claude_hint = true
+    end)
+end
+
 local function add_after_build(menu)
     local key0 = tostring(menu.id or menu.type or "?")
     local sweeps = 0
@@ -2367,6 +2488,9 @@ local function add_after_build(menu)
         sweeps = sweeps + 1
         if sweeps <= 50 or sweeps % 10 == 0 then
             pcall(sweep_old_look, menu, backdrop_wanted(key0))
+        end
+        if sweeps <= 60 or sweeps % 5 == 0 then
+            pcall(restyle_footer, menu)
         end
     end)
     pcall(function()
@@ -2397,6 +2521,14 @@ local function add_after_build(menu)
         if not ok and not card_logged then
             card_logged = true
             log("card: " .. tostring(err))
+        end
+    end)
+    local probes = 0
+    menu:addElement(LUI.UITimer.new(400, "claude_cac_probe"))
+    menu:registerEventHandler("claude_cac_probe", function()
+        probes = probes + 1
+        if probes <= 25 then
+            pcall(probe_cac_editor, menu)
         end
     end)
     menu:addElement(LUI.UITimer.new(50, "claude_after_build", nil, true))
@@ -2733,6 +2865,267 @@ do
     end
     LUI.MenuBuilder.m_types_build.s1_tab = LUI.AWMaps.new
 
+    -- Our shell's map picker (view.rs map_picker): a tab for each game, then a
+    -- grid of cards, each a picture of the map with its name on a strip under
+    -- it, the one in use marked SELECTED, the chosen map's name large at the
+    -- bottom right. HMW's own list and tabs are kept (hidden) so a card's
+    -- click runs exactly the action HMW's row would.
+    local function map_picture(load_name)
+        local base = string.gsub(load_name, "^mp_", "")
+        local names = {
+            "preview_" .. load_name, "loadscreen_" .. load_name,
+            "preview_" .. base, "loadscreen_" .. base,
+            "loadscreen_mp_" .. base .. "_01",
+        }
+        for _, n in ipairs(names) do
+            local ok, has = pcall(UI.has_material, n)
+            if ok and has then
+                return UI.material(n), n
+            end
+        end
+        return nil, nil
+    end
+
+    -- The map a recorded row's action chooses, found by running it with the
+    -- calls it makes held back (it sets ui_mapname and leaves the menu).
+    local function learn_load_name(fn)
+        local learned = nil
+        local saved = {}
+        local function hold(tbl, key, repl)
+            saved[#saved + 1] = { tbl, key, tbl[key] }
+            tbl[key] = repl
+        end
+        local ok = pcall(function()
+            local noop = function() end
+            hold(Engine, "SetDvarString", function(name, value)
+                if name == "ui_mapname" then
+                    learned = value
+                end
+            end)
+            hold(Engine, "SetDvarFromString", noop)
+            hold(Engine, "SetDvarBool", noop)
+            hold(Engine, "SetDvarInt", noop)
+            hold(Engine, "ExecNow", noop)
+            hold(LUI.FlowManager, "RequestLeaveMenu", noop)
+            hold(LUI.FlowManager, "RequestAddMenu", noop)
+            fn({}, { controller = 0 })
+        end)
+        for i = #saved, 1, -1 do
+            local e = saved[i]
+            e[1][e[2]] = e[3]
+        end
+        return learned
+    end
+
+    local function capture_tab(tab, menu)
+        local out = {}
+        local dud = setmetatable({}, { __index = function() return function() end end })
+        local fake = setmetatable({}, {
+            __index = function(_, k)
+                if k == "AddButton" then
+                    return function(_, text, fn, ...)
+                        out[#out + 1] = { name = text, fn = fn }
+                        return dud
+                    end
+                end
+                return menu[k]
+            end,
+            __newindex = function(_, k, v) end,
+        })
+        pcall(function()
+            tab:MapFeeder(fake)
+        end)
+        return out
+    end
+
+    local function build_map_tiles(menu, tabs, tab_manager)
+        local body = (CoD.TextSettings.BodyFont or CoD.TextSettings.TitleFontTiny).Font
+        local bold = (CoD.TextSettings.BodyFontBold or CoD.TextSettings.BodyFont or CoD.TextSettings.TitleFontTiny).Font
+        local pages = {}
+        for _, t in ipairs(tabs) do
+            local label = ""
+            pcall(function() label = t:GetTabLabel() end)
+            local maps = capture_tab(t, menu)
+            if #maps > 0 then
+                pages[#pages + 1] = { label = label, maps = maps }
+            end
+        end
+        if #pages == 0 then
+            error("no maps captured")
+        end
+        local current = ""
+        pcall(function() current = Engine.GetDvarString("ui_mapname") or "" end)
+        local found_pictures = 0
+        for _, pg in ipairs(pages) do
+            for _, m in ipairs(pg.maps) do
+                m.load = learn_load_name(m.fn)
+                if m.load and m.load ~= "" then
+                    m.pic = map_picture(m.load)
+                    if m.pic then found_pictures = found_pictures + 1 end
+                end
+            end
+        end
+        log(string.format("map tiles: %d tabs, %d pictures found", #pages, found_pictures))
+
+        local function st(x1, y1, x2, y2)
+            return {
+                topAnchor = true, leftAnchor = true, bottomAnchor = false, rightAnchor = false,
+                left = UI.px(x1), top = UI.px(y1), width = UI.px(x2 - x1), height = UI.px(y2 - y1),
+            }
+        end
+        local function put_text(parent, x1, y1, x2, y2, str, font, color, alpha, align)
+            local t = st(x1, y1, x2, y2)
+            t.font = font
+            t.alignment = align or LUI.Alignment.Left
+            t.color = color
+            t.alpha = alpha or 1
+            local el = LUI.UIText.new(t)
+            el:setText(str)
+            parent:addElement(el)
+            return el
+        end
+        local function put_box(parent, x1, y1, x2, y2, color, alpha)
+            local t = st(x1, y1, x2, y2)
+            t.material = UI.material("white")
+            t.color = color
+            t.alpha = alpha
+            local el = LUI.UIImage.new(t)
+            parent:addElement(el)
+            return el
+        end
+        local function clear(el)
+            local c = el:getFirstChild()
+            while c do
+                local nxt = c:getNextSibling()
+                pcall(function() c:close() end)
+                c = nxt
+            end
+        end
+
+        local root = LUI.UIElement.new(st(0, 0, 1920, 1080))
+        root.claude = true
+        local tabs_el = LUI.UIElement.new(st(0, 0, 1920, 1080))
+        tabs_el.claude = true
+        local grid = LUI.UIElement.new(st(0, 0, 1920, 1080))
+        grid.claude = true
+        root:addElement(tabs_el)
+        root:addElement(grid)
+        menu:addElement(root)
+
+        local state = { page = 1, first = 0 }
+        local tw, th, gap = 280, 158, 14
+        local cols, rows = 6, 4
+        local x0, y0 = 72, 236
+        local per = cols * rows
+
+        local render_tabs, render_grid
+        render_grid = function()
+            clear(grid)
+            local pg = pages[state.page]
+            local total = #pg.maps
+            if state.first >= total then state.first = 0 end
+            local last = math.min(total, state.first + per)
+            for k = state.first + 1, last do
+                local m = pg.maps[k]
+                local i = k - state.first - 1
+                local c = i % cols
+                local r = math.floor(i / cols)
+                local x = x0 + c * (tw + gap)
+                local y = y0 + r * (th + 4)
+                local holder = LUI.UIElement.new(st(x, y, x + tw, y + th))
+                holder.claude = true
+                put_box(holder, 0, 0, tw, th - 10, UI.PANEL, 0.9)
+                if m.pic then
+                    local im = st(0, 0, tw, th - 54)
+                    im.material = m.pic
+                    im.alpha = 1
+                    holder:addElement(LUI.UIImage.new(im))
+                end
+                local chosen = m.load ~= nil and m.load == current
+                put_box(holder, 0, th - 54, tw, th - 10, chosen and UI.ACCENT or UI.BLACK, chosen and 0.85 or 0.72)
+                put_text(holder, 12, th - 50, tw - 12, th - 14, string.upper(tostring(m.name or "")), bold, UI.WHITE, 1)
+                if chosen then
+                    put_text(holder, 0, 6, tw - 10, 30, "SELECTED", bold, UI.GOLD, 1, LUI.Alignment.Right)
+                end
+                holder:setHandleMouseButton(true)
+                holder:registerEventHandler("leftmouseup", function(el, ev)
+                    pcall(m.fn, el, ev or { controller = 0 })
+                end)
+                grid:addElement(holder)
+            end
+            -- "13-24 OF 31" and the way on, under the grid.
+            local py = y0 + rows * (th + 4) + 6
+            if total > per then
+                put_text(grid, x0, py, x0 + 520, py + 28,
+                    string.format("%d-%d OF %d     CLICK HERE FOR MORE", state.first + 1, last, total), body, UI.DIM, 1)
+                pcall(click_area, grid, st(x0, py - 4, x0 + 520, py + 32), function()
+                    state.first = state.first + per
+                    if state.first >= total then state.first = 0 end
+                    render_grid()
+                end)
+            end
+            -- The chosen map's name, large, at the bottom right, its game under.
+            local chosen_name, chosen_tab = nil, nil
+            for _, pgx in ipairs(pages) do
+                for _, mx in ipairs(pgx.maps) do
+                    if mx.load ~= nil and mx.load == current then
+                        chosen_name, chosen_tab = mx.name, pgx.label
+                    end
+                end
+            end
+            if chosen_name then
+                put_text(grid, 1000, 905, 1848, 975, string.upper(tostring(chosen_name)), bold, UI.WHITE, 1, LUI.Alignment.Right)
+                put_text(grid, 1000, 975, 1848, 1005, string.upper(tostring(chosen_tab or "")), body, UI.ACCENT, 1, LUI.Alignment.Right)
+            end
+        end
+
+        render_tabs = function()
+            clear(tabs_el)
+            local x = x0
+            for i, pg in ipairs(pages) do
+                local on = i == state.page
+                local label = string.upper(pg.label)
+                local w = math.max(150, UI.text_width(label, bold, UI.px(26)) / UI.K + 44)
+                if on then
+                    put_box(tabs_el, x, 188, x + w, 226, UI.ACCENT, 0.9)
+                end
+                put_text(tabs_el, x, 192, x + w, 224, label, on and bold or body, on and UI.WHITE or UI.TEXT, on and 1 or 0.8, LUI.Alignment.Center)
+                local idx = i
+                pcall(click_area, tabs_el, st(x, 188, x + w, 226), function()
+                    state.page = idx
+                    state.first = 0
+                    render_tabs()
+                    render_grid()
+                end)
+                x = x + w + 8
+            end
+            put_box(tabs_el, x0, 228, 1848, 230, UI.ACCENT, 0.45)
+        end
+
+        -- Start on the tab holding the map in use.
+        for i, pg in ipairs(pages) do
+            for _, m in ipairs(pg.maps) do
+                if m.load ~= nil and m.load == current then
+                    state.page = i
+                end
+            end
+        end
+        render_tabs()
+        render_grid()
+
+        -- HMW's list and tabs stay (their actions are ours), unseen. Its list
+        -- is filled after this runs, so it is hidden again for a while.
+        local n = 0
+        root:addElement(LUI.UITimer.new(150, "claude_maps_hide"))
+        root:registerEventHandler("claude_maps_hide", function()
+            n = n + 1
+            if n <= 40 then
+                pcall(hide, menu.list)
+                pcall(hide, tab_manager)
+            end
+        end)
+    end
+
     LUI.MapSetup.AddTabs = function(menu)
         local tabManager = LUI.MenuBuilder.BuildRegisteredType("MFTabManager", {
             defState = CoD.CreateState(nil, nil, nil, nil, CoD.AnchorTypes.TopLeftRight),
@@ -2755,6 +3148,10 @@ do
         end
         tabManager:refreshTab(menu.controller)
         menu:addElement(tabManager)
+        local ok, err = pcall(build_map_tiles, menu, tabs, tabManager)
+        if not ok then
+            log("map tiles: " .. tostring(err))
+        end
     end
     log("map select: AW (2014) tab added (" .. #AW_MAPS .. " maps)")
 end

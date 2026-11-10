@@ -371,6 +371,11 @@ local orig_ras = LUI.UIElement.registerAnimationState
 local function our_ras(self, name, state, ...)
     if type(state) == "table" and state.material ~= nil then
         pcall(note_material, state.material)
+        pcall(function()
+            if names[state.material] == "h2m_ui_playercard_bg" then
+                UI.card_bg = self
+            end
+        end)
         local r = rule_for(state.material)
         if r and not r.logo then
             local ok, s = pcall(restyle, state, r)
@@ -814,6 +819,7 @@ local function after_build(menu)
             end
             local line = text_of(head)
             local c = text_of(crumb)
+            log("title texts: crumb='" .. c .. "' head='" .. line .. "' in " .. tostring(menu.id))
             if c ~= "" and line ~= "" then
                 line = c .. "  /  " .. line
             elseif line == "" then
@@ -1105,13 +1111,25 @@ end
 -- y 105-205 on a 1080-line screen.
 local card_logged = false
 local function place_card(menu)
-    local card = nil
-    walk(menu, 0, function(el)
-        if not card and type(el.id) == "string" and string.find(string.lower(el.id), "playercard") then
-            card = el
-        end
-    end)
+    -- (The card: what holds HMW's card picture, h2m_ui_playercard_bg.)
+    local bg = UI.card_bg
+    if not bg then
+        return
+    end
+    local card = bg:getParent()
     if not card then
+        return
+    end
+    -- Only a card inside this menu.
+    local inside, p = false, card
+    while p do
+        if p == menu then
+            inside = true
+            break
+        end
+        p = p:getParent()
+    end
+    if not inside then
         return
     end
     local parent = card:getParent()

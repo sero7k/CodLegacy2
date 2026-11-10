@@ -1911,9 +1911,36 @@ function UI.lobby_look(menu, key)
     -- Teams, right side.
     local who = "PLAYER"
     pcall(function() who = string.upper(Engine.GetUsernameByController(0) or who) end)
-    local function team(y, name, tint, count, you)
+    -- A team's name and badge: what the game has set for it (g_TeamName_* /
+    -- g_TeamIcon_*, or our clc_icon_* override); Ghosts and Federation when
+    -- it has nothing.
+    local function faction(side, fallback)
+        local name, icon = fallback, nil
+        pcall(function()
+            local raw = Engine.GetDvarString("g_TeamName_" .. side) or ""
+            if raw ~= "" then
+                local loc = Engine.Localize(raw)
+                if loc and loc ~= "" and string.sub(loc, 1, 1) ~= "@" then
+                    name = string.upper(loc)
+                end
+            end
+            local over = Engine.GetDvarString("clc_icon_" .. string.lower(side)) or ""
+            local ic = over ~= "" and over or (Engine.GetDvarString("g_TeamIcon_" .. side) or "")
+            if ic ~= "" then
+                icon = UI.material(ic)
+            end
+        end)
+        return name, icon
+    end
+    local function team(y, side, fallback, tint, count, you)
+        local name, icon = faction(side, fallback)
         box(dyn, 1180, y, 1184, y + 40, tint, 1)
-        text(dyn, 1200, y + 2, 1800, y + 38, name .. "  \194\183  " .. count, UI.WHITE, 1)
+        if icon then
+            local pic = LUI.UIImage.new(st(1200, y + 2, 1236, y + 38))
+            pic:setImage(icon)
+            dyn:addElement(pic)
+        end
+        text(dyn, icon and 1246 or 1200, y + 2, 1800, y + 38, name .. "  \194\183  " .. count, UI.WHITE, 1)
         local ry = y + 52
         local rows = you and 1 or 0
         if you then
@@ -1930,8 +1957,8 @@ function UI.lobby_look(menu, key)
         end
         return ry
     end
-    local ny = team(250, "BLACK OPS", UI.ACCENT, "WAITING " .. members() .. "/9", true)
-    team(ny + 30, "SPETSNAZ", UI.ENEMY, "0/9", false)
+    local ny = team(250, "Allies", "GHOSTS", UI.ACCENT, "WAITING " .. members() .. "/9", true)
+    team(ny + 30, "Axis", "FEDERATION", UI.ENEMY, "0/9", false)
 
     end
     local function signature()

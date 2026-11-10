@@ -1288,6 +1288,8 @@ end
 local MAP_BACKDROP_MENUS = {
     menu_xboxlive_privatelobby_container = true,
     gamesetup_menu_main_container = true,
+    menu_xboxlive_container = true,
+    menu_systemlink_container = true,
 }
 
 local function backdrop_wanted(key)

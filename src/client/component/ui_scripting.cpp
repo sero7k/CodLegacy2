@@ -24,6 +24,7 @@
 #include "game/scripting/execution.hpp"
 
 #include "ui_scripting.hpp"
+#include "materials.hpp"
 
 #include <utils/string.hpp>
 #include <utils/hook.hpp>
@@ -404,6 +405,41 @@ namespace ui_scripting
 			game_type["claudelog"] = [](const game&, const std::string& line)
 			{
 				claude_log(line);
+			};
+
+			// game:clcimage("codlegacy/backgrounds/bg01.jpg"): a picture beside the
+			// game as a material for LUI (nil when the file is missing or bad).
+			game_type["clcimage"] = [](const game&, const std::string& path) -> script_value
+			{
+				static std::unordered_map<std::string, game::Material*> loaded;
+				const auto found = loaded.find(path);
+				if (found != loaded.end())
+				{
+					return found->second ? script_value(lightuserdata(found->second)) : script_value();
+				}
+
+				std::string data;
+				game::Material* material = nullptr;
+				if (path.find("..") == std::string::npos && utils::io::read_file(path, &data) && !data.empty())
+				{
+					material = materials::create_material("clc_img_" + path);
+					try
+					{
+						if (!materials::setup_material_image(material, data))
+						{
+							materials::free_material(material);
+							material = nullptr;
+						}
+					}
+					catch (const std::exception&)
+					{
+						materials::free_material(material);
+						material = nullptr;
+					}
+				}
+				loaded[path] = material;
+				claude_log(std::string("[clcimage] ") + path + (material ? " loaded" : " missing"));
+				return material ? script_value(lightuserdata(material)) : script_value();
 			};
 
 			game_type["openlink"] = [](const game&, const std::string& name)

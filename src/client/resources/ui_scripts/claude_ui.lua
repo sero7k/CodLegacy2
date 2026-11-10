@@ -901,6 +901,131 @@ local function after_build(menu)
     end
 end
 
+-- Our backdrop in place of the lobby room and its soldier (the front-end
+-- menus only; Create-a-Class keeps the room, it shows the gun and the
+-- soldier): our shell's pictures (codlegacy/backgrounds/bgNN.jpg beside the
+-- game), one at a time, drifting slowly closer and fading into the next.
+local BACKDROP_COUNT = 21
+local BACKDROP_HOLD = 9000
+local BACKDROP_FADE = 900
+
+local function backdrop_wanted(key)
+    if string.find(key, "^Cac") or string.find(key, "Cac") then
+        return false
+    end
+    return key == "mp_main_menu_container"
+        or string.find(key, "^menu_xboxlive") ~= nil
+        or string.find(key, "^menu_systemlink") ~= nil
+end
+
+local function backdrop_materials()
+    if UI.backdrops then
+        return UI.backdrops
+    end
+    local list = {}
+    if game and game.clcimage then
+        for i = 1, BACKDROP_COUNT do
+            local ok, m = pcall(function()
+                return game:clcimage(string.format("codlegacy/backgrounds/bg%02d.jpg", i))
+            end)
+            if ok and m then
+                list[#list + 1] = m
+            end
+        end
+    end
+    UI.backdrops = list
+    log("backdrop: " .. #list .. " pictures")
+    return list
+end
+
+local function add_backdrop(menu)
+    local pics = backdrop_materials()
+    if #pics == 0 then
+        return
+    end
+    local holder = LUI.UIElement.new({
+        topAnchor = true, bottomAnchor = true, leftAnchor = true, rightAnchor = true,
+        top = 0, bottom = 0, left = 0, right = 0,
+    })
+    -- Black first: the room and its soldier are covered even between pictures.
+    holder:addElement(LUI.UIImage.new({
+        topAnchor = true, bottomAnchor = true, leftAnchor = true, rightAnchor = true,
+        top = -20, bottom = 20, left = -20, right = 20,
+        material = UI.material("black") or UI.material("white"),
+        red = 0, green = 0, blue = 0,
+        alpha = 1,
+    }))
+    -- (The pictures are 16:9 with our shell's fades baked in.)
+    local over = 0
+    local function frame(zoom, a)
+        return {
+            topAnchor = true, bottomAnchor = true, leftAnchor = true, rightAnchor = true,
+            top = -over - zoom * 0.56, bottom = over + zoom * 0.56,
+            left = -zoom, right = zoom,
+            alpha = a,
+        }
+    end
+    local layers = {}
+    for n = 1, 2 do
+        local img = LUI.UIImage.new(frame(0, 0))
+        img:setImage(pics[1])
+        img:registerAnimationState("start", frame(0, 0))
+        img:registerAnimationState("in", frame(12, 1))
+        img:registerAnimationState("drift", frame(60, 1))
+        img:registerAnimationState("out", frame(70, 0))
+        img:registerEventHandler("transition_complete_in", function(el)
+            pcall(function()
+                el:animateToState("drift", BACKDROP_HOLD)
+            end)
+        end)
+        holder:addElement(img)
+        layers[n] = img
+    end
+    UI.backdrop_index = UI.backdrop_index or 0
+    local front = 1
+    local function show_next()
+        -- A random picture, never the same one twice in a row (as our shell).
+        local i = math.random(1, #pics)
+        if #pics > 1 and i == UI.backdrop_index then
+            i = (i % #pics) + 1
+        end
+        UI.backdrop_index = i
+        local incoming = layers[front]
+        local outgoing = layers[3 - front]
+        front = 3 - front
+        incoming:setImage(pics[UI.backdrop_index])
+        incoming:animateToState("start", 0)
+        incoming:animateToState("in", BACKDROP_FADE)
+        outgoing:animateToState("out", BACKDROP_FADE)
+    end
+    holder:addElement(LUI.UITimer.new(BACKDROP_HOLD, "claude_backdrop_next"))
+    holder:registerEventHandler("claude_backdrop_next", function()
+        pcall(show_next)
+    end)
+    pcall(function()
+        math.randomseed(Engine.GetMilliseconds and Engine.GetMilliseconds() or os.time())
+    end)
+    pcall(show_next)
+    -- Over the menu's own background art (the main menu's picture), under
+    -- its title and rows: just before the title.
+    local placed = false
+    pcall(function()
+        local idx, c = 0, menu:getFirstChild()
+        while c do
+            idx = idx + 1
+            if c.id == "generic_title" then
+                menu:insertElement(holder, idx)
+                placed = true
+                break
+            end
+            c = c:getNextSibling()
+        end
+    end)
+    if not placed then
+        insert_behind(menu, holder)
+    end
+end
+
 -- The player card at the top right, as our shell's (view.rs): x 1130-1708,
 -- y 105-205 on a 1080-line screen.
 local card_logged = false
@@ -934,6 +1059,15 @@ local function place_card(menu)
 end
 
 local function add_after_build(menu)
+    pcall(function()
+        local key = tostring(menu.id or menu.type or "?")
+        if backdrop_wanted(key) then
+            local ok, err = pcall(add_backdrop, menu)
+            if not ok then
+                log("backdrop: " .. tostring(err))
+            end
+        end
+    end)
     menu:addElement(LUI.UITimer.new(400, "claude_card_tick"))
     menu:registerEventHandler("claude_card_tick", function()
         local ok, err = pcall(place_card, menu)

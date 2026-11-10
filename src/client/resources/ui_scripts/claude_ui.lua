@@ -1801,19 +1801,19 @@ function UI.lobby_look(menu, key)
     -- Tabs: LOBBY | LOADOUTS | SETTINGS.
     local tabs = { { "LOBBY", nil }, { "LOADOUTS", { "CLASS", "LOADOUT" } }, { "SETTINGS", { "SETTINGS", "SETUP" } } }
     local x = 100
-    text(root, x, 118, x + 30, 150, "Q", UI.ACCENT_LIFT, 1)
+    text(root, x, 140, x + 30, 172, "Q", UI.ACCENT_LIFT, 1)
     x = x + 44
     for _, tb in ipairs(tabs) do
         local active = (tb[1] == "LOBBY" and key == "menu_xboxlive_privatelobby_container")
             or (tb[1] == "SETTINGS" and key == "gamesetup_menu_main_container")
         local w = 36 + 20 * #tb[1]
-        text(root, x, 118, x + w, 152, tb[1], active and UI.WHITE or UI.DIM, active and 1 or 0.7)
+        text(root, x, 140, x + w, 174, tb[1], active and UI.WHITE or UI.DIM, active and 1 or 0.7)
         if active then
-            box(root, x, 154, x + w - 20, 157, UI.ACCENT, 1)
+            box(root, x, 176, x + w - 20, 179, UI.ACCENT, 1)
         end
         if tb[2] and not active then
             local words = tb[2]
-            click_area(root, st(x, 112, x + w, 160), function()
+            click_area(root, st(x, 134, x + w, 182), function()
                 local up = table.unpack or unpack
                 local act = row_action(up(words))
                 if act then act(menu, { controller = 0 }) end
@@ -1821,7 +1821,7 @@ function UI.lobby_look(menu, key)
         end
         x = x + w + 24
     end
-    text(root, x, 118, x + 30, 150, "E", UI.ACCENT_LIFT, 1)
+    text(root, x, 140, x + 30, 172, "E", UI.ACCENT_LIFT, 1)
 
     -- Q / E (or the shoulder buttons): the tab to the left / right.
     local order = { { "LOBBY", nil }, { "LOADOUTS", { "CLASS", "LOADOUT" } }, { "SETTINGS", { "SETTINGS", "SETUP" } } }

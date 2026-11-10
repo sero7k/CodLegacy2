@@ -910,21 +910,18 @@ local function after_build(menu)
     end
 end
 
--- Our backdrop in place of the lobby room and its soldier (the front-end
--- menus only; Create-a-Class keeps the room, it shows the gun and the
--- soldier): our shell's pictures (codlegacy/backgrounds/bgNN.jpg beside the
+-- Our backdrop in place of the lobby room and its soldier (every front-end
+-- menu): our shell's pictures (codlegacy/backgrounds/bgNN.jpg beside the
 -- game), one at a time, drifting slowly closer and fading into the next.
 local BACKDROP_COUNT = 21
 local BACKDROP_HOLD = 9000
 local BACKDROP_FADE = 900
 
 local function backdrop_wanted(key)
-    if string.find(key, "^Cac") or string.find(key, "Cac") then
-        return false
-    end
-    return key == "mp_main_menu_container"
-        or string.find(key, "^menu_xboxlive") ~= nil
-        or string.find(key, "^menu_systemlink") ~= nil
+    -- Every front-end screen, as our shell (its screens all sit on the
+    -- backdrop and none shows the lobby room; Create-a-Class shows the gun's
+    -- picture, not the 3D model).
+    return key ~= "?"
 end
 
 local function backdrop_materials()

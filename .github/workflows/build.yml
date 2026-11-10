@@ -1,0 +1,30 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: microsoft/setup-msbuild@v2
+      - name: Generate project
+        shell: cmd
+        run: tools\premake5 vs2022
+      - name: Build (release)
+        shell: cmd
+        run: msbuild build\hmw-mod.sln /m /p:Configuration=release /p:Platform=x64
+      - name: Collect
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force out | Out-Null
+          Get-ChildItem -Recurse build\bin -Include *.exe,*.dll,*.pdb -ErrorAction SilentlyContinue | Copy-Item -Destination out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: client
+          path: out

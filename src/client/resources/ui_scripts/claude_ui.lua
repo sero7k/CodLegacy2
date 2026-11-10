@@ -948,7 +948,7 @@ local function add_backdrop(menu)
     end
     local holder = LUI.UIElement.new({
         topAnchor = true, bottomAnchor = true, leftAnchor = true, rightAnchor = true,
-        top = 0, bottom = 0, left = 0, right = 0,
+        top = -40, bottom = 40, left = -70, right = 70,
     })
     holder.claude = true
     -- Black first: the room and its soldier are covered even between pictures.
@@ -1055,6 +1055,36 @@ local function sweep_old_look(menu, backdrop)
     hide(menu.listDivider)
     if menu.list then
         hide(menu.list.bottomDivider)
+    end
+    -- After the title: unnamed pieces made only of pictures are the title's
+    -- divider lines (HMW's); anything holding text (the player card) stays.
+    local function only_images(el)
+        local c = el:getFirstChild()
+        if not c then
+            return false
+        end
+        while c do
+            if c.id ~= "LUIImage" then
+                return false
+            end
+            c = c:getNextSibling()
+        end
+        return true
+    end
+    do
+        local after = false
+        local c = menu:getFirstChild()
+        while c do
+            if after and not c.claude then
+                if c.id == "LUIImage" or (c.id == "LUIElement" and only_images(c)) then
+                    hide(c)
+                end
+            end
+            if c.id == "generic_title" then
+                after = true
+            end
+            c = c:getNextSibling()
+        end
     end
     if backdrop then
         -- (The menu's children before its title are its background art.)
@@ -1175,6 +1205,7 @@ local function decorate(menu)
             alpha = p[4],
         }))
     end
+    band.claude = true
     menu:addElement(band)
     add_unlock_poll(menu)
     pcall(add_after_build, menu)

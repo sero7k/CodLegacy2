@@ -1,0 +1,394 @@
+//! bo2mp shell: the loading screen - the map's picture over the whole
+//! screen, drifting slowly closer, in the front end's Ghosts look: the dark
+//! shade across the top with its accent rule, the map and mode behind an
+//! accent bar (as the menus' header), a tip under the rule as the line
+//! about a row; at the foot the notice strip (where the map is from) and
+//! the dark foot band with what is loading, the bar and how far. It shares
+//! the front end's picture, fade, type and slide-ins, and replaces BO2's
+//! own loading menu. A Zombies map loads on the same screen in the Zombies
+//! red, with Zombies tips; Resurgence in WARZONE's grey and orange.
+
+use bevy::prelude::*;
+use bevy::window::PrimaryWindow;
+
+use super::pics::{ShellPics, cover};
+use super::theme::*;
+use super::ghosts::{SAFE_X, SAFE_Y};
+use super::{bridge, window_scale};
+
+#[derive(Component)]
+pub(crate) struct LoadRoot;
+
+#[derive(Component)]
+pub(crate) struct LoadPicture;
+
+#[derive(Component)]
+pub(crate) struct LoadBar;
+
+#[derive(Component)]
+pub(crate) struct LoadStage;
+
+#[derive(Component)]
+pub(crate) struct LoadPercent;
+
+/// The accent a little lighter (the mode's name).
+fn lift(c: Color) -> Color {
+    super::view::lift(c, 0.18)
+}
+
+const TIPS: &[&str] = &[
+    "Bots follow the map's own paths: hold a choke point and they will come to you.",
+    "Every level past 55 still counts toward your next prestige.",
+    "Prestige icons come from Black Ops, Modern Warfare 2 and Modern Warfare 3 in turn.",
+    "Change the bots' difficulty in the lobby's SETTINGS tab.",
+    "Press F10 in the menus to tell the game where your other games are installed.",
+    "Objectives only appear in the modes that use them.",
+    "Classic maps play by Black Ops II's rules: its weapons, scorestreaks and spawns.",
+    "A controller's buttons show in every prompt as soon as you touch it.",
+    "Experience comes in three times faster than in the original game.",
+];
+
+const ZM_TIPS: &[&str] = &[
+    "Quick Revive lets you revive yourself in solo games (three times) and helps you revive teammates faster in co-op.",
+    "Juggernog lets you take more hits before you go down.",
+    "Speed Cola makes your reloads faster.",
+    "Double Tap makes your guns fire faster.",
+    "A knife kill is worth 130 points, more than any shot.",
+    "Headshot kills are worth more points than body kills.",
+    "Rebuilding a barrier earns points, up to a limit each round.",
+    "The Mystery Box costs 950 points a spin. When the teddy bear shows up, it moves somewhere else on the map.",
+    "Insta-Kill: for 30 seconds, any hit kills a zombie.",
+    "Double Points: every point you earn is doubled for 30 seconds.",
+    "Carpenter rebuilds every barrier on the map and gives every player 200 points.",
+    "Nuke kills every zombie on the map and gives every player 400 points.",
+    "Max Ammo refills every player's ammunition.",
+    "Perk machines need the power turned on first.",
+    "The Pack-a-Punch upgrades your gun for 5000 points: more damage and more ammo.",
+    "Revive a downed teammate before the bar runs out, or they bleed out and wait for the next round.",
+    "Train the zombies into a group and lead them in a loop to buy time.",
+    "Hold a corner with a teammate covering the other way: zombies come from every window.",
+];
+
+#[derive(Default)]
+pub(crate) struct LoadState {
+    request: Option<u64>,
+    shown: f32,
+    target: f32,
+    tip: usize,
+    since: f64,
+    key: String,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn shell_loading(
+    mut commands: Commands,
+    loading: Option<Res<assets::LoadingScreen>>,
+    setup: Option<Res<session::Bo2mpMatchSetup>>,
+    front: Option<Res<crate::lui_frontend::Bo2mpFrontend>>,
+    fonts: Option<Res<ShellFonts>>,
+    mut pics: ResMut<ShellPics>,
+    icons: Option<Res<assets::T6HudIcons>>,
+    mut images: ResMut<Assets<Image>>,
+    roots: Query<Entity, With<LoadRoot>>,
+    mut pictures: Query<(&mut ImageNode, &mut Node), (With<LoadPicture>, Without<LoadBar>)>,
+    mut bars: Query<&mut Node, (With<LoadBar>, Without<LoadPicture>)>,
+    mut stages: Query<&mut Text, (With<LoadStage>, Without<LoadPercent>)>,
+    mut percents: Query<&mut Text, (With<LoadPercent>, Without<LoadStage>)>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    time: Res<Time>,
+    mut st: Local<LoadState>,
+) {
+    // (A Zombies map started from the shell has no match setup: its own
+    // map, title and mode.)
+    // (Only while that map loads: going back to the menus loads no map.)
+    let zm = if setup.is_none() {
+        super::zombies::loading().filter(|z| loading.as_ref().is_some_and(|l| l.title().contains(&z.map)))
+    } else {
+        None
+    };
+    let on = bridge::enabled() && front.is_none() && loading.is_some() && (setup.is_some() || zm.is_some());
+    bridge::set_loading_shown(on);
+    let setup: Option<session::Bo2mpMatchSetup> = setup.map(|s| (*s).clone()).or_else(|| {
+        zm.as_ref().map(|z| session::Bo2mpMatchSetup { map: z.map.clone(), gametype: "zclassic".to_owned(), ..Default::default() })
+    });
+    let (Some(loading), Some(setup), Some(fonts), true) = (loading, setup, fonts, on) else {
+        for e in &roots {
+            commands.entity(e).despawn();
+        }
+        st.key.clear();
+        st.request = None;
+        return;
+    };
+    let now = time.elapsed_secs_f64();
+    let snap = loading.progress.snapshot();
+    if st.request != Some(snap.request_id) {
+        st.request = Some(snap.request_id);
+        st.shown = 0.0;
+        st.target = 0.0;
+        st.since = now;
+        st.tip = (snap.request_id as usize).wrapping_mul(7);
+    }
+    // Zombies maps load on the same screen in red.
+    let zombies = setup.map.starts_with("zm_") || sim::is_foreign_zm_map(&setup.map);
+    let pal = if zombies {
+        Palette::ZOMBIES
+    } else if sim::resurgence_on() {
+        super::wz_theme::PALETTE
+    } else {
+        Palette::MULTIPLAYER
+    };
+    let (accent, tips) = (pal.accent, if zombies { ZM_TIPS } else { TIPS });
+    let tip = tips[st.tip % tips.len()];
+    let shade = pal.shade;
+    // How far: finished stages, and the share of the running ones' counts.
+    let total = snap.stages.len().max(1) as f32;
+    let done: f32 = snap
+        .stages
+        .iter()
+        .map(|s| {
+            if s.end.is_some() {
+                1.0
+            } else {
+                s.count.and_then(|c| c.total.filter(|t| *t > 0).map(|t| c.completed as f32 / t as f32)).unwrap_or(0.0).min(0.95)
+            }
+        })
+        .sum();
+    // (Stages join as the load goes, so the bar never runs back, and it
+    // keeps a little for the world to appear.)
+    st.target = st.target.max((done / total).min(0.96));
+    let dt = time.delta_secs().min(0.1);
+    st.shown += (st.target - st.shown) * (dt * 3.0).min(1.0);
+    let stage = snap
+        .stages
+        .iter()
+        .rev()
+        .find(|s| s.end.is_none() && s.started_at.is_some())
+        .map_or_else(|| "Preparing the world".to_owned(), |s| format!("Loading {}", s.key.label().to_lowercase()));
+    let cat = bridge::catalog();
+    let entry = cat.as_ref().and_then(|c| c.map(&setup.map).cloned());
+    let mut map_title = entry.as_ref().map_or_else(|| setup.map.trim_start_matches("mp_").to_uppercase(), |m| m.title.clone());
+    let mut mode_title = cat
+        .as_ref()
+        .and_then(|c| c.mode(&setup.gametype).map(|m| m.title.clone()))
+        .unwrap_or_else(|| setup.gametype.to_uppercase());
+    // (Resurgence rides on the free-for-all: its own name, not dm's.)
+    if sim::resurgence_on() {
+        mode_title = "RESURGENCE".to_owned();
+    }
+    let mut origin = entry.as_ref().map(|m| m.origin.to_uppercase()).unwrap_or_default();
+    // The map's loading picture first, then its menu pictures.
+    let mut names = vec![format!("loadscreen_{}", setup.map)];
+    if let Some(e) = &entry {
+        names.extend(e.pictures.iter().cloned());
+    }
+    if let Some(z) = &zm {
+        map_title = z.title.clone();
+        mode_title = z.mode.clone();
+        origin = z.origin.clone();
+        names = z.pictures.clone();
+        names.push(format!("loadscreen_{}", z.map));
+    }
+    let picture = pics.first(&names, icons.as_deref(), &mut images);
+    let (area, s) = window_scale(&windows);
+    let key = format!("{map_title}|{mode_title}|{area:?}|{}|{}|{zombies}|{:?}", picture.is_some(), st.tip, pal.accent);
+    if st.key != key || roots.is_empty() {
+        st.key = key;
+        for e in &roots {
+            commands.entity(e).despawn();
+        }
+        let px = |v: f32| Val::Px(v * s);
+        let bold = |v: f32| font(&fonts.bold, v * s);
+        let regular = |v: f32| font(&fonts.regular, v * s);
+        commands
+            .spawn((
+                LoadRoot,
+                GlobalZIndex(10_500),
+                BackgroundColor(if zombies { Color::srgb(0.04, 0.008, 0.008) } else { Color::srgb(0.012, 0.02, 0.04) }),
+                Node {
+                    position_type: PositionType::Absolute,
+                    width: Val::Percent(100.0),
+                    height: Val::Percent(100.0),
+                    overflow: Overflow::clip(),
+                    ..default()
+                },
+            ))
+            .with_children(|r| {
+                if let Some(h) = picture.clone() {
+                    r.spawn((LoadPicture, ImageNode::new(h), Node { position_type: PositionType::Absolute, ..default() }));
+                }
+                // A soft vignette, darker toward the bands.
+                r.spawn((
+                    Node { position_type: PositionType::Absolute, width: Val::Percent(100.0), height: Val::Percent(100.0), ..default() },
+                    BackgroundGradient::from(LinearGradient::to_bottom(vec![
+                        ColorStop::new(Color::srgba(shade[0], shade[1], shade[2], 0.55), Val::Percent(0.0)),
+                        ColorStop::new(Color::srgba(shade[0], shade[1], shade[2], 0.0), Val::Percent(22.0)),
+                        ColorStop::new(Color::srgba(shade[0], shade[1], shade[2], 0.0), Val::Percent(70.0)),
+                        ColorStop::new(Color::srgba(shade[0], shade[1], shade[2], 0.75), Val::Percent(100.0)),
+                    ])),
+                ));
+                // The top: the header's dark shade and accent rule, the map
+                // and mode behind an accent bar, sliding in. (bo2mp: inside
+                // the shell's title-safe margin, the shades full-bleed.)
+                let dark = Color::srgba(0.0, 0.01, 0.03, 0.80);
+                r.spawn((
+                    Node { position_type: PositionType::Absolute, left: Val::Px(0.0), top: Val::Px(0.0), width: Val::Percent(100.0), height: px(170.0 + SAFE_Y), ..default() },
+                    BackgroundGradient::from(LinearGradient::to_bottom(vec![ColorStop::new(dark, Val::Percent(0.0)), ColorStop::new(dark.with_alpha(0.0), Val::Percent(100.0))])),
+                ));
+                r.spawn((
+                    Node { position_type: PositionType::Absolute, left: px(SAFE_X), top: px(150.0 + SAFE_Y), width: Val::Percent(70.0), height: px(3.0), ..default() },
+                    fade_right(accent.with_alpha(0.65), accent.with_alpha(0.0)),
+                ));
+                r.spawn((
+                    Node { position_type: PositionType::Absolute, left: px(150.0 + SAFE_X), top: px(60.0 + SAFE_Y), column_gap: px(14.0), align_items: AlignItems::Center, ..default() },
+                    super::anim::from_left(s, 60.0, 0.0),
+                ))
+                .with_children(|t| {
+                    t.spawn((Node { width: px(7.0), height: px(40.0), ..default() }, BackgroundColor(accent)));
+                    t.spawn((Text::new(map_title.clone()), regular(46.0), TextColor(WHITE)));
+                    t.spawn((Text::new("/"), regular(46.0), TextColor(DIM)));
+                    t.spawn((Text::new(mode_title.clone()), regular(46.0), TextColor(lift(accent))));
+                });
+                // The tip, just over the foot band beside the bar and the
+                // percentage.
+                r.spawn((
+                    Node { position_type: PositionType::Absolute, left: px(150.0 + SAFE_X), bottom: px(92.0 + SAFE_Y), max_width: px(1100.0), column_gap: px(12.0), align_items: AlignItems::Center, ..default() },
+                    super::anim::from_left(s, 60.0, 0.06),
+                ))
+                .with_children(|t| {
+                    t.spawn((Node { width: px(6.0), height: px(22.0), flex_shrink: 0.0, ..default() }, BackgroundColor(accent)));
+                    t.spawn((Text::new(tip), regular(26.0), TextColor(TEXT)));
+                });
+                let line = Color::srgba(0.70, 0.80, 0.95, 0.14);
+                // The foot band: what is loading, the bar, how far.
+                r.spawn((
+                    Node {
+                        position_type: PositionType::Absolute,
+                        left: Val::Px(0.0),
+                        right: Val::Px(0.0),
+                        bottom: Val::Px(0.0),
+                        height: px(72.0 + SAFE_Y),
+                        padding: UiRect::new(px(150.0 + SAFE_X), px(150.0 + SAFE_X), Val::Px(0.0), px(SAFE_Y)),
+                        align_items: AlignItems::Center,
+                        column_gap: px(28.0),
+                        border: UiRect::top(px(1.0)),
+                        ..default()
+                    },
+                    BorderColor::all(line),
+                    BackgroundGradient::from(LinearGradient::to_bottom(vec![
+                        ColorStop::new(Color::srgba(0.0, 0.0, 0.0, 0.72), Val::Percent(0.0)),
+                        ColorStop::new(Color::srgba(0.0, 0.0, 0.0, 0.94), Val::Percent(100.0)),
+                    ])),
+                ))
+                .with_children(|b| {
+                    b.spawn((Node { width: px(320.0), ..default() },)).with_child((LoadStage, Text::new(stage.clone()), regular(24.0), TextColor(TEXT)));
+                    b.spawn((Node { flex_grow: 1.0, height: px(5.0), ..default() }, BackgroundColor(Color::srgba(1.0, 1.0, 1.0, 0.12))))
+                        .with_child((LoadBar, Node { width: Val::Percent(0.0), height: Val::Percent(100.0), ..default() }, fade_right(accent.with_alpha(0.75), accent)));
+                    b.spawn((LoadPercent, Text::new("0%"), bold(26.0), TextColor(WHITE)));
+                });
+            });
+        return;
+    }
+    // Every frame: the picture's drift, the bar, the stage.
+    if let Some(h) = picture
+        && let Ok((mut img, mut node)) = pictures.single_mut()
+    {
+        let size = images.get(&h).map_or(area, |i| i.size_f32());
+        let drift = 1.0 + 0.08 * (((now - st.since) / 40.0).clamp(0.0, 1.0) as f32);
+        let c = cover(size, area) * drift;
+        node.width = Val::Px(c.x);
+        node.height = Val::Px(c.y);
+        node.left = Val::Px((area.x - c.x) * 0.5);
+        node.top = Val::Px((area.y - c.y) * 0.5);
+        img.color = Color::srgba(1.0, 1.0, 1.0, (((now - st.since) / 0.8).clamp(0.0, 1.0)) as f32);
+    }
+    for mut bar in &mut bars {
+        bar.width = Val::Percent(st.shown * 100.0);
+    }
+    for mut t in &mut stages {
+        if t.0 != stage {
+            t.0.clone_from(&stage);
+        }
+    }
+    let pct = format!("{}%", (st.shown * 100.0).round() as i32);
+    for mut t in &mut percents {
+        if t.0 != pct {
+            t.0 = pct.clone();
+        }
+    }
+}
+
+/// The loading screen's music (a Black Ops Zombies map: Black Ops' own
+/// splash music, `mus_zombie_splash_screen`, as its maps open on).
+#[derive(Component)]
+pub(crate) struct LoadMusic;
+
+/// What plays while a map loads: a Black Ops Zombies map plays Black Ops'
+/// splash music (read from its IWDs off the main thread, once); anything
+/// else plays nothing of ours. It stops when the loading screen goes.
+pub(crate) fn shell_loading_music(
+    mut commands: Commands,
+    loading: Option<Res<assets::LoadingScreen>>,
+    playing: Query<Entity, With<LoadMusic>>,
+    settings: Option<Res<frame::GameSettings>>,
+    mut clips: ResMut<Assets<audio::PcmAudio>>,
+    mut stop: MessageWriter<frame::UiStopMusic>,
+    mut st: Local<(Option<u64>, bool)>,
+) {
+    let zm = super::zombies::loading().filter(|z| loading.as_ref().is_some_and(|l| l.title().contains(&z.map)));
+    let bo1 = zm.as_ref().is_some_and(|z| z.origin == "BLACK OPS ZOMBIES");
+    let request = loading.as_ref().map(|l| l.progress.snapshot().request_id);
+    if !bridge::enabled() || request.is_none() || !bo1 {
+        for e in &playing {
+            commands.entity(e).despawn();
+        }
+        *st = (None, false);
+        return;
+    }
+    if st.0 != request {
+        *st = (request, false);
+        for e in &playing {
+            commands.entity(e).despawn();
+        }
+    }
+    if st.1 {
+        return;
+    }
+    let Some(clip) = splash_music() else { return };
+    st.1 = true;
+    // (The menus' music stops: one track at a time.)
+    stop.write(frame::UiStopMusic);
+    let volume = settings.as_deref().map_or(0.8, |s| s.master_volume * s.music_volume);
+    commands.spawn((
+        LoadMusic,
+        AudioPlayer(clips.add(clip)),
+        PlaybackSettings::DESPAWN.with_volume(bevy::audio::Volume::Linear(volume.clamp(0.0, 1.0))),
+    ));
+}
+
+/// Black Ops' Zombies splash music, decoded (`None` while it is read, or
+/// when Black Ops is not installed).
+fn splash_music() -> Option<audio::PcmAudio> {
+    static CLIP: std::sync::OnceLock<Option<audio::PcmAudio>> = std::sync::OnceLock::new();
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if let Some(c) = CLIP.get() {
+        return c.clone();
+    }
+    if !STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        std::thread::spawn(|| {
+            let clip = (|| {
+                let root = asset_transport::games_root_from_env().ok()?;
+                let trees = asset_transport::NamespaceTrees::discover(&root);
+                let main = trees.main_for(asset_core::AssetNamespace::T5)?.to_path_buf();
+                let index = asset_transport::iwd::IwdSoundIndex::open(&main).ok()?;
+                let bytes = index.read_sound("mus/zombie/zombie_global/mus_zombie_splash_screen.wav")?.ok()?;
+                audio::decode_t5_stream(&bytes)
+            })();
+            match &clip {
+                Some(_) => diag::info!(Ui, "bo2mp zombies: Black Ops' splash music read"),
+                None => diag::warn!(Ui, "bo2mp zombies: Black Ops' splash music not found"),
+            }
+            let _ = CLIP.set(clip);
+        });
+    }
+    None
+}

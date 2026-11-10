@@ -1,0 +1,23 @@
+[package]
+name = "fastfile_jup"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Call of Duty: Modern Warfare III (2023, cod23): the .ff Oodle block envelopes, the KAPI .xsub/.xpak packages, zone readers, and MWIII Opus sounds."
+
+[dependencies]
+codlegacy_env.workspace = true
+# Pure-Rust Opus decoder (BSD-3-Clause): the sounds are Opus streams.
+rusty-opus = "1.0.1"
+bcdec_rs.workspace = true # emblems' and calling cards' pictures
+flate2.workspace = true # the zone's small compressed text files (vision sets)
+libloading.workspace = true # the game's Oodle DLL (Windows), or a decoder library named by $JUP_OODLE_LIB
+
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+png.workspace = true
+dxil_sm6 = { path = "../dxil_sm6" }
+naga = { version = "29", features = ["wgsl-in"] }

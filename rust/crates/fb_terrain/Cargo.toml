@@ -1,0 +1,12 @@
+[package]
+name = "fb_terrain"
+# Vendored from https://github.com/AaronSparks/Battlefield-1-Rust-Rewrite (Unlicense). See docs/BF1.md and NOTICE.
+description = "Battlefield 1 terrain heights from the terrain streaming tree"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "Unlicense"
+
+[dependencies]
+anyhow = "1"
+texture2ddecoder = "0.1"

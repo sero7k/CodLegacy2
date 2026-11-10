@@ -1,0 +1,16 @@
+[package]
+name = "bf1_adapter"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Battlefield 1 family adapter: install path, map catalog, and a world report read through the vendored fb_* crates. Inert unless a BF1 install is configured."
+
+[dependencies]
+anyhow = "1"
+fb_vfs = { path = "../fb_vfs" }
+fb_ebx = { path = "../fb_ebx" }
+fb_level = { path = "../fb_level" }
+fb_terrain = { path = "../fb_terrain" }
+
+[lints]
+workspace = true

@@ -1,0 +1,345 @@
+//! Which of each game's files the rebuild reads: a game's file is copied
+//! when it matches one of its KEEP patterns and none of its DROP ones (the
+//! patterns are `glob`'s, relative to the game's folder).
+//!
+//! Never read for any game: videos, installers and redistributables, other
+//! languages' files, crash reporters. Per game, what its loaders open (see
+//! each list).
+
+use crate::glob::matches;
+
+pub struct Rules {
+    pub keep: &'static [&'static str],
+    pub drop: &'static [&'static str],
+}
+
+impl Rules {
+    pub fn keeps(&self, rel: &str) -> bool {
+        !COMMON_DROP.iter().any(|p| matches(p, rel)) && !self.drop.iter().any(|p| matches(p, rel)) && self.keep.iter().any(|p| matches(p, rel))
+    }
+}
+
+/// Never read, whatever the game.
+const COMMON_DROP: &[&str] = &[
+    "**/*.bik",
+    "**/*.mkv",
+    "**/*.webm",
+    "**/*.mp4",
+    "video/**",
+    "raw/video/**",
+    "redist/**",
+    "_commonredist/**",
+    "directx/**",
+    "**/*.cab",
+    "**/vcredist*",
+    "**/dxsetup*",
+    "**/crashreporter*",
+    "**/*.log",
+    "**/*.dmp",
+    "**/*.tmp",
+    // (Other languages; the rebuild reads English.)
+    "**/*.french.*",
+    "**/*.german.*",
+    "**/*.italian.*",
+    "**/*.spanish.*",
+    "**/*.polish.*",
+    "**/*.russian.*",
+    "**/*.japanese.*",
+    "**/*.portuguese.*",
+    "**/localized_french*",
+    "**/localized_german*",
+    "**/localized_italian*",
+    "**/localized_spanish*",
+    "**/localized_polish*",
+    "**/localized_russian*",
+    "**/localized_japanese*",
+    "**/localized_portuguese*",
+    "**/french/**",
+    "**/german/**",
+    "**/italian/**",
+    "**/spanish/**",
+    "**/polish/**",
+    "**/russian/**",
+    "**/japanese/**",
+    "**/portuguese/**",
+    "**/fulljap/**",
+    "**/chinese/**",
+    "**/korean/**",
+    "**/arabic/**",
+];
+
+/// Everything but the above.
+const ALL: Rules = Rules { keep: &["**"], drop: &[] };
+
+/// Black Ops II: its multiplayer and Zombies zones (every `zone/all` zone is
+/// kept: campaign and Strike Force are a small share), its image packs and
+/// its English and shared sound banks.
+const BO2: Rules = Rules {
+    keep: &["zone/all/*.ff", "zone/all/*.ipak", "zone/english/*.ff", "zone/english/*.ipak", "sound/*.all.sab*", "sound/*.english.sab*"],
+    drop: &[],
+};
+
+/// Black Ops: its multiplayer zones and English ones, its IWDs (pictures,
+/// sounds; Black Ops II's DLC5 pack borrows from them). Only English: two
+/// language folders make its language lookup ambiguous.
+const BO1: Rules = Rules {
+    keep: &["zone/common/*_mp.ff", "zone/common/mp_*.ff", "zone/english/en_*.ff", "main/*.iwd"],
+    drop: &["**/*_sp.ff", "**/*_zm.ff"],
+};
+
+/// Modern Warfare 2 and 3: the multiplayer zones (MW2's common_mp is every
+/// match's), the maps with their load zones, every IWD (and IW4x's and the
+/// usermaps for MW2).
+const IW4_IW5: Rules = Rules {
+    keep: &["zone/**/*_mp.ff", "zone/**/mp_*.ff", "main/*.iwd", "main/iw4x/**", "iw4x/**", "usermaps/**"],
+    drop: &[],
+};
+
+/// World at War and Call of Duty 4: the multiplayer zones and maps, every
+/// IWD (WaW's guns' sounds stream from them).
+const T4_IW3: Rules = Rules {
+    keep: &["zone/**/*_mp.ff", "zone/**/mp_*.ff", "main/*.iwd"],
+    drop: &["**/nazi_zombie_*"],
+};
+
+/// Ghosts: its multiplayer zones and maps, every image and sound pack (which
+/// pack numbers a map wants is only known when it loads).
+const GHOSTS: Rules = Rules {
+    keep: &["zone/*_mp.ff", "zone/mp_*.ff", "zone/imagefile*.pak", "zone/soundfile*.pak", "zone/english/eng_soundfile*.pak", "zone/english/*.ff"],
+    drop: &["zone/mp_alien_*"],
+};
+
+/// Advanced Warfare: its multiplayer zones and maps (its maps are coming;
+/// its guns today), the guns' view and world zones, and every pack.
+const AW: Rules = Rules {
+    keep: &["zone/*_mp.ff", "zone/mp_*.ff", "zone/imagefile*.pak", "zone/soundfile*.pak", "zone/english/*.ff", "zone/english/eng_soundfile*.pak"],
+    drop: &["zone/*_zm_mp.ff", "zone/mp_zombie_*"],
+};
+
+/// Black Ops III: its common zones, its multiplayer maps, every package
+/// (each map draws on the shared ones), and the multiplayer sound bank.
+const BO3: Rules = Rules {
+    keep: &[
+        "zone/core_*.ff",
+        "zone/mp_*.ff",
+        "zone/zm_common.ff",
+        "zone/zm_levelcommon.ff",
+        "zone/*.xpak",
+        "zone/**/mp_common.all.sab*",
+        "zone/**/mp_common.en.sab*",
+    ],
+    drop: &["zone/cp_*"],
+};
+
+/// Modern Warfare III (2023): the zones its maps (Tokyo, Rebirth Island,
+/// the multiplayer maps of `asset_transport::JUP_MAPS` and Modern Warfare
+/// II's of `asset_transport::MWII_MAPS`) read,
+/// its played guns' part zones (`assets::lane::jup_gun`; the MCW 6.8's are
+/// filed under the MCW's `acharlie`), every package (opened together) and its
+/// decompressor.
+const JUP: Rules = Rules {
+    keep: &[
+        "oo2core_*.dll",
+        "zone/ingame*.ff",
+        "zone/eng_ingame*.ff",
+        "zone/global*.ff",
+        "zone/code_post_gfx*.ff",
+        "zone/mp_jup_escape5*",
+        "zone/eng_mp_jup_escape5*",
+        "zone/mp_jup_elevated*",
+        "zone/eng_mp_jup_elevated*",
+        "zone/mp_jup_afghan_v2.ff",
+        "zone/mp_jup_afghan_v2_*_tr.ff",
+        "zone/eng_mp_jup_afghan_v2.ff",
+        "zone/mp_jup_derail.ff",
+        "zone/mp_jup_derail_*_tr.ff",
+        "zone/eng_mp_jup_derail.ff",
+        "zone/mp_jup_estate.ff",
+        "zone/mp_jup_estate_*_tr.ff",
+        "zone/eng_mp_jup_estate.ff",
+        "zone/mp_jup_favela.ff",
+        "zone/mp_jup_favela_*_tr.ff",
+        "zone/eng_mp_jup_favela.ff",
+        "zone/mp_jup_highrise.ff",
+        "zone/mp_jup_highrise_*_tr.ff",
+        "zone/eng_mp_jup_highrise.ff",
+        "zone/mp_jup_invasion.ff",
+        "zone/mp_jup_invasion_*_tr.ff",
+        "zone/eng_mp_jup_invasion.ff",
+        "zone/mp_jup_karachi.ff",
+        "zone/mp_jup_karachi_*_tr.ff",
+        "zone/eng_mp_jup_karachi.ff",
+        "zone/mp_jup_quarry.ff",
+        "zone/mp_jup_quarry_*_tr.ff",
+        "zone/eng_mp_jup_quarry.ff",
+        "zone/mp_jup_rundown.ff",
+        "zone/mp_jup_rundown_*_tr.ff",
+        "zone/eng_mp_jup_rundown.ff",
+        "zone/mp_jup_rust.ff",
+        "zone/mp_jup_rust_*_tr.ff",
+        "zone/eng_mp_jup_rust.ff",
+        "zone/mp_jup_scrapyard.ff",
+        "zone/mp_jup_scrapyard_*_tr.ff",
+        "zone/eng_mp_jup_scrapyard.ff",
+        "zone/mp_jup_skidrow.ff",
+        "zone/mp_jup_skidrow_*_tr.ff",
+        "zone/eng_mp_jup_skidrow.ff",
+        "zone/mp_jup_subbase.ff",
+        "zone/mp_jup_subbase_*_tr.ff",
+        "zone/eng_mp_jup_subbase.ff",
+        "zone/mp_jup_terminal.ff",
+        "zone/mp_jup_terminal_*_tr.ff",
+        "zone/eng_mp_jup_terminal.ff",
+        "zone/mp_jup_underpass.ff",
+        "zone/mp_jup_underpass_*_tr.ff",
+        "zone/eng_mp_jup_underpass.ff",
+        "zone/mp_jup_wasteland.ff",
+        "zone/mp_jup_wasteland_*_tr.ff",
+        "zone/eng_mp_jup_wasteland.ff",
+        "zone/mp_jup_shoothouse2.ff",
+        "zone/mp_jup_shoothouse2_*_tr.ff",
+        "zone/eng_mp_jup_shoothouse2.ff",
+        "zone/mp_jup_shipment_iw9.ff",
+        "zone/mp_jup_shipment_iw9_*_tr.ff",
+        "zone/eng_mp_jup_shipment_iw9.ff",
+        "zone/mp_jup_das_haus.ff",
+        "zone/mp_jup_das_haus_*_tr.ff",
+        "zone/eng_mp_jup_das_haus.ff",
+        "zone/mp_jup_farm_18.ff",
+        "zone/mp_jup_farm_18_*_tr.ff",
+        "zone/eng_mp_jup_farm_18.ff",
+        "zone/mp_jup_growhouse.ff",
+        "zone/mp_jup_growhouse_*_tr.ff",
+        "zone/eng_mp_jup_growhouse.ff",
+        // (Modern Warfare II (2022)'s maps in the install: `asset_transport::MWII_MAPS`.)
+        "zone/mp_jup_observatory.ff",
+        "zone/mp_jup_observatory_*_tr.ff",
+        "zone/eng_mp_jup_observatory.ff",
+        "zone/mp_jup_grandprix_pm_2.ff",
+        "zone/mp_jup_grandprix_pm_2_*_tr.ff",
+        "zone/eng_mp_jup_grandprix_pm_2.ff",
+        "zone/mp_jup_swap_meet.ff",
+        "zone/mp_jup_swap_meet_*_tr.ff",
+        "zone/eng_mp_jup_swap_meet.ff",
+        "zone/mp_jup_luxury.ff",
+        "zone/mp_jup_luxury_*_tr.ff",
+        "zone/eng_mp_jup_luxury.ff",
+        "zone/mp_jup_m_alley.ff",
+        "zone/mp_jup_m_alley_*_tr.ff",
+        "zone/eng_mp_jup_m_alley.ff",
+        "zone/mp_jup_m_blacksite2.ff",
+        "zone/mp_jup_m_blacksite2_*_tr.ff",
+        "zone/eng_mp_jup_m_blacksite2.ff",
+        "zone/mp_jup_m_exhibit.ff",
+        "zone/mp_jup_m_exhibit_*_tr.ff",
+        "zone/eng_mp_jup_m_exhibit.ff",
+        "zone/mp_av_*mike93*",
+        "zone/mp_aw_*mike93*",
+        "zone/mp_av_*anov94*",
+        "zone/mp_aw_*anov94*",
+        "zone/mp_av_*acharlie*",
+        "zone/mp_aw_*acharlie*",
+        "zone/mp_av_*balpha27*",
+        "zone/mp_aw_*balpha27*",
+        "zone/mp_av_*foxtrot2000*",
+        "zone/mp_aw_*foxtrot2000*",
+        "zone/mp_av_*qbravo97*",
+        "zone/mp_aw_*qbravo97*",
+        "zone/mp_av_*stango44*",
+        "zone/mp_aw_*stango44*",
+        "zone/mp_av_*aromeo200*",
+        "zone/mp_aw_*aromeo200*",
+        "zone/mp_av_*kappa98*",
+        "zone/mp_aw_*kappa98*",
+        "zone/mp_av_*pkilop*",
+        "zone/mp_aw_*pkilop*",
+        "zone/mp_av_*qbravo95lsw*",
+        "zone/mp_aw_*qbravo95lsw*",
+        "zone/mp_av_*spapa12*",
+        "zone/mp_aw_*spapa12*",
+        "zone/mp_av_*kpappa50*",
+        "zone/mp_aw_*kpappa50*",
+        "zone/mp_av_*talpham*",
+        "zone/mp_aw_*talpham*",
+        // (Modern Warfare II's guns: their default parts' zones.)
+        "zone/mp_av_att_vm_p*",
+        "zone/mp_aw_att_wm_p*",
+        "zone/mp_aw_att_vm_p*",
+        "zone/mp_av_att_vm_ar_mike16_smag*",
+        "zone/mp_aw_att_*m_ar_mike16_smag*",
+        "zone/mp_av_*cdelta50*",
+        "zone/mp_aw_*cdelta50*",
+        "zone/mp_av_*hsierra*",
+        "zone/mp_aw_*hsierra*",
+        "zone/*.xpak",
+        "zone/*.xsub",
+        "jupiter/assets/mapents/**",
+    ],
+    drop: &[],
+};
+
+/// Infinite Warfare: its menus' zone, its multiplayer and Zombies maps with
+/// their technique zones and patches, the shared zones and the asset and
+/// image packs (wherever the zones sit). None of its sound is read.
+const IW: Rules = Rules {
+    keep: &["**/ui.ff", "**/iw7_ui.ff", "**/mp_*.ff", "**/cp_*.ff", "**/techsets_*.ff", "**/patch_*.ff", "**/common*.ff", "**/global*.ff", "**/assetfile*.pak", "**/imagefile*.pak", "**/iw7_imagefile*.bin"],
+    drop: &["**/*.sab*", "**/soundfile*"],
+};
+
+/// The @leetinservers mod: its zone, its settings and the archives at its
+/// top.
+const BO2MOD: Rules = Rules { keep: &["mod.ff", "mod.json", "*.iwd", "*.sab*"], drop: &[] };
+
+pub fn for_game(key: &str) -> Rules {
+    match key {
+        "bo2" => BO2,
+        "bo1" => BO1,
+        "mw2" | "mw3" => IW4_IW5,
+        "waw" | "cod4" => T4_IW3,
+        "ghosts" => GHOSTS,
+        "aw" => AW,
+        "bo3" => BO3,
+        "jup" => JUP,
+        "iw" => IW,
+        "bo2mod" => BO2MOD,
+        // (The DLC5 pack, and any game not listed: whole.)
+        _ => ALL,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::for_game;
+
+    #[test]
+    fn videos_and_installers_never_go() {
+        let r = for_game("bo2");
+        assert!(r.keeps("zone/all/common_mp.ff"));
+        assert!(!r.keeps("video/intro.bik"));
+        assert!(!r.keeps("redist/DirectX/DXSETUP.exe"));
+        assert!(!r.keeps("zone/french/common_mp.ff"));
+        assert!(r.keeps("sound/mpl_common.all.sabs"));
+        assert!(!r.keeps("sound/mpl_common.french.sabs"));
+    }
+
+    #[test]
+    fn each_game_keeps_what_it_reads() {
+        assert!(for_game("bo1").keeps("main/iw_00.iwd"));
+        assert!(!for_game("bo1").keeps("main/localized_french_iw00.iwd"));
+        assert!(for_game("mw2").keeps("main/localized_english_iw00.iwd"));
+        assert!(for_game("mw2").keeps("zone/english/mp_rust_load.ff"));
+        assert!(!for_game("mw2").keeps("zone/english/cliffhanger.ff"));
+        assert!(for_game("bo3").keeps("zone/base.xpak"));
+        assert!(for_game("bo3").keeps("zone/snd/all/mp_common.all.sabs"));
+        assert!(!for_game("bo3").keeps("zone/snd/all/zm_genesis.all.sabs"));
+        assert!(!for_game("bo3").keeps("zone/cp_mi_eth_prologue.ff"));
+        assert!(for_game("iw").keeps("ui.ff") && for_game("iw").keeps("zone/mp_breakneck.ff"));
+        assert!(!for_game("iw").keeps("english/soundfile1.pak"));
+        assert!(for_game("aw").keeps("zone/mp_venus.ff"));
+        assert!(for_game("aw").keeps("zone/imagefile36.pak"));
+        assert!(for_game("aw").keeps("zone/mp_vm_bal27_tr.ff"));
+        assert!(for_game("jup").keeps("oo2core_8_win64.dll"));
+        assert!(!for_game("bo2mod").keeps("sub/notes.txt"));
+        assert!(for_game("bo2extra").keeps("mods/dlc5/mod.ff"));
+    }
+}

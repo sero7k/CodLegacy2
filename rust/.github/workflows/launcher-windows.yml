@@ -1,0 +1,55 @@
+# Builds the player launcher (crates/player_launcher) for Windows and keeps
+# codlegacy-launcher.exe and the CodLegacy-Setup.exe installer as downloadable
+# artifacts of the run: on pushes that touch the launcher, and on demand.
+name: Launcher (Windows)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/player_launcher/**"
+      - "tools/installer/**"
+      - ".github/workflows/launcher-windows.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: launcher-windows
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust (rust-toolchain.toml)
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Test
+        run: cargo test -p player_launcher
+
+      - name: Build
+        run: cargo build --release -p player_launcher
+
+      - name: Installer
+        shell: pwsh
+        run: |
+          choco install nsis -y --no-progress
+          $ver = (Select-String -Path crates\player_launcher\Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          & "${env:ProgramFiles(x86)}\NSIS\makensis.exe" /DVERSION=$ver /DEXE="$PWD\target\release\codlegacy-launcher.exe" /DOUT="$PWD\CodLegacy-Setup.exe" tools\installer\codlegacy.nsi
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target\release\codlegacy-launcher.exe dist\codlegacy-launcher.exe
+          Copy-Item target\release\codlegacy-publish.exe dist\codlegacy-publish.exe
+          Copy-Item CodLegacy-Setup.exe dist\CodLegacy-Setup.exe
+          git log -1 --format="%h %s" | Out-File -Encoding utf8 dist\build.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: codlegacy-launcher-${{ github.sha }}
+          path: dist/
+          retention-days: 14

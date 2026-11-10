@@ -1,0 +1,15 @@
+[package]
+name = "gsc_t7"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "bo2mp: Black Ops III compiled scripts (GSC, version 0x1C): the table generator, tests over the retail zones and tools for gsc_t6::t7."
+
+[dependencies]
+gsc_t6 = { path = "../gsc_t6" }
+
+[dev-dependencies]
+fastfile_t7 = { path = "../fastfile_t7" }
+
+[lints]
+workspace = true

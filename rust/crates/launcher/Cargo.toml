@@ -1,0 +1,26 @@
+[package]
+name = "launcher"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "The binary. Process entry only: allocator, argv, env, log init; assembly lives in bootstrap."
+
+[[bin]]
+name = "CodLegacy"
+path = "src/main.rs"
+
+[features]
+bevy-debug = ["bootstrap/bevy-debug"]
+# NVIDIA DLSS (needs the DLSS SDK to build: docs/RENDER.md, "Enabling DLSS").
+dlss = ["bootstrap/dlss"]
+bevy-trace = ["bootstrap/bevy-trace"]
+span-stats = ["bootstrap/span-stats"]
+
+[dependencies]
+diag.workspace = true
+asset_transport.workspace = true
+bootstrap = { path = "../bootstrap" }
+call_of_claude = { path = "../call_of_claude" }
+
+[lints]
+workspace = true

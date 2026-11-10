@@ -1,0 +1,384 @@
+kind	id	name	argspec	returns	what	confidence	evidence	handler	static_calls	mainrun_calls
+function	0xa6	randomint	max:int	int	[0,max)	VERIFIED	error when max<1	0x1403b3ae0	14	4778
+function	0xa7	randomfloat	max:float	float	[0,max)	VERIFIED		0x1403b3b30	14	2430
+function	0xb2	abs	v:float	float	absolute value	VERIFIED		0x1403b47b0	1	2407
+method	0x82aa	rotateto_shortest	angles:vec,time,[accel],[decel]	-	rotate to angles taking the shortest way (wraps every axis)	GUESS	like rotateto but delta wrapped to +-180	0x1403cf2c0	11	2406
+function	0x2d	isdefined	v:any	bool	false for undefined and for freed/non-value objects; true for any other value	VERIFIED	handler: arg type 0 -> false; objects with type<0x17 except 0x14 -> true	0x1403b7660	1405	1281
+function	0x37	getdvar	name:string,[default:string]	string	dvar value as string	VERIFIED	Dvar_GetVariantStringWithDefault -> Scr_AddString	0x1403b9df0	36	672
+function	0x39	getdvarfloat	name:string,[default]	float	dvar as float (atof of the string)	VERIFIED	same as 0x37 + atof	0x1403ba5e0	10	650
+function	0xb0	int	v:string/float/int	int	cast to int	VERIFIED	string -> atoi; float truncated	0x1403b43e0	33	542
+function	0x1a6	getnextarraykey	array,key	key	next key after key; undefined at the end	VERIFIED	requires array object	0x1403ba5a0	267	176
+function	0x1c1	getfirstarraykey	array	key	first key; undefined for empty	VERIFIED	requires array object	0x1403ba570	267	86
+function	0x189	getentarray	[value:string,key:string]	array	all matching entities; no args = every in-use entity	VERIFIED		0x1403d3650	59	86
+method	0x82ad	rotateroll	delta,time,[accel],[decel]	-	axis 2	VERIFIED		0x1403cf440	2	80
+function	0x188	getent	value:string,key:string	ent	the entity whose <key> field == value (error when several)	VERIFIED	entity field table lookup	0x1403d3580	29	72
+function	0x143	loadfx	path:string	int	fx index; prepends fx/ when the path lacks it	VERIFIED	mp_frag fx script calls it 40x with fx paths	0x1403b2f60	48	62
+function	0x18c	spawnstruct	-	struct	new empty struct	VERIFIED	allocates a struct object	0x140438250	48	45
+function	0x32	setdvar	name:string,value:string/any	-	sets a dvar from script; vector args are concatenated; double quotes are replaced by single quotes	VERIFIED	Dvar_IsValidName + Dvar_SetFromStringByNameFromSource(script)	0x1403b8ec0	40	28
+function	0x13a	precacherumble	name:string	-	init-only; non-empty name; registers a rumble config string	LIKELY	called with exploder.v["rumble"] style strings	0x1403b8b90	7	28
+function	0x38	getdvarint	name:string,[default]	int	dvar as int (atoi of the string)	VERIFIED	same as 0x37 + atoi	0x1403ba230	22	27
+function	0x2f	isstring	v:any	bool	type == string	VERIFIED	returns (type==2)	0x1403b7970	1	26
+method	0x81ac	getentitynumber	-	int	entity number	VERIFIED	g_entities[idx].number	0x1403b1ff0	21	22
+function	0xe9	vectordot	a:vec,b:vec	float	dot product	VERIFIED		0x1403b5b10	13	21
+method	0x82b5	unk_0x82b5	v:int	-	stores a byte at +0x19b of the entity (0/1); used by script_vehicle damage code and mp_frag setup	GUESS		0x1403cf850	15	20
+function	0x15e	precachemodel	name:string	-	init-only; registers a model	VERIFIED	mp_frag calls it with model names	0x1403cc0f0	30	16
+method	0x80a9	delete	-	-	removes a script entity (error on players, clients, or when linked children)	VERIFIED	free entity	0x1403c1ea0	52	15
+function	0x63	spawn	classname:string,origin:vec,[spawnflags:int],[ignoreSpawnflag:int]	ent	creates an entity of a classname (script_model, script_origin, trigger_radius ...) at origin	VERIFIED	G_Spawn + origin at +0x140 + spawnflags at +0x1bc + classname spawn function table	0x1403b3f30	33	13
+function	0xa9	randomfloatrange	min:float,max:float	float	[min,max)	VERIFIED	error when max<=min	0x1403b3c80	12	12
+function	0x107	vectornormalize	v:vec	vec	v divided by its length (length 0 -> unchanged)	VERIFIED		0x1403b5d30	13	9
+method	0x804a	linkto	parent:ent,[tag:string],[offset:vec],[angles:vec]	-	attaches an entity to a parent (optionally a tag)	VERIFIED	mp_frag calls with 1, 2 and 4 args; handler is LinkTo with flag 0	0x1403b7e70	23	8
+function	0xd5	max	a:float,b:float	float	larger of two	VERIFIED		0x1403b48b0	9	8
+method	0x82b6	unk_0x82b6	v:int	-	clears (nonzero) or sets (0) entity flag 0x10	GUESS	mp_frag	0x1403cf8b0	8	8
+function	0xb3	min	a:float,b:float	float	smaller of two	VERIFIED		0x1403b4870	2	8
+function	0x116	tolower	string	string	lowercase copy	VERIFIED		0x1403b7b10	14	7
+function	0x113	issubstr	haystack:string,needle:string	bool	strstr != 0	VERIFIED		0x1403b76b0	30	6
+method	0x82b2	rotateto	angles:vec,time,[accel],[decel]	-	rotate to angles	VERIFIED		0x1403cf690	13	6
+function	0x10c	anglestoright	angles:vec	vec	right vector	VERIFIED	AngleVectors with only the 3rd output	0x1403b6400	5	6
+method	0x80aa	setmodel	model:string	-	sets the model	VERIFIED		0x1403b3d60	18	5
+function	0xe1	distance	a:vec,b:vec	float	euclidean distance	VERIFIED		0x1403b5540	10	5
+method	0x826e	useanimtree	tree	-	binds the entity to an anim tree (entity must be animatable)	LIKELY	called with the get_animtree value right after setmodel	0x1403ce920	6	5
+method	0x80d1	setcursorhint	hint:string	-	HINT_NOICON, HINT_ACTIVATE ... for use triggers	VERIFIED	names in the handler	0x1403bd240	15	4
+function	0x108	vectortoangles	v:vec	vec	direction -> (pitch,yaw,0)	VERIFIED	helper shared with spawnfx forward->angles	0x1403b5e20	12	4
+function	0x10d	anglestoforward	angles:vec	vec	forward vector	VERIFIED	AngleVectors with only the 2nd output	0x1403b6580	12	4
+function	0x66	bullettrace	start:vec,end:vec,hitchars:int,[ignore:ent],[...]	struct	trace; result array has position,fraction,entity,normal,surfacetype	VERIFIED	trace mask 0x280e831/0x80a831 by 3rd arg; builds the 5 result fields	0x1403c2670	7	4
+function	0x1c0	getarraykeys	array	array	keys of an array	LIKELY	requires array object	0x1403ba400	7	4
+method	0x8092	getorigin	-	vec	current origin	VERIFIED	copies ent+0x140	0x1403c68d0	4	4
+function	0x1a7	sortbydistance	array,origin:vec	array	entities sorted by distance (max 0x800)	VERIFIED	array of entities, origin; qsort by distance	0x1403ba920	3	4
+method	0x81d9	getlightintensity	-	float	primary light intensity	LIKELY	entity type 10 only	0x1403bb7d0	2	4
+method	0x833d	unk_0x833d	type:string	-	sets entity subtype from 9 names (helicopter, airstrike, explosive, fast explosive, rocket, rocket_corpse, turret, javelin, missile); entity type 6	GUESS	used by maps/mp/_load	0x1403ca5a0	2	4
+function	0xe3	distancesquared	a:vec,b:vec	float	squared distance	VERIFIED		0x1403b5790	8	3
+function	0x13e	precachestring	s:istring	-	init-only; registers a localized string	VERIFIED	called with &"ELEVATOR_FLOOR_SELECT_HINT"	0x1403be020	7	3
+method	0x8051	hide	-	-	hides from every client	LIKELY	svFlags OR= 0x20 (use-client-mask) and client mask = -1	0x1403c9c30	23	2
+method	0x8073	playloopsound	alias:string	-	loop sound on the entity	VERIFIED	sets the loop sound index and clears the tracking bit	0x1403c9700	12	2
+function	0xb7	getnode	value:string,key:string	node	path node with node.<key> == value (error when several)	VERIFIED	class 2 (node) field table lookup	0x14037f4f0	5	2
+function	0x10b	anglestoup	angles:vec	vec	up vector	VERIFIED	AngleVectors with only the 4th output	0x1403b6340	5	2
+method	0x80b8	makeusable	-	-	entity can be used (+contents)	LIKELY	contents OR= 0x200000; errors for players	0x1403bcaf0	4	2
+method	0x80d7	unk_0x80d7	-	-	sets flag 0x20000000 on the entity	GUESS		0x1403bd0e0	4	2
+function	0x89	getnorthyaw	-	float	north yaw stored in configstring 0x499 (set by setminimap)	LIKELY	reads cs 0x499 as float	0x1403b26c0	2	2
+function	0x136	visionsetnaked	name:string,[time:float=1]	-	configstring 0x49c "name" ms	VERIFIED	"\"%s\" %i", default 1000	0x1403cc130	2	2
+method	0x826d	clonebrushmodeltoscriptmodel	brush:ent	-	copies a brush model's collision model onto this script_model	VERIFIED	requires the other to be a brushmodel entity (+0x109==4)	0x1403d01c0	2	2
+function	0x148	playloopedfx	fx:int,repeat:float,origin:vec,[cull:float],[forward],[up]	-	looped fx	VERIFIED	exe error strings "playLoopedFx called with ..."	0x1403cdf10	1	2
+method	0x80d2	sethintstring	istring...	-	use-prompt text	VERIFIED	"Hint String"	0x1403bdba0	1	2
+method	0x8176	unk_0x8176	-	-	sets a byte at +0x1f8 on trigger classes	GUESS		0x1403b87f0	1	2
+method	0x81ae	unk_0x81ae	-	-	sets flag 0x80 on the classname DAT_ce68 entity	GUESS		0x1403b2560	1	2
+method	0x81da	setlightintensity	v:float	-	primary light intensity (>=0)	LIKELY	writes float [0x16]	0x1403bb900	1	2
+function	0x3b	gettime	-	int	level time in ms	LIKELY	no decompiled body; used as `x = gettime() + secs*1000` 41 times, 0 args	0x1403bb070	41	1
+method	0x82b4	notsolid	-	-	clears collision contents	VERIFIED		0x1403cec90	12	1
+method	0x8057	disconnectpaths	-	-	unlinks nodes inside this brush entity	VERIFIED	sets flag 0x20000000 and removes node links	0x1403b7cf0	8	1
+function	0xab	cos	deg:float	float	cosine of an angle in degrees	VERIFIED		0x1403b3de0	5	1
+method	0x8056	connectpaths	-	-	re-links the path nodes blocked by this brush entity	VERIFIED	clears flag 0x20000000 after the disconnect helper	0x1403b7bf0	5	1
+function	0xaa	sin	deg:float	float	sine of an angle in degrees	VERIFIED	x*0.0174533 -> sin helper (the one AngleVectors uses for the sine terms)	0x1403b3d30	4	1
+method	0x82a3	moveto	origin:vec,time:float,[accel:float],[decel:float]	-	linear move	VERIFIED		0x1403ced20	4	1
+method	0x804c	unlink	-	-	detaches from the parent; resets the player link state	VERIFIED	clears client link flags	0x1403b81b0	3	1
+function	0x200	connectnodepair	node1,node2,[dontbidirectional:int]	-	links two path nodes (both ways unless 3rd arg set)	VERIFIED	removes any old link, adds link	0x1403b8090	2	1
+function	0xec	visionsetthermal	name:string,[time:float=1]	-	sets configstring 0x49f "name" ms (default 1000 ms)	LIKELY	4th of the visionset* family (0x136..0x138, 0xec, 0xed)	0x1403cc280	1	1
+function	0xed	visionsetpain	name:string,[time:float=1]	-	configstring 0x4a0	LIKELY		0x1403cc2f0	1	1
+function	0x137	visionsetnight	name:string,[time:float=1]	-	configstring 0x49d	VERIFIED		0x1403cc1a0	1	1
+function	0x138	visionsetmissilecam	name:string,[time:float=1]	-	configstring 0x49e	VERIFIED		0x1403cc210	1	1
+function	0x13c	precacheitem	name:string	-	init-only; G_FindItem(pickup name) must exist	VERIFIED	called with "briefcase_bomb_mp", "bomb_site_mp"	0x1403bdb10	1	1
+function	0x13f	precachemenu	name:string	-	init-only; registers a menu	VERIFIED	called with "elevator_floor_selector", "painter_mp"	0x1403be390	1	1
+function	0x1be	setminimap	material:string,x1,y1,x2,y2	-	configstring 0x49a with the map rectangle; checks north yaw	LIKELY	"\"%s\" %f %f %f %f"	0x1403b9b10	1	1
+function	0x1a8	tablelookup	file:string,searchcol:int,value:string,returncol:int	string	first row whose column searchcol == value	VERIFIED	StringTable_GetAsset	0x1403b7270	52	0
+function	0x130	getmatchrulesdata	path...	any	reads the match-rules structured data (mp/recipes.def); 2..5 path args	VERIFIED	exe symbol GetMatchRulesData	0x1403c9600	38	0
+function	0x33	setsaveddvar	name:string,value:string/any	-	same shape as setdvar (no FindVar call); used for the scr_<gt>_<name> and r_* register helpers	GUESS	handler is setdvar minus the FindVar; sibling of 0x32	0x1403b92d0	22	0
+method	0x8097	playsound	alias:string,[notify:string]	-	sound at the entity	VERIFIED	0x8072 is the master variant; utility chooses between them	0x1403c69f0	17	0
+function	0x117	strtok	string,delims:string	array of string	split on any delimiter char	VERIFIED		0x1403b7ea0	16	0
+function	0x19a	isplayer	ent	bool	entity has a player client	VERIFIED	ent+0x168 != 0	0x1403cc3d0	16	0
+method	0x817b	gettagorigin	tag:string	vec	world origin of a model tag	VERIFIED		0x1403b84c0	15	0
+method	0x80a2	istouching	ent	bool	bounding boxes overlap	VERIFIED		0x1403bdfd0	13	0
+method	0x8050	show	-	-	clears the hidden-from-clients state	LIKELY	svFlags -= 0x20 and client mask = 0 (0x8051 sets/hides)	0x1403c9be0	12	0
+method	0x82ea	playlocalsound	alias:string	-	cmd n + sound index to one client; skipped for bots/agents	VERIFIED	cmd 'n' + sound index; skips bots/agents	0x14038ba70	12	0
+method	0x80a4	stoploopsound	[alias]	-	stops the loop sound	VERIFIED	clears loop sound index and bit	0x1403b8fc0	11	0
+method	0x8263	iprintln	string...	-	prints a message to one player	GUESS	cmd char via "%c"; 1-2 args	0x1403906e0	11	0
+method	0x8264	iprintlnbold	string...	-	centered message to one player	GUESS		0x140390750	9	0
+function	0x196	newhudelem	-	hudelem	server-wide hud element	VERIFIED	HudElem_Alloc(0x7ff)	0x140399620	8	0
+function	0x1a9	tablelookupbyrow	file:string,row:int,col:int	string	cell value	VERIFIED	StringTable_GetColumnValueForRow	0x1403b7c70	8	0
+method	0x8018	playsoundontag?	a,[b],[c]	-	1..3 arg helper used by _destructible	GUESS	parses args with FUN_1403c3720	0x1403b47e0	8	0
+method	0x8211	getpointinbounds	x:float,y:float,z:float	vec	point inside the entity bounds by 0..1 fractions	LIKELY	FUN_1403d8120(ent,x,y,z)	0x1403b37c0	8	0
+method	0x8242	buttonpressed	name:string	bool	always 0 on the server build	VERIFIED	createfx menu calls it with "escape","x"	0x14038fa60	7	0
+method	0x830c	setoffhandsecondaryclass	class:string	-	exactly 1 arg; one of 6 constant strings, else error; stores the index	LIKELY	stores index at +0x418	0x14038a710	7	0
+function	0x5b	getweaponattachments	weapon:string	array of string	attachment names of a weapon string (up to 4)	LIKELY	G_GetWeaponForName + attachment list walk	0x1403bbf10	6	0
+function	0xc3	isai	ent	bool	true for bots and agents	LIKELY	IsBot or IsAgent helpers on an entity argument	0x1403cc420	6	0
+function	0x144	playfx	fx:int,origin:vec,[forward:vec],[up:vec]	-	one-shot effect at a position	VERIFIED	temp event 0x5b; 2..4 args	0x1403b3850	6	0
+function	0x149	spawnfx	fx:int,origin:vec,forward:vec,[up:vec]	ent	creates an fx entity (use triggerfx)	VERIFIED	exe error strings "spawnFx called with ..."	0x1403ce510	6	0
+function	0x14a	triggerfx	fxent,[delay:float]	-	starts (or restarts) a spawnfx entity	VERIFIED	requires entity type 8, sets start time	0x1403ce7f0	6	0
+function	0x195	playsoundatposition	origin:vec,alias:string	-	one-shot sound at a position	LIKELY	temp event 3 with sound alias index; arg order vec then string per handler	0x1403c6e00	6	0
+function	0x1e9	isagent	ent	bool	entity is an agent	LIKELY	IsAgent helper only	0x1403ca4e0	6	0
+method	0x817c	gettagangles	tag:string	vec	world angles of a model tag	VERIFIED		0x1403b8650	6	0
+method	0x82f2	setclientdvar	name:string,value	-	sends a dvar value to one client	VERIFIED	"Client Dvar Value"	0x14038a430	6	0
+method	0x8338	setoffhandprimaryclass	class:string	-	as 0x830c, other slot	LIKELY		0x14038a390	6	0
+function	0x115	getsubstr	string,start:int,[end:int]	string	substring [start,end) (<=1023 chars)	VERIFIED		0x1403b7990	5	0
+function	0x18e	isalive	ent	bool	ent.health > 0	LIKELY	ent+0x1dc (health) > 0	0x1403c6540	5	0
+method	0x8008	setplayerangles	v:vec	-	sets view angles of a player/agent	GUESS	sibling of 0x8007	0x1403cae30	5	0
+method	0x8081	fadeovertime	time:float(0..60]	-	error outside (0,60]; snapshots colour/alpha, start = level time, duration = round(sec*1000)	VERIFIED	hudelem method: snapshots color and stores the duration (ms)	0x1403986d0	5	0
+method	0x8085	destroy	-	-	frees the hud element	LIKELY	hudelem method; zeroes the element	0x140398a50	5	0
+method	0x82b3	solid	-	-	sets collision contents 0x2080 on script_model/brush entities	VERIFIED		0x1403cebe0	5	0
+method	0x82c1	isinuse?	-	bool	returns false on the server build	GUESS		0x140391970	5	0
+method	0x82c8	unk_0x82c8	a,b	-	JKLMNX(ent,0)	GUESS		0x14038d910	5	0
+method	0x82f1	setclientomnvar?	name:string,value	-	2 args; sets a typed client variable by name	GUESS	typed var table; 2 args	0x14038a080	5	0
+method	0x8375	setmovingplatformenabled?	enabled:int	-	FUN_140379ae0 on brush entity	GUESS		0x1403b85d0	5	0
+function	0x1a5	getbaseweaponname	weapon:string	string	weapon name without attachments/alt prefix	LIKELY	G_GetWeaponForName + name of the base	0x1403bbc60	4	0
+function	0x1ac	tablelookupgetrownum	file:string,col:int,value:string	int	row number or -1	VERIFIED	StringTable_LookupRowNumForValue	0x1403b77d0	4	0
+method	0x8007	setorigin	v:vec	-	moves a player/agent	GUESS	player client vs agent client dispatch; 1 vector arg	0x1403cad70	4	0
+method	0x80c1	settext	istring...	-	hudelem type 1 (text)	LIKELY	type 1; "Hud Elem String"	0x140397d00	4	0
+method	0x817d	shellshock	name:string,duration:float,[?]	-	shellshock (0..60 s)	LIKELY	client shellshock idx/time/duration	0x1403c1c80	4	0
+method	0x81d0	unk_0x81d0	6 args	-	damage / physics pulse helper	GUESS		0x1403c1150	4	0
+method	0x821c	getrankedplayerdata	path...	any	ranked player data	VERIFIED	exe symbol GetRankedPlayerData	0x1403b5b70	4	0
+method	0x8270	scriptmodelplayanim	anim:string	-	plays a looping animation on a script_model	LIKELY	looks the anim up, sets trajectory type 10	0x1403ce9a0	4	0
+method	0x82dc	unk_0x82dc	-	bool	returns true; player-only	GUESS		0x1403919b0	4	0
+method	0x8305	getcurrentweapon	-	string	current weapon or "none"	VERIFIED		0x140389d90	4	0
+method	0x8309	unk_0x8309	a	-	FUN_14038f770(ent,0)	GUESS		0x14038ada0	4	0
+method	0x832f	getplayerangles	-	vec	view angles	LIKELY	reads client+0x184	0x14038c750	4	0
+function	0xa8	randomintrange	min:int,max:int	int	[min,max)	VERIFIED	error when max<=min	0x1403b3c30	3	0
+function	0xdc	clamp	v:float,min:float,max:float	float	v clamped to [min,max]	VERIFIED		0x1403b4c00	3	0
+function	0x145	playfxontag	fx:int,ent,tag:string	-	effect attached to a model tag	VERIFIED	event 0x5c with tag index; rejects tags containing "	0x1403b40d0	3	0
+function	0x1aa	tablelookupistring	file:string,searchcol:int,value:string,returncol:int	istring	like tablelookup but returns a localized string	LIKELY	same lookup, different return	0x1403b75a0	3	0
+function	0x1d0	weaponclass	weapon:string	string	weapon class name (rifle, smg ...)	LIKELY	weapon def +0xa0 -> name	0x1403bbe00	3	0
+function	0x1d8	getvehiclenodearray	value,key	array	all matches	VERIFIED	class 3	0x140572060	3	0
+function	0x1e8	isbot	ent	bool	entity is a bot	LIKELY	FUN_1404613c0 on entity	0x14046cc90	3	0
+method	0x8177	getstance	-	string	"stand","crouch" or "prone"	LIKELY	reads stance bits of the client	0x1403c14d0	3	0
+method	0x82ec	setweaponammoclip	weapon:string,count:int,[hand]	-	sets clip ammo	LIKELY		0x140388c40	3	0
+method	0x8300	getweaponslistall	-	array of string	all carried weapons (and alt modes)	VERIFIED		0x14038c7d0	3	0
+method	0x83ba	unk_0x83ba	a:string,b:string	-	stores two config indices on the client	GUESS		0x140389eb0	3	0
+function	0x34	setdvarifuninitialized	name:string,value:any	-	only sets the dvar when it has no value yet	VERIFIED	handler: Dvar_FindVar, returns when the current string is non-empty	0x1403b97d0	2	0
+function	0x118	strcmp	a:string,b:string	int	string compare, 0 when equal	GUESS	FUN_1404f64e0 = stricmp style helper	0x1403b8580	2	0
+function	0x131	isusingmatchrulesdata	-	int	match rules data present	LIKELY	reads the same record GetMatchRulesData checks	0x1403c9660	2	0
+function	0x175	unk_0x175	name:string	int	maps one of 19 engine constant strings to a small int	GUESS	table lookup	0x1403c05e0	2	0
+function	0x176	print3d	origin,text,[color],[alpha],[scale],[time]	-	debug text; no-op on the server	GUESS	stub, 4..6 args	0x1403c10f0	2	0
+function	0x179	earthquake	scale:float,duration:float,source:vec,radius:float	-	screen shake event (g_earthquakeEnable)	VERIFIED	event 0x65	0x1403b36f0	2	0
+function	0x186	iprintlnbold	string...	-	prints to every client (concatenated args)	LIKELY	sends cmd 'g' to all clients	0x1403c64d0	2	0
+function	0x1d7	getvehiclenode	value,key	vehiclenode	first match; error on several	VERIFIED	class 3	0x140571f70	2	0
+function	0x201	disconnectnodepair	node1,node2,[dontbidirectional:int]	-	unlinks two path nodes	VERIFIED		0x1403b83e0	2	0
+function	0x220	soundgetplaybacktime	alias:string	int	duration of a sound alias in ms	GUESS	1 string -> int; used by _movers after playsound	0x1403b8170	2	0
+method	0x8003	playsoundtoteam	alias:string,team:string,[excludeplayer:ent]	-	plays a sound at the entity only for the players of a team	LIKELY	team must be "allies" or "axis"; builds a client mask from player teams	0x1403c6ee0	2	0
+method	0x8026	?	string,[any]	-	name + optional const; object method used by _destructible	GUESS	FUN_1403d7400(ent,name,v) errors on failure	0x1403b55b0	2	0
+method	0x8072	playsoundasmaster	alias:string,[notify:string]	-	plays a sound at the entity as a master sound	VERIFIED	common_scripts/utility play_sound_in_space picks it when the master arg is true	0x1403c9680	2	0
+method	0x80a1	geteye	-	vec	eye position of a player/agent	LIKELY	client eye pos; used by createfx	0x1403c2060	2	0
+method	0x80c3	setshader	material:string,[w:int,h:int]	-	1 or 3 args (error otherwise); empty name is an error; w,h >= 0; hudelem type 4, clears the other setters' state	LIKELY	type 4	0x140397dd0	2	0
+method	0x8181	setdepthoffield	nearStart,nearEnd,farStart,farEnd,nearBlur,farBlur	-	dof (blur 4..10)	VERIFIED	six floats with range checks	0x1403b8850	2	0
+method	0x8261	suicide	-	-	kills the player	LIKELY	health=0 + 100000 damage	0x1403905b0	2	0
+method	0x829b	setperk	perk:string,bit:int,slot:int	-	exactly 3 args; perk name must be in the perk table (error otherwise); arg2 sets the perk bit, arg3 the slot value (category <= 8)	VERIFIED	perk tables + bit set	0x14038e210	2	0
+method	0x82ae	devaddyaw	delta:float	-	editor helper (axis 1)	LIKELY		0x1403cf3c0	2	0
+method	0x82af	devaddroll	delta:float	-	editor helper (axis 2)	LIKELY		0x1403cf3e0	2	0
+method	0x82b0	devaddpitch	delta:float	-	editor helper (axis 0)	LIKELY		0x1403cf400	2	0
+method	0x82b7	physicslaunchserver	[velocity:vec,angvel:vec]	-	turns the entity into a physics mover with an initial velocity/spin	LIKELY	sets trajectory type 9	0x1403cf930	2	0
+method	0x82cd	setblurforplayer	blur:float,time:float	-	blur_target / blur_duration_ms client fields	VERIFIED	strings in handler	0x14038da20	2	0
+method	0x82ee	getweaponammoclip	weapon:string,[hand]	int	clip ammo	LIKELY		0x1403896e0	2	0
+method	0x82ff	unk_0x82ff	-	-	FUN_14038f570(ent,6)	GUESS		0x14038c7b0	2	0
+method	0x8302	giveweapon	weapon:string,[camo:int],[akimbo:int],[?],[?]	-	gives a weapon	VERIFIED	G_GivePlayerWeapon	0x1403891f0	2	0
+method	0x831c	unk_0x831c	v:int	-	sets/clears bit 4 of a client flag word	GUESS		0x14038ecf0	2	0
+method	0x831e	unk_0x831e	-	-	clears the same flag	GUESS		0x14038eec0	2	0
+method	0x8325	givemaxammo	weapon:string	-	refills ammo of a carried weapon	LIKELY	G_InitializeAmmo(ps,weapon,0)	0x14038b450	2	0
+method	0x8404	playsoundonmovingent	alias:string	-	sound that follows the entity (temp event 3); used by _movers	LIKELY	looks up the alias; 1 arg; sibling of playsound (0x8097)	0x1403c6a30	2	0
+function	0x31	getdvarinternal?	name:string	int/float/string	reads an engine-side system variable (not a dvar) by name; error if the var is flagged write-only	GUESS	1 call in _utility; handler looks the name up in a typed var table and returns int/float/string	0x1403b8a30	1	0
+function	0x65	unk_0x65	a,b,c	-	dedicated-server stub (no body)	GUESS	3 args; 1 call in common_scripts/utility	0x1403b5150	1	0
+function	0x84	physicstrace	start:vec,end:vec	vec	end point of a physics (contents 0x820015) trace	LIKELY	returns lerp point	0x1403b25b0	1	0
+function	0xb1	float	v:string/float/int	float	cast to float	VERIFIED		0x1403b4600	1	0
+function	0xb8	getnodearray	value:string,key:string	array	all path nodes matching	VERIFIED		0x14037f600	1	0
+function	0xd6	floor	v:float	float	floorf	VERIFIED		0x1403b49b0	1	0
+function	0xd7	ceil	v:float	float	ceilf	VERIFIED		0x1403b49d0	1	0
+function	0xda	sqrt	v:float	float	square root	VERIFIED		0x1403b4bc0	1	0
+function	0xe4	length	v:vec	float	vector length	VERIFIED		0x1403b5800	1	0
+function	0xe7	length2dsquared	v:vec	float	x*x+y*y	VERIFIED		0x1403b5970	1	0
+function	0x114	isendstr	string,suffix:string	bool	string ends with suffix	VERIFIED	compares the tail	0x1403b76f0	1	0
+function	0x133	unk_0x133	-	-	dedicated-server stub (no body)	GUESS	1 call in maps/mp/_utility	0x1403c6310	1	0
+function	0x13d	precacheshader	name:string	-	init-only; registers a material	VERIFIED	called with "black", "entity_headicon_*"	0x1403bdcd0	1	0
+function	0x170	physicsexplosionsphere	origin:vec,radius:float,inner:float,magnitude:float	-	pushes physics objects	LIKELY	temp event 0x60 + radii checks (inner<=radius)	0x1403b4ad0	1	0
+function	0x18f	isvehicle	ent	bool	entity type 0x11	GUESS	type compare	0x1403c6590	1	0
+function	0x197	newclienthudelem	player	hudelem	hud element for one player	VERIFIED	HudElem_Alloc(entnum)	0x1403995d0	1	0
+function	0x1b7	isweaponvalid	name:string	bool	weapon definition exists	GUESS	asset lookup != 0	0x1403be950	1	0
+function	0x1cb	resetscriptslot	index:int	-	clears one of 32 global script slots (0..31)	GUESS		0x1403d1dd0	1	0
+function	0x1e0	botsconnecttype	-	int	BG_BotsConnectType	GUESS		0x14046c070	1	0
+function	0x212	activateclientexploder	n:int,[players:ent or array],[delay:float]	-	asks clients to run client-side exploder n (optionally only for some players, after delay)	LIKELY	event entity 0xc1 with the id, a client mask built from the optional ent/array, start time = delay; 1 call in _exploder	0x1403b9e50	1	0
+function	0x243	playsoundtoplayers	alias,alias2,team,time,...	-	plays a sound to all players matching filters	GUESS	iterates all clients; 1 call in _utility	0x1403c7910	1	0
+method	0x800a	unk_0x800a	v	-	FUN_1403cd3b0(ent,0x2000000): sets a 0x2000000 flag on a player	GUESS	1385 once	0x1403ca950	1	0
+method	0x8019	?	a,b	-	player-only variant of 0x8018	GUESS		0x1403b48f0	1	0
+method	0x8022	?	-	-	stub	GUESS		0x1403c68c0	1	0
+method	0x8027	?	string,[any]	-	player variant of 0x8026 (clears a client flag first)	GUESS		0x1403b5670	1	0
+method	0x8028	?	string,a,b	-	3-arg sibling of 0x8026	GUESS		0x1403b4f00	1	0
+method	0x8045	?	tag	-	sets a bit in a model's per-bone mask (destructible part visibility)	GUESS	model bone-mask add; 1-2 args (tag, [model])	0x1403b6170	1	0
+method	0x8048	?	tag	-	clears the same bit	GUESS	inverse of 0x8045	0x1403b6d20	1	0
+method	0x8068	?	-	-	sets flag 0x20 on a brush/model entity (error when already set)	GUESS	_movers	0x1403b8e50	1	0
+method	0x80a6	?	string	-	event 0x6b with a configstring index (non-player entities only)	GUESS	_exploder	0x1403b95e0	1	0
+method	0x80ab	?	-	-	sets flag 0x10000 on a player/entity	GUESS		0x1403be3d0	1	0
+method	0x80ac	?	-	-	clears flag 0x10000	GUESS		0x1403be520	1	0
+method	0x80b9	makeunusable	-	-	clears usability	LIKELY		0x1403bccd0	1	0
+method	0x80c2	?	-	-	stub	GUESS		0x140397dc0	1	0
+method	0x80c6	settimer	seconds:float	-	exactly 1 arg; ceil(sec*1000) >= 1 else error; type 5, end = level time + ms	VERIFIED	type 5, end=level time + ms	0x140398020	1	0
+method	0x80ce	setvalue	v:float	-	hudelem type 2 (value), clears the other setters' state	LIKELY	type 2	0x140398460	1	0
+method	0x81aa	unk_0x81aa	pct:int,vec	-	stores damage-direction values on the client	GUESS		0x1403b94f0	1	0
+method	0x81d4	unk_0x81d4	ent,[vec]	-	links a script_model-like entity to a target (+offset)	GUESS		0x1403b2ba0	1	0
+method	0x81d7	unk_0x81d7	-	-	FUN_1403c4660(ent,1)	GUESS		0x1403b3010	1	0
+method	0x81d8	unk_0x81d8	-	-	FUN_1403c4660(ent,0)	GUESS		0x1403b3030	1	0
+method	0x821d	getprivateplayerdata	path...	any	private player data	VERIFIED	exe symbol	0x1403b5f60	1	0
+method	0x823b	setrankedplayerdata	path...,value	-	exe symbol	VERIFIED		0x1403b5e00	1	0
+method	0x823c	setprivateplayerdata	path...,value	-	exe symbol	VERIFIED		0x1403b60a0	1	0
+method	0x8245	setspawnweapon	weapon:string	-	selects the weapon the player holds on spawn	LIKELY	touches weapon slots, G_SelectWeapon	0x14038fae0	1	0
+method	0x826a	getguid	-	string	player guid	VERIFIED	SV_GetGuid	0x140391100	1	0
+method	0x8292	getspectatingplayer	-	ent	the entity a spectator is following (undefined when none)	LIKELY	client state 2 and spectator client >= 0	0x140391430	1	0
+method	0x829d	clearperks	-	-	clears all perks	VERIFIED		0x14038e970	1	0
+method	0x829e	unsetperk	perk:string,[?]	-	removes a perk	VERIFIED		0x14038e6f0	1	0
+method	0x82a7	movegravity	velocity:vec,time:float	-	ballistic move under gravity	LIKELY	trajectory type 5 with velocity and end time	0x1403cef10	1	0
+method	0x82bf	unk_0x82bf	-	-	sets client flag 0x8000	GUESS		0x14038d200	1	0
+method	0x82ca	unk_0x82ca	a,b	-	JKLMNX(ent,2)	GUESS		0x14038d9a0	1	0
+method	0x82cb	unk_0x82cb	a,b	-	JKLMNX(ent,3)	GUESS		0x14038d9c0	1	0
+method	0x82d6	unk_0x82d6	pct:int(0..100)	-	sets client flag 0x400 and a value	GUESS		0x14038f270	1	0
+method	0x82d7	unk_0x82d7	-	-	clears client flag 0x400	GUESS		0x140388b80	1	0
+method	0x82ed	setweaponammostock	weapon:string,count:int	-	sets stock ammo	LIKELY		0x140389490	1	0
+method	0x82ef	getweaponammostock	weapon:string	int	stock ammo	LIKELY		0x140389970	1	0
+method	0x82fc	setweaponhudiconoverrides	slot:int(1..7),kind:string,[weapon]	-	"weapon","altmode","nightvision","none"	VERIFIED	strings in handler	0x14038c360	1	0
+method	0x8303	takeweapon	weapon:string	-	removes a weapon	VERIFIED	G_TakePlayerWeapon	0x1403898a0	1	0
+method	0x8308	hasweapon	weapon:string	bool	true if carried	VERIFIED		0x14038a970	1	0
+method	0x830d	getoffhandsecondaryclass	-	string	reads the same	LIKELY		0x14038a910	1	0
+method	0x830e	unk_0x830e	string,int,[float]	-	sets client packed field (0x23c)	GUESS		0x14038be50	1	0
+method	0x830f	unk_0x830f	-	-	clears that field	GUESS		0x14038c010	1	0
+method	0x8310	unk_0x8310	-	-	sets client flag 0x80	GUESS		0x14038efa0	1	0
+method	0x8311	unk_0x8311	-	-	clears client flag 0x80	GUESS		0x14038f160	1	0
+method	0x8312	unk_0x8312	-	-	sets client flag 0x1000	GUESS		0x14038f210	1	0
+method	0x8313	unk_0x8313	-	-	clears client flag 0x1000	GUESS		0x14038f2f0	1	0
+method	0x8314	unk_0x8314	-	-	sets client flag 0x800	GUESS		0x14038f350	1	0
+method	0x8315	unk_0x8315	-	-	clears client flag 0x800	GUESS		0x140388be0	1	0
+method	0x8316	openpopupmenu	menu:string	bool	opens a menu on the client	LIKELY	cmd 'o' + menu index	0x14038e450	1	0
+method	0x8318	closepopupmenu	[menu]	-	closes the menu	LIKELY		0x14038e840	1	0
+method	0x831d	unk_0x831d	-	-	sets a client flag (bit 8)	GUESS		0x14038edf0	1	0
+method	0x8334	unk_0x8334	-	float	reads client+0x424	GUESS		0x14038db60	1	0
+method	0x8335	unk_0x8335	-	bool	true when a client flag set is non-empty	GUESS		0x14038dbc0	1	0
+method	0x8336	unk_0x8336	-	bool	flag test	GUESS		0x14038dc40	1	0
+method	0x833e	unk_0x833e	-	bool	flag test on client	GUESS		0x14038d890	1	0
+method	0x836d	botgetskill?	-	int	bot data	GUESS		0x14046a7f0	1	0
+method	0x83fc	playsoundtoplayer?	alias:string,type:string,time:float,...	-	plays sound for one player	GUESS		0x1403c7750	1	0
+method	0x8406	unk_0x8406	-	int	reads a counter from the client	GUESS		0x14038fa00	1	0
+method	0x82a4	movex	dist:float,time,[accel],[decel]	-	move along X by a distance	VERIFIED	axis 0 helper	0x1403cf270	0	0
+method	0x82a5	movey	dist,time,[accel],[decel]	-	axis 1	VERIFIED		0x1403cf280	0	0
+method	0x82a6	movez	dist,time,[accel],[decel]	-	axis 2	VERIFIED		0x1403cf2a0	0	0
+method	0x82ab	rotatepitch	delta:float,time,[accel],[decel]	-	axis 0	VERIFIED		0x1403cf410	0	0
+method	0x82ac	rotateyaw	delta,time,[accel],[decel]	-	axis 1	VERIFIED		0x1403cf420	0	0
+function	0x30	setsaveddvar			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	LIKELY				
+function	0x5a	getweaponmodel			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	GUESS				
+function	0x60	unk_0060			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+function	0x61	unk_0061			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+function	0x62	unk_0062			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+function	0x82	sighttracepassed			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	LIKELY				
+function	0x83	bullettracepassed			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	LIKELY				
+function	0x85	playerphysicstrace			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	GUESS				
+function	0xa5	setslowmotion			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	LIKELY				
+function	0xba	unk_00ba			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+function	0xbb	unk_00bb			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+function	0xe0	pointonsegmentnearesttopoint			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	LIKELY				
+function	0xee	unk_00ee			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+function	0xf1	bullettracer			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	GUESS				
+function	0x122	setmatchdata			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	VERIFIED				
+function	0x123	getmatchdata			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	VERIFIED				
+function	0x124	sendmatchdata			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	LIKELY				
+function	0x129	setclientmatchdata			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	VERIFIED				
+function	0x12a	getclientmatchdata			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	LIKELY				
+function	0x12b	setclientmatchdatadef			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	LIKELY				
+function	0x12c	sendclientmatchdata			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	LIKELY				
+function	0x12f	unk_012f			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+function	0x132	kick			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	LIKELY				
+function	0x134	unk_0134			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+function	0x135	unk_0135			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+function	0x146	stopfxontag			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	LIKELY				
+function	0x147	killfxontag			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	LIKELY				
+function	0x14b	playfxontagforclients			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	LIKELY				
+function	0x14c	unk_014c			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+function	0x150	getteamscore			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	LIKELY				
+function	0x151	setteamscore			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	LIKELY				
+function	0x157	unk_0157			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+function	0x158	positionwouldtelefrag			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	LIKELY				
+function	0x159	unk_0159			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+function	0x15f	map_restart			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	LIKELY				
+function	0x160	exitlevel			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	LIKELY				
+function	0x169	unk_0169			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+function	0x187	unk_0187			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+function	0x18a	getspawnarray			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	VERIFIED				
+function	0x198	newteamhudelem			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	LIKELY				
+function	0x19e	weaponclipsize			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	LIKELY				
+function	0x1a4	weaponinventorytype			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	GUESS				
+function	0x21e	unk_021e			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+function	0x23a	unk_023a			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+function	0x23b	unk_023b			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+function	0x248	unk_0248			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+function	0x24f	unk_024f			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+function	0x250	unk_0250			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+function	0x251	unk_0251			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+function	0x253	unk_0253			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x8005	unk_8005			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x8015	unk_8015			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x8016	unk_8016			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x8017	unk_8017			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x801f	unk_801f			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x8029	unk_8029			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x804e	viewkick			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	GUESS				
+method	0x8082	scaleovertime			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	LIKELY				
+method	0x8083	moveovertime			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	LIKELY				
+method	0x8086	setpulsefx			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	LIKELY				
+method	0x808f	unk_808f			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x80a8	unk_80a8			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x80b1	unk_80b1			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x80b7	setcontents			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	LIKELY				
+method	0x80cf	unk_80cf			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x8178	setstance			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	LIKELY				
+method	0x817f	unk_817f			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x81db	unk_81db			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x81dc	setmovespeedscale			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	LIKELY				
+method	0x821a	isitemunlocked			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	VERIFIED				
+method	0x821b	getplayerdata			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	VERIFIED				
+method	0x821e	getcoopplayerdata			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	VERIFIED				
+method	0x821f	getcommonplayerdata			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	VERIFIED				
+method	0x823a	setplayerdata			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	VERIFIED				
+method	0x823d	setcoopplayerdata			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	VERIFIED				
+method	0x823e	setcommonplayerdata			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	VERIFIED				
+method	0x823f	getcacplayerdata			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	VERIFIED				
+method	0x8247	unk_8247			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x8265	unk_8265			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x8267	cloneplayer			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	LIKELY				
+method	0x8269	allowspectateteam			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	LIKELY				
+method	0x826f	scriptmodelclearanim			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	LIKELY				
+method	0x828c	getxuid			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	LIKELY				
+method	0x8291	unk_8291			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x8293	unk_8293			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x8295	unk_8295			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x8296	unk_8296			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x8299	unk_8299			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x82bd	unk_82bd			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x82c0	unk_82c0			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x82c2	getweaponslistprimaries			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	LIKELY				
+method	0x82c3	getweaponslistoffhands			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	LIKELY				
+method	0x82d1	notifyonplayercommand			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	LIKELY				
+method	0x82d4	unk_82d4			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x82d5	unk_82d5			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x82de	unk_82de			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x82f3	setclientdvars			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	LIKELY				
+method	0x8304	takeallweapons			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	LIKELY				
+method	0x8306	unk_8306			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x8321	unk_8321			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x832c	unk_832c			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x8330	unk_8330			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x8337	unk_8337			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x833f	unk_833f			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x8340	unk_8340			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x8352	unk_8352			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x83a7	unk_83a7			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x83b7	unk_83b7			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x83b8	unk_83b8			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x83d8	unk_83d8			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x83d9	unk_83d9			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x83da	unk_83da			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x83e8	unk_83e8			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x83f1	unk_83f1			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x83fa	unk_83fa			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x83fb	unk_83fb			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x83fd	setcamerapoint			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	GUESS				
+method	0x83fe	unk_83fe			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x8402	getlinkedchildren			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	LIKELY				
+method	0x8405	unk_8405			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x840c	unk_840c			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x840d	unk_840d			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x841c	setcommonplayerdatareservedint			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	VERIFIED				
+method	0x841d	unk_841d			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+method	0x841e	getrankedplayerdatareservedint			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	VERIFIED				
+method	0x841f	setrankedplayerdatareservedint			named 2026-11-05 from script usage; see IW6_NATIVE.md Builtin pass 3	VERIFIED				
+method	0x8423	unk_8423			named 2026-11-05 from script usage; no readable handler meaning, no-op	GUESS				
+function	0x1c2	getglass	name:string	glass	INFERRED from mp_snow: result tested with isdefined, then waited on for glass_destroyed	GUESS	mp_snow main/#1002, #1367		0	0
+function	0x221	getscriptablearray	value:string,key:string	array	scriptable entities with that key (mp_snow: snowman); iterated with getfirstarraykey	GUESS	mp_snow main #30328		0	0

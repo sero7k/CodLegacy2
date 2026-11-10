@@ -1,0 +1,12 @@
+[package]
+name = "native_cull"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Visibility culling every native renderer shares: a software occlusion buffer built from big opaque surfaces, and the too-small-to-see test."
+
+[dependencies]
+glam = "0.32.1"
+
+[lints]
+workspace = true

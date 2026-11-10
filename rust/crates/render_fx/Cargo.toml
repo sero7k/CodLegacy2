@@ -1,0 +1,47 @@
+[package]
+name = "render_fx"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Bevy-facing FX presentation producer over the pure fx host pool."
+
+[dependencies]
+codlegacy_env.workspace = true
+asset_audio.workspace = true
+asset_core.workspace = true
+asset_game.workspace = true
+asset_iw4.workspace = true
+asset_model.workspace = true
+asset_world.workspace = true
+assets.workspace = true
+audio.workspace = true
+diag.workspace = true
+entity_iw4.workspace = true
+frame.workspace = true
+fx.workspace = true
+fx_iw4.workspace = true
+fastfile_t7.workspace = true
+lighting_iw4.workspace = true
+marks_iw4.workspace = true
+math_iw4.workspace = true
+net.workspace = true
+render_frame.workspace = true
+render_anim.workspace = true
+render_scene.workspace = true
+sim.workspace = true
+weapon_iw4.workspace = true
+bevy.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+# bo2mp: the offline Ghosts effect harness (`examples/iw6_fx_shot.rs`).
+fastfile_iw6.workspace = true
+fastfile_h1.workspace = true
+render_h1.workspace = true
+render_iw6.workspace = true
+glam = "0.32.1"
+png = "0.18"
+wgpu = { version = "29", features = ["noop"] }
+bcdec_rs.workspace = true

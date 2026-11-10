@@ -1,0 +1,14 @@
+[package]
+name = "fb_vfs"
+# Vendored from https://github.com/AaronSparks/Battlefield-1-Rust-Rewrite (Unlicense). See docs/BF1.md and NOTICE.
+description = "Read-only access to Frostbite (Battlefield 1) toc/sb/cat/cas files"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "Unlicense"
+
+[dependencies]
+anyhow = "1"
+flate2.workspace = true
+lz4_flex.workspace = true
+ruzstd = "0.8"

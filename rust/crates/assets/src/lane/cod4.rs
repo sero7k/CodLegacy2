@@ -1,0 +1,1785 @@
+//! bo2mp: Call of Duty 4 (IW3) maps.
+//!
+//! A CoD4 map zone (`IWffu100`, version 5) is read with the `iw3` crate
+//! (ported from COD4-Rewrite): its GfxWorld becomes the world draw, its
+//! clipMap_t the collision, its MapEnts the entities and spawns. Every world
+//! surface's colour map is read from CoD4's own IWDs (`main/iw_*.iwd`) and
+//! drawn through the renderer's fallback pass, as Black Ops II's surfaces
+//! are; Black Ops II's rules then add everything else
+//! (`attach_t6_rules`). No ZoneGame of its own: the map walk sends a CoD4
+//! zone here by its version.
+//!
+//! World at War (`t4`) maps share everything after the zone read: the `t4`
+//! crate converts a WaW zone to an `iw3::zone::Zone` (see `super::waw`),
+//! and [`build_legacy_world`] turns either into the match's world.
+
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
+
+use asset_core::{AssetEdge, AssetNamespace, AssetRef, T6Draw, ZoneOwner};
+use asset_material::{AuthoredImage, AuthoredMaterial, MaterialCatalog, MaterialTextureBinding, TS_COLOR_MAP, TS_NORMAL_MAP, TS_SPECULAR_MAP};
+use asset_transport::progress::{LoadProgress, StageId};
+use asset_world::WorldDrawPolicy;
+use bevy::asset::RenderAssetUsages;
+use bevy::prelude::Image;
+use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+
+use super::LoadedWorld;
+use crate::lane_capability::PreparedCapability;
+use crate::session_load::PreparedWorld;
+
+/// The techniques whose draw state a surface takes, first present wins: lit
+/// with sun shadow, lit with sun, lit, emissive, unlit.
+const TECHNIQUES: [usize; 5] = [9, 8, 7, 5, 4];
+
+/// bo2mp: a colour map with its whole mip chain, so the fallback pass's
+/// trilinear, anisotropic sampler has smaller levels to read at a distance
+/// (one level shimmered and aliased across every far floor and wall).
+/// bo2mp: the side of the flat water's ripple tile.
+const WATER_TILE: u32 = 32;
+
+/// bo2mp: a flat water colour as a tile of faint ripples (three crossing
+/// waves, whole cycles over the tile so it repeats), the colour its mean and
+/// its alpha unchanged: flat water that flows (`T6Anim::Flow`) has something
+/// to carry.
+fn water_tile(rgba: [u8; 4]) -> Vec<u8> {
+    let side = WATER_TILE as usize;
+    let mut out = Vec::with_capacity(side * side * 4);
+    for y in 0..side {
+        for x in 0..side {
+            let (x, y) = (x as f32, y as f32);
+            let wave = |a: f32, b: f32, phase: f32| {
+                (std::f32::consts::TAU * (a * x + b * y) / side as f32 + phase).sin()
+            };
+            let ripple = (wave(1.0, 2.0, 0.0) + wave(3.0, -1.0, 1.3) + wave(2.0, 3.0, 2.1)) / 3.0;
+            let lift = 1.0 + 0.1 * ripple;
+            for &c in &rgba[..3] {
+                out.push((f32::from(c) * lift).clamp(0.0, 255.0).round() as u8);
+            }
+            out.push(rgba[3]);
+        }
+    }
+    out
+}
+
+fn rgba_image(w: u32, h: u32, rgba: Vec<u8>) -> Image {
+    let (data, levels) = mip_chain(w, h, rgba);
+    let mut image = Image::new_uninit(
+        Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        TextureDimension::D2,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    );
+    image.texture_descriptor.mip_level_count = levels;
+    image.data = Some(data);
+    image
+}
+
+/// bo2mp: a normal map with its mip chain (each level a 2x2 box of the one
+/// above, the vector renormalised), stored linear.
+fn linear_image(w: u32, h: u32, rgba: Vec<u8>) -> Image {
+    let levels = 32 - w.max(h).max(1).leading_zeros();
+    let mut data = rgba.clone();
+    let (mut pw, mut ph, mut prev) = (w as usize, h as usize, rgba);
+    for _ in 1..levels {
+        let (nw, nh) = ((pw / 2).max(1), (ph / 2).max(1));
+        let mut next = vec![0u8; nw * nh * 4];
+        for y in 0..nh {
+            for x in 0..nw {
+                let mut v = [0.0f32; 3];
+                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    let (sx, sy) = ((x * 2 + dx).min(pw - 1), (y * 2 + dy).min(ph - 1));
+                    let p = &prev[(sy * pw + sx) * 4..][..4];
+                    for c in 0..3 {
+                        v[c] += f32::from(p[c]) / 255.0 * 2.0 - 1.0;
+                    }
+                }
+                let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-6);
+                let o = (y * nw + x) * 4;
+                for c in 0..3 {
+                    next[o + c] = ((v[c] / len * 0.5 + 0.5) * 255.0).round().clamp(0.0, 255.0) as u8;
+                }
+                next[o + 3] = 255;
+            }
+        }
+        data.extend_from_slice(&next);
+        (pw, ph, prev) = (nw, nh, next);
+    }
+    let mut image = Image::new_uninit(
+        Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        TextureDimension::D2,
+        TextureFormat::Rgba8Unorm,
+        RenderAssetUsages::default(),
+    );
+    image.texture_descriptor.mip_level_count = levels;
+    image.data = Some(data);
+    image
+}
+
+/// The levels of an sRGB RGBA8 picture, largest first, concatenated: each a
+/// 2x2 box of the one above, averaged in linear light. Alpha keeps the top
+/// level's coverage at the 0.5 test the alpha-tested shaders make (each
+/// level's alpha scaled until as much of it passes), so leaves and fences
+/// do not thin away with distance.
+fn mip_chain(w: u32, h: u32, top: Vec<u8>) -> (Vec<u8>, u32) {
+    let levels = 32 - w.max(h).max(1).leading_zeros();
+    let to_lin: Vec<f32> = (0..256).map(|i| (i as f32 / 255.0).powf(2.2)).collect();
+    // Linear back to 8-bit sRGB through a 4096-step table.
+    let to_srgb: Vec<u8> =
+        (0..4096).map(|i| ((i as f32 / 4095.0).powf(1.0 / 2.2) * 255.0).round().clamp(0.0, 255.0) as u8).collect();
+    let coverage = |px: &[u8], scale: f32| {
+        let n = px.len() / 4;
+        let pass = px.chunks_exact(4).filter(|p| f32::from(p[3]) * scale >= 127.5).count();
+        pass as f32 / n.max(1) as f32
+    };
+    let want = coverage(&top, 1.0);
+    let cut = top.chunks_exact(4).any(|p| p[3] < 255);
+    let mut out = top.clone();
+    let (mut pw, mut ph, mut prev) = (w as usize, h as usize, top);
+    for _ in 1..levels {
+        let (nw, nh) = ((pw / 2).max(1), (ph / 2).max(1));
+        let mut next = vec![0u8; nw * nh * 4];
+        for y in 0..nh {
+            for x in 0..nw {
+                let mut acc = [0.0f32; 4];
+                let mut n = 0.0;
+                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    let (sx, sy) = ((x * 2 + dx).min(pw - 1), (y * 2 + dy).min(ph - 1));
+                    let p = &prev[(sy * pw + sx) * 4..][..4];
+                    for c in 0..3 {
+                        acc[c] += to_lin[usize::from(p[c])];
+                    }
+                    acc[3] += f32::from(p[3]);
+                    n += 1.0;
+                }
+                let o = (y * nw + x) * 4;
+                for c in 0..3 {
+                    next[o + c] = to_srgb[((acc[c] / n) * 4095.0).round().clamp(0.0, 4095.0) as usize];
+                }
+                next[o + 3] = (acc[3] / n).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+        if cut && want > 0.0 {
+            // The alpha scale whose coverage matches the top level's.
+            let (mut lo, mut hi) = (0.0f32, 4.0f32);
+            for _ in 0..12 {
+                let mid = (lo + hi) * 0.5;
+                if coverage(&next, mid) < want { lo = mid } else { hi = mid }
+            }
+            for a in next.chunks_exact_mut(4) {
+                a[3] = (f32::from(a[3]) * hi).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+        out.extend_from_slice(&next);
+        (pw, ph, prev) = (nw, nh, next);
+    }
+    (out, levels)
+}
+
+/// Links every surface material the world uses into `catalog` with its
+/// colour map (from the game's IWDs); world surface index -> catalog index.
+fn link_world_materials(
+    tag: &str,
+    zone: &iw3::zone::Zone,
+    world: &iw3::zone::GfxWorld,
+    main: Option<&Path>,
+    catalog: &mut MaterialCatalog,
+    owner: &str,
+    report: &mut Vec<String>,
+    look: Option<&super::bo2_look::Look>,
+    commons: &[&iw3::zone::Zone],
+) -> Vec<Option<usize>> {
+    // bo2mp: a material the map only names (a reference, no technique set:
+    // the flags' decals, shared trims) is the game's `common_mp` one.
+    let common_names = super::legacy_guns::common_material_names(commons);
+    let mut from_common = 0usize;
+    let owner = ZoneOwner::intern(owner);
+    // bo2mp: Black Ops II pictures linked for swapped surfaces (colour,
+    // normal, specular slots), by World at War colour image.
+    let mut swapped: HashMap<String, [Option<usize>; 3]> = HashMap::new();
+    let mut swap_count = 0usize;
+    let mut by_material: HashMap<usize, Option<usize>> = HashMap::new();
+    let mut images: HashMap<String, Option<usize>> = HashMap::new();
+    let (mut decoded, mut grey, mut missing) = (0usize, 0usize, Vec::new());
+    let mut layer_maps = 0usize;
+    let mut shine_maps = 0usize;
+    let mut water_count = 0usize;
+    let mut out = Vec::with_capacity(world.surfaces.len());
+    // bo2mp: water draws as moving water only where the map has reflections
+    // to show on it (its own probes, or a Black Ops II model map's); the
+    // fallback pass skips water without them, so elsewhere it keeps its flat
+    // colour.
+    let water_probes = legacy_probes_ready(zone, world, look);
+    let mut moving_water = 0usize;
+    let mut sky_line = None;
+    for surf in &world.surfaces {
+        let Some(mid) = surf.material else {
+            out.push(None);
+            continue;
+        };
+        if let Some(found) = by_material.get(&mid) {
+            out.push(*found);
+            continue;
+        }
+        let Some(material) = zone.material(mid) else {
+            by_material.insert(mid, None);
+            out.push(None);
+            continue;
+        };
+        let (mzone, material) = match (material.name.starts_with(',') || material.technique_set.is_none())
+            .then(|| common_names.get(material.name.trim_start_matches(',')))
+            .flatten()
+            .and_then(|&(z, i)| Some((commons[z], commons[z].material(i)?)))
+        {
+            Some(found) => {
+                from_common += 1;
+                found
+            }
+            None => (zone, material),
+        };
+        let technique_set = material
+            .technique_set
+            .and_then(|t| mzone.technique_set(t))
+            .map_or("", |t| t.name.as_str());
+        let state = TECHNIQUES.iter().find_map(|&t| material.state_bits_for(t));
+        let mut draw = T6Draw::from_technique_set(technique_set, material.sort_key, state);
+        // bo2mp: tool surfaces (`wc_tools`: caulk_shadow, aa_default) cast
+        // shadows only; the game never draws their pictures (Cargoship's
+        // caulk drew over 1300 triangles of its decks).
+        if technique_set.trim_start_matches(',').split('_').any(|t| t == "tools") {
+            draw.blend = asset_core::T6Blend::ShadowOnly;
+        }
+
+        let mut textures = Vec::new();
+        // bo2mp: the base colour map is `colorMap` (a layered material's
+        // `colorMap1` / `colorMap2` can sort before it by name hash).
+        let base_hash = super::t6_materials::name_hash("colorMap");
+        let colours = || material.textures.iter().filter(|t| t.semantic == iw3::zone::TextureSemantic::Color && t.image.is_some());
+        let colour = colours().find(|t| t.name_hash == base_hash).or_else(|| {
+            colours().find(|t| !super::t6_materials::LAYER_MAPS.iter().any(|(h, _)| *h == t.name_hash))
+        }).or_else(|| colours().next());
+        let swap = colour
+            .and_then(|t| t.image)
+            .and_then(|i| mzone.image(i))
+            .and_then(|image| look.and_then(|l| l.swaps.get_key_value(image.name.as_str())));
+        // bo2mp: CoD4 / World at War water (`wc_water`) keeps the shader's
+        // placeholder in its colour slot (`case64blue`, a blue grid of
+        // numbers): the game's water shader draws from its constants and
+        // normal map instead. Drawn here as its `waterColor` (alpha below 1
+        // blended over the bed), not the placeholder.
+        let water = legacy_water_colour(technique_set, material);
+        let water_rows = water_probes.then(|| legacy_water_table(technique_set, material)).flatten();
+        if let Some(rows) = water_rows
+            && let Some(texture) = colour
+        {
+            // bo2mp: moving water (the fallback pass's IW3 water): its
+            // table in the colour map's place, the ripple map in both normal
+            // slots.
+            draw.water = true;
+            if rows[8][3] < 1.0 && draw.blend == asset_core::T6Blend::Opaque {
+                draw.blend = asset_core::T6Blend::Blend;
+            }
+            let table = *images.entry(format!("{}#watertable", material.name)).or_insert_with(|| {
+                Some(catalog.link_image(AuthoredImage {
+                    namespace: AssetNamespace::T6,
+                    name: AssetRef::Real(format!("{tag}:{}#watertable", material.name)),
+                    map_type: 0,
+                    semantic: TS_COLOR_MAP,
+                    category: 0,
+                    use_srgb_reads: false,
+                    width: rows.len() as u16,
+                    height: 1,
+                    depth: 1,
+                    level_count: 1,
+                    format: 0,
+                    payload: Arc::new(Vec::new()),
+                    decoded: Some(Arc::new(super::t6_materials::water_image(&rows))),
+                    common_owned: false,
+                    decoded_variant: None,
+                    decoded_by: None,
+                    pending_decode: None,
+                }))
+            });
+            let ripple = *images.entry("#legacy_water_ripple".to_owned()).or_insert_with(|| {
+                let (w, h, rgba) = ripple_normal_map();
+                Some(catalog.link_image(AuthoredImage {
+                    namespace: AssetNamespace::T6,
+                    name: AssetRef::Real(format!("{tag}:#water_ripple")),
+                    map_type: 0,
+                    semantic: TS_NORMAL_MAP,
+                    category: 0,
+                    use_srgb_reads: false,
+                    width: w as u16,
+                    height: h as u16,
+                    depth: 1,
+                    level_count: 1,
+                    format: 0,
+                    payload: Arc::new(Vec::new()),
+                    decoded: Some(Arc::new(linear_image(w, h, rgba))),
+                    common_owned: false,
+                    decoded_variant: None,
+                    decoded_by: None,
+                    pending_decode: None,
+                }))
+            });
+            water_count += 1;
+            moving_water += 1;
+            for (semantic, image) in [(TS_COLOR_MAP, table), (TS_NORMAL_MAP, ripple), (TS_SPECULAR_MAP, ripple)] {
+                textures.push(MaterialTextureBinding {
+                    name_hash: texture.name_hash,
+                    name_start: 0,
+                    name_end: 0,
+                    sampler_state: texture.sampler_state,
+                    semantic,
+                    image,
+                });
+            }
+        } else if let Some(rgba) = water
+            && let Some(texture) = colour
+        {
+            if rgba[3] < 255 && draw.blend == asset_core::T6Blend::Opaque {
+                draw.blend = asset_core::T6Blend::Blend;
+            }
+            // bo2mp: water without reflections to show keeps its flat colour
+            // but flows: a tile of faint ripples slides along it.
+            draw.anim = asset_core::T6Anim::Flow;
+            let slot = *images.entry(format!("{}#water", material.name)).or_insert_with(|| {
+                Some(catalog.link_image(AuthoredImage {
+                    namespace: AssetNamespace::T6,
+                    name: AssetRef::Real(format!("{tag}:{}#water", material.name)),
+                    map_type: 0,
+                    semantic: TS_COLOR_MAP,
+                    category: 0,
+                    use_srgb_reads: true,
+                    width: WATER_TILE as u16,
+                    height: WATER_TILE as u16,
+                    depth: 1,
+                    level_count: 1,
+                    format: 0,
+                    payload: Arc::new(Vec::new()),
+                    decoded: Some(Arc::new(rgba_image(WATER_TILE, WATER_TILE, water_tile(rgba)))),
+                    common_owned: false,
+                    decoded_variant: None,
+                    decoded_by: None,
+                    pending_decode: None,
+                }))
+            });
+            water_count += 1;
+            textures.push(MaterialTextureBinding {
+                name_hash: texture.name_hash,
+                name_start: 0,
+                name_end: 0,
+                sampler_state: texture.sampler_state,
+                semantic: TS_COLOR_MAP,
+                image: slot,
+            });
+        } else if let Some((key, swap)) = swap
+            && let Some(texture) = colour
+        {
+            let slots = *swapped.entry(key.clone()).or_insert_with(|| {
+                let link = |catalog: &mut MaterialCatalog, img: &Arc<Image>, part: &str, semantic: u8, srgb: bool| {
+                    let size = img.texture_descriptor.size;
+                    catalog.link_image(AuthoredImage {
+                        namespace: AssetNamespace::T6,
+                        name: AssetRef::Real(format!("bo2look:{}:{part}", swap.material)),
+                        map_type: 0,
+                        semantic,
+                        category: 0,
+                        use_srgb_reads: srgb,
+                        width: size.width as u16,
+                        height: size.height as u16,
+                        depth: 1,
+                        level_count: img.texture_descriptor.mip_level_count as u8,
+                        format: 0,
+                        payload: Arc::new(Vec::new()),
+                        decoded: Some(Arc::clone(img)),
+                        common_owned: false,
+                        decoded_variant: None,
+                        decoded_by: None,
+                        pending_decode: None,
+                    })
+                };
+                [
+                    Some(link(catalog, &swap.colour, "c", TS_COLOR_MAP, true)),
+                    swap.normal.as_ref().map(|i| link(catalog, i, "n", TS_NORMAL_MAP, false)),
+                    swap.specular.as_ref().map(|i| link(catalog, i, "s", TS_SPECULAR_MAP, true)),
+                ]
+            });
+            swap_count += 1;
+            for (slot, semantic) in slots.into_iter().zip([TS_COLOR_MAP, TS_NORMAL_MAP, TS_SPECULAR_MAP]) {
+                if slot.is_some() {
+                    textures.push(MaterialTextureBinding {
+                        name_hash: texture.name_hash,
+                        name_start: 0,
+                        name_end: 0,
+                        sampler_state: texture.sampler_state,
+                        semantic,
+                        image: slot,
+                    });
+                }
+            }
+        } else if let Some(texture) = colour
+            && let Some(image) = texture.image.and_then(|i| mzone.image(i))
+        {
+            // bo2mp: a map in Black Ops II's look takes its model map's sky.
+            let bo2_sky = (draw.blend == asset_core::T6Blend::Sky)
+                .then(|| look.and_then(|l| l.sky.as_ref()))
+                .flatten();
+            let sky_cube = if let Some((name, cube)) = bo2_sky {
+                Some(Ok(Some((**cube).clone()))).inspect(|_| sky_line = Some(format!("{tag} sky: the Black Ops II model's {name}")))
+            } else {
+                (draw.blend == asset_core::T6Blend::Sky)
+                    .then(|| main.map(|main| asset_material::decode_sky_cube_from_main(main, &image.name)))
+                    .flatten()
+            };
+            let bo2_sky_used = bo2_sky.is_some();
+            if let Some(cube) = sky_cube {
+                let slot = match cube {
+                    Ok(Some(img)) => {
+                        let size = img.texture_descriptor.size;
+                        if !bo2_sky_used {
+                            sky_line = Some(format!("{tag} sky: {} ({}x{} cube)", image.name, size.width, size.width));
+                        }
+                        Some(catalog.link_image(AuthoredImage {
+                            namespace: AssetNamespace::T6,
+                            name: AssetRef::Real(format!("{tag}:sky:{}", image.name)),
+                            map_type: 5,
+                            semantic: TS_COLOR_MAP,
+                            category: 0,
+                            use_srgb_reads: true,
+                            width: size.width as u16,
+                            height: size.width as u16,
+                            depth: 1,
+                            level_count: img.texture_descriptor.mip_level_count as u8,
+                            format: 0,
+                            payload: Arc::new(Vec::new()),
+                            decoded: Some(Arc::new(img)),
+                            common_owned: false,
+                            decoded_variant: None,
+                            decoded_by: None,
+                            pending_decode: None,
+                        }))
+                    }
+                    Ok(None) => {
+                        sky_line = Some(format!("{tag} sky: {} is not a cube in the IWDs", image.name));
+                        None
+                    }
+                    Err(e) => {
+                        sky_line = Some(format!("{tag} sky: {}: {e}", image.name));
+                        None
+                    }
+                };
+                textures.push(MaterialTextureBinding {
+                    name_hash: texture.name_hash,
+                    name_start: 0,
+                    name_end: 0,
+                    sampler_state: texture.sampler_state,
+                    semantic: TS_COLOR_MAP,
+                    image: slot,
+                });
+            } else {
+            let slot = *images.entry(image.name.clone()).or_insert_with(|| {
+                let pixels = main
+                    .and_then(|main| asset_material::decode_ui_image_from_main(main, &image.name).ok().flatten());
+                let (w, h, rgba) = match pixels {
+                    Some(p) => {
+                        decoded += 1;
+                        grey += usize::from(asset_world::world_iw3::is_greyscale_rgba(&p.2));
+                        p
+                    }
+                    None => {
+                        missing.push(image.name.clone());
+                        // Flat grey where the picture is not found.
+                        (1, 1, vec![128, 128, 128, 255])
+                    }
+                };
+                Some(catalog.link_image(AuthoredImage {
+                    namespace: AssetNamespace::T6,
+                    name: AssetRef::Real(format!("{tag}:{}", image.name)),
+                    map_type: 0,
+                    semantic: TS_COLOR_MAP,
+                    category: 0,
+                    use_srgb_reads: true,
+                    width: w as u16,
+                    height: h as u16,
+                    depth: 1,
+                    level_count: 1,
+                    format: 0,
+                    payload: Arc::new(Vec::new()),
+                    decoded: Some(Arc::new(rgba_image(w, h, rgba))),
+                    common_owned: false,
+                    decoded_variant: None,
+                    decoded_by: None,
+                    pending_decode: None,
+                }))
+            });
+            textures.push(MaterialTextureBinding {
+                name_hash: texture.name_hash,
+                name_start: 0,
+                name_end: 0,
+                sampler_state: texture.sampler_state,
+                semantic: TS_COLOR_MAP,
+                image: slot,
+            });
+            }
+        }
+        // bo2mp: the material's own normal and specular maps (a CoD4 /
+        // World at War lit material's `normalMap` and `specularMap`): the
+        // fallback pass's IW3 branch bumps the lightmap's dominant light and
+        // the sun by the normal map and adds the specular map's reflection
+        // and sun highlight (`fragment_lightmapped`). Not on a surface drawn
+        // with Black Ops II's maps (`bo2_look` binds its own), nor a sky.
+        if swap.is_none() && draw.blend != asset_core::T6Blend::Sky && !draw.unlit && !draw.water && !draw.flow && !draw.layered {
+            for (semantic, want) in [
+                (TS_NORMAL_MAP, iw3::zone::TextureSemantic::Normal),
+                (TS_SPECULAR_MAP, iw3::zone::TextureSemantic::Specular),
+            ] {
+                let Some(texture) = material.textures.iter().find(|t| t.semantic == want && t.image.is_some()) else {
+                    continue;
+                };
+                let Some(image) = texture.image.and_then(|i| mzone.image(i)) else { continue };
+                // (`$identitynormalmap` and other engine images: flat, not
+                // in the IWDs.)
+                if image.name.trim_start_matches(',').starts_with('$') {
+                    continue;
+                }
+                let key = format!("{}#{semantic}", image.name);
+                let slot = *images.entry(key).or_insert_with(|| {
+                    let mut pixels = main.and_then(|main| asset_material::decode_ui_image_from_main(main, &image.name).ok().flatten())?;
+                    if semantic == TS_NORMAL_MAP {
+                        asset_world::world_iw3::iw3_normal_to_bo2(&mut pixels.2);
+                    }
+                    shine_maps += 1;
+                    let (w, h, rgba) = pixels;
+                    Some(catalog.link_image(AuthoredImage {
+                        namespace: AssetNamespace::T6,
+                        name: AssetRef::Real(format!("{tag}:{}", image.name)),
+                        map_type: 0,
+                        semantic,
+                        category: 0,
+                        // (Specular colours are gamma values, read as the
+                        // colour map is; a normal map as stored.)
+                        use_srgb_reads: semantic == TS_SPECULAR_MAP,
+                        width: w as u16,
+                        height: h as u16,
+                        depth: 1,
+                        level_count: 1,
+                        format: 0,
+                        payload: Arc::new(Vec::new()),
+                        decoded: Some(Arc::new(if semantic == TS_SPECULAR_MAP {
+                            rgba_image(w, h, rgba)
+                        } else {
+                            linear_image(w, h, rgba)
+                        })),
+                        common_owned: false,
+                        decoded_variant: None,
+                        decoded_by: None,
+                        pending_decode: None,
+                    }))
+                });
+                if slot.is_some() {
+                    textures.push(MaterialTextureBinding {
+                        name_hash: texture.name_hash,
+                        name_start: 0,
+                        name_end: 0,
+                        sampler_state: texture.sampler_state,
+                        semantic,
+                        image: slot,
+                    });
+                }
+            }
+        }
+        // bo2mp: a layered material's other colour maps (`colorMap1`,
+        // `colorMap2`): blended in by the vertex colour's green and blue (the
+        // layer weights, as Black Ops II's layered materials), on the same
+        // texture coordinates. Before, only the first layer drew: rubble,
+        // mud and grass blended over a floor were missing.
+        if draw.layered {
+            for (hash, semantic) in super::t6_materials::LAYER_MAPS {
+                let Some(texture) = material.textures.iter().find(|t| t.name_hash == hash && t.image.is_some()) else {
+                    continue;
+                };
+                let Some(image) = texture.image.and_then(|i| mzone.image(i)) else { continue };
+                let slot = *images.entry(image.name.clone()).or_insert_with(|| {
+                    let pixels = main.and_then(|main| asset_material::decode_ui_image_from_main(main, &image.name).ok().flatten());
+                    let (w, h, rgba) = match pixels {
+                        Some(p) => {
+                            decoded += 1;
+                            p
+                        }
+                        None => {
+                            missing.push(image.name.clone());
+                            (1, 1, vec![128, 128, 128, 255])
+                        }
+                    };
+                    Some(catalog.link_image(AuthoredImage {
+                        namespace: AssetNamespace::T6,
+                        name: AssetRef::Real(format!("{tag}:{}", image.name)),
+                        map_type: 0,
+                        semantic: TS_COLOR_MAP,
+                        category: 0,
+                        use_srgb_reads: true,
+                        width: w as u16,
+                        height: h as u16,
+                        depth: 1,
+                        level_count: 1,
+                        format: 0,
+                        payload: Arc::new(Vec::new()),
+                        decoded: Some(Arc::new(rgba_image(w, h, rgba))),
+                        common_owned: false,
+                        decoded_variant: None,
+                        decoded_by: None,
+                        pending_decode: None,
+                    }))
+                });
+                layer_maps += 1;
+                textures.push(MaterialTextureBinding {
+                    name_hash: texture.name_hash,
+                    name_start: 0,
+                    name_end: 0,
+                    sampler_state: texture.sampler_state,
+                    semantic,
+                    image: slot,
+                });
+            }
+        }
+        // bo2mp: how it moves: the world's water that has no water shader
+        // of its own flows (above), a waterfall or a scrolling technique by
+        // its names. (This lane's materials are the map's world.)
+        draw.anim = if draw.water || draw.effect || draw.unlit && draw.blend == asset_core::T6Blend::Multiply {
+            asset_core::T6Anim::None
+        } else {
+            draw.anim.or(asset_core::t6_anim_kind(technique_set, &material.name, true))
+        };
+        let index = catalog.link_material(AuthoredMaterial {
+            name: AssetRef::Real(format!("{tag}:{}", material.name)),
+            namespace: AssetNamespace::T6,
+            technique_set: AssetRef::default(),
+            technique_set_edge: AssetEdge::Absent,
+            draw_surf: 0,
+            sort_key: material.sort_key,
+            info_game_flags: 0,
+            texture_atlas: None,
+            surface_type_bits: None,
+            t5_layered_surface_types: None,
+            state_flags: 0,
+            camera_region: 0,
+            state_bits: Vec::new(),
+            state_bits_entry: None,
+            t5_state_bits_entry: None,
+            iw5_state_bits_entry: None,
+            technique_table: None,
+            route: None,
+            textures,
+            constants: Vec::new(),
+            zone: owner,
+            t6_draw: Some(draw),
+        });
+        by_material.insert(mid, Some(index));
+        out.push(Some(index));
+    }
+    report.push(format!(
+        "{tag} materials: {} linked, {decoded} colour maps decoded from the IWDs ({grey} of them grey), {} not found{}",
+        by_material.values().filter(|m| m.is_some()).count(),
+        missing.len(),
+        if missing.is_empty() {
+            String::new()
+        } else {
+            format!(" (first: {})", missing.iter().take(5).cloned().collect::<Vec<_>>().join(", "))
+        } + &if from_common > 0 {
+            format!("; {from_common} from the game's common_mp")
+        } else {
+            String::new()
+        } + &if layer_maps > 0 {
+            format!("; {layer_maps} blend layers")
+        } else {
+            String::new()
+        } + &if shine_maps > 0 {
+            format!("; {shine_maps} normal and specular maps")
+        } else {
+            String::new()
+        } + &if swap_count > 0 {
+            format!("; {swap_count} drawn with Black Ops II materials")
+        } else {
+            String::new()
+        } + &if water_count > 0 {
+            format!("; {water_count} water ({moving_water} moving, the rest by its colour)")
+        } else {
+            String::new()
+        }
+    ));
+    report.push(sky_line.unwrap_or_else(|| format!("{tag} sky: none ({} sky surfaces)", world.sky_start_surfs.len())));
+    if let Some(img) = world.sky_image.and_then(|i| zone.image(i)) {
+        report.push(format!(
+            "{tag} sky image: {} {:?} {}x{}x{} ({} sky surfaces)",
+            img.name, img.map_type, img.width, img.height, img.depth, world.sky_start_surfs.len()
+        ));
+    }
+    out
+}
+
+/// bo2mp: a CoD4 / World at War map's own reflection probes (64x64
+/// A8R8G8B8 cubes in the zone, `world_iw3::iw3_probe_faces`) as the
+/// fallback pass's cube array, linked as Black Ops II's are
+/// (`t6_materials::link_reflection_probes`); a probe in another form is
+/// black. The report line, or `None` when the map has none.
+fn link_own_probes(tag: &str, zone: &iw3::zone::Zone, world: &iw3::zone::GfxWorld, catalog: &mut MaterialCatalog, owner: &str) -> Option<String> {
+    use bevy::render::render_resource::{TextureViewDescriptor, TextureViewDimension};
+    const SIZE: u32 = 64;
+    const LEVELS: u32 = 7;
+    if world.reflection_probes.is_empty() {
+        return None;
+    }
+    let face: usize = (0..LEVELS).map(|l| ((SIZE >> l).max(1) as usize).pow(2) * 4).sum();
+    let mut data = Vec::with_capacity(face * 6 * world.reflection_probes.len());
+    let mut real = 0usize;
+    for (i, probe) in world.reflection_probes.iter().enumerate() {
+        // (Probe 0 is the compiler's stand-in, a flat red cube: black.)
+        if i == 0 && world.reflection_probes.len() > 1 {
+            data.resize(data.len() + face * 6, 0);
+            continue;
+        }
+        let faces = probe
+            .image
+            .and_then(|i| zone.image(i))
+            .and_then(|img| img.load_def.as_ref())
+            .filter(|d| d.format == 21 && d.dimensions[0] == SIZE as u16)
+            .and_then(|d| asset_world::world_iw3::iw3_probe_faces(SIZE, LEVELS, &d.data));
+        match faces {
+            Some(f) => {
+                data.extend_from_slice(&f);
+                real += 1;
+            }
+            None => data.resize(data.len() + face * 6, 0),
+        }
+    }
+    if real == 0 {
+        return None;
+    }
+    let mut image = Image::new_uninit(
+        Extent3d { width: SIZE, height: SIZE, depth_or_array_layers: 6 * world.reflection_probes.len() as u32 },
+        TextureDimension::D2,
+        TextureFormat::Rgba8Unorm,
+        RenderAssetUsages::RENDER_WORLD,
+    );
+    image.texture_descriptor.mip_level_count = LEVELS;
+    image.texture_view_descriptor =
+        Some(TextureViewDescriptor { dimension: Some(TextureViewDimension::CubeArray), ..Default::default() });
+    image.data = Some(data);
+    let slot = catalog.link_image(AuthoredImage {
+        namespace: AssetNamespace::T6,
+        name: AssetRef::Real(super::t6_materials::T6_PROBES_MATERIAL.to_owned()),
+        map_type: 5,
+        semantic: super::t6_materials::T6_PROBES_SEMANTIC,
+        category: 0,
+        use_srgb_reads: false,
+        width: SIZE as u16,
+        height: SIZE as u16,
+        depth: 1,
+        level_count: LEVELS as u8,
+        format: 0,
+        payload: Arc::new(Vec::new()),
+        decoded: Some(Arc::new(image)),
+        common_owned: false,
+        decoded_variant: None,
+        decoded_by: None,
+        pending_decode: None,
+    });
+    catalog.link_material(AuthoredMaterial {
+        name: AssetRef::Real(super::t6_materials::T6_PROBES_MATERIAL.to_owned()),
+        namespace: AssetNamespace::T6,
+        technique_set: AssetRef::default(),
+        technique_set_edge: AssetEdge::Absent,
+        draw_surf: 0,
+        sort_key: 0,
+        info_game_flags: 0,
+        texture_atlas: None,
+        surface_type_bits: None,
+        t5_layered_surface_types: None,
+        state_flags: 0,
+        camera_region: 0,
+        state_bits: Vec::new(),
+        state_bits_entry: None,
+        t5_state_bits_entry: None,
+        iw5_state_bits_entry: None,
+        technique_table: None,
+        route: None,
+        textures: vec![MaterialTextureBinding {
+            name_hash: 0,
+            name_start: 0,
+            name_end: 0,
+            sampler_state: 0,
+            semantic: super::t6_materials::T6_PROBES_SEMANTIC,
+            image: Some(slot),
+        }],
+        constants: Vec::new(),
+        zone: ZoneOwner::intern(owner),
+        t6_draw: None,
+    });
+    Some(format!(
+        "{tag} reflection probes: {} ({real} cube maps), one {SIZE}x{SIZE} cube array, {LEVELS} mips",
+        world.reflection_probes.len()
+    ))
+}
+
+/// bo2mp: the map's film vision. CoD4 and World at War keep every map's
+/// `vision/<map>.vision` in `common_mp` (a rawfile), not in the IWDs; the
+/// map's own zone and its IWDs are read too.
+fn legacy_film_vision(
+    map: &str,
+    zones: &[&iw3::zone::Zone],
+    main: Option<&Path>,
+    report: &mut Vec<String>,
+) -> Option<asset_world::FilmVision> {
+    let name = format!("vision/{}.vision", map.to_ascii_lowercase());
+    let found = zones
+        .iter()
+        .enumerate()
+        .find_map(|(i, z)| {
+            z.assets.iter().find_map(|a| match a {
+                iw3::zone::Asset::RawFile(r) if r.name.eq_ignore_ascii_case(&name) => Some((i, r.data.clone())),
+                _ => None,
+            })
+        })
+        .map(|(i, d)| (if i == 0 { "zone" } else { "common_mp" }, d))
+        .or_else(|| main.and_then(|m| asset_transport::read_main_iwd_file(m, &name)).map(|d| ("iwd", d)));
+    // (Without its comments: Cargoship's keeps an older look in a /* */
+    // block after its own, whose lines would win.)
+    let found = found.map(|(source, bytes)| (source, strip_gsc_comments(&String::from_utf8_lossy(&bytes)).into_bytes()));
+    match found {
+        Some((source, bytes)) => match asset_world::parse_film_vision_rawfile(&name, &bytes, false) {
+            Ok(Some(v)) => {
+                report.push(format!(
+                    "film vision: READY source={source} enable={} contrast={:.4} brightness={:.4} desaturation={:.5} light tint {:?} dark tint {:?}",
+                    v.enable, v.contrast, v.brightness, v.desaturation, v.light_tint, v.dark_tint
+                ));
+                Some(v)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                report.push(format!("film vision: {name} unreadable ({e:?})"));
+                None
+            }
+        },
+        None => {
+            report.push(format!("film vision: {name} in neither the map's zone, common_mp nor the IWDs"));
+            None
+        }
+    }
+}
+
+/// bo2mp: whether the fallback pass will have reflection probes for this
+/// map (a Black Ops II model map's, or the map's own 64x64 cubes, as
+/// `link_own_probes` takes them).
+fn legacy_probes_ready(zone: &iw3::zone::Zone, world: &iw3::zone::GfxWorld, look: Option<&super::bo2_look::Look>) -> bool {
+    if look.and_then(|l| l.capture.world.as_ref()).is_some_and(|m| !m.reflection_probes.is_empty()) {
+        return true;
+    }
+    let many = world.reflection_probes.len() > 1;
+    world.reflection_probes.iter().enumerate().any(|(i, p)| {
+        !(i == 0 && many)
+            && p.image
+                .and_then(|i| zone.image(i))
+                .and_then(|img| img.load_def.as_ref())
+                .is_some_and(|d| d.format == 21 && d.dimensions[0] == 64)
+    })
+}
+
+/// bo2mp: a CoD4 / World at War water material's table for the fallback
+/// pass's IW3 water (`fragment_lightmapped`), one RGBA16F texel each, laid
+/// out as Black Ops II's water table (`t6_materials::water_table`): 0..3
+/// the four ripple layers (world xy scale, scroll per second), 4 the
+/// ripple map's scale and bias, 5 the layers' weights, 6 the sun glint's
+/// power, the fresnel's exponent, least share and range (`envMapParms`
+/// x, y, z: the reflection's share runs from x to y by (1 - N.V)^z), 7 the
+/// glint's strength (`envMapParms` w), 8 and 9 the water's colour (its
+/// `waterColor`, gamma values) and opacity. The games' own water is a wave
+/// simulation drawn each frame (`watersetup0`); this stands in for it with
+/// scrolling ripples, its colour and its reflection.
+fn legacy_water_table(technique_set: &str, material: &iw3::zone::Material) -> Option<Vec<[f32; 4]>> {
+    legacy_water_colour(technique_set, material)?;
+    let constant = |name: &str| material.constants.iter().find(|c| c.name == name).map(|c| c.literal);
+    let colour = constant("waterColor").unwrap_or([0.26, 0.28, 0.22, 0.6]);
+    let env = constant("envMapParms").unwrap_or([0.2, 0.6, 4.0, 1.0]);
+    let opacity = if colour[3] > 0.0 { colour[3].max(0.35) } else { 1.0 };
+    let (least, most) = (env[0].clamp(0.0, 1.0), env[1].clamp(0.0, 1.0).max(env[0].clamp(0.0, 1.0)));
+    let body = [colour[0], colour[1], colour[2], opacity];
+    Some(vec![
+        [1.0 / 310.0, 1.0 / 310.0, 0.011, 0.006],
+        [1.0 / 173.0, 1.0 / 173.0, -0.008, 0.010],
+        [1.0 / 97.0, 1.0 / 97.0, 0.019, -0.012],
+        [1.0 / 59.0, 1.0 / 59.0, -0.015, -0.020],
+        [2.0, -1.0, 2.0, -1.0],
+        [0.32, 0.28, 0.22, 0.18],
+        [192.0, env[2].clamp(1.0, 8.0), least, most - least],
+        [env[3].clamp(0.0, 4.0) * 0.4, 0.0, 0.0, 0.0],
+        body,
+        body,
+    ])
+}
+
+/// bo2mp: a tiling 256x256 ripple normal map (a sum of waves whole in the
+/// tile), Black Ops II's layout (x red, y green, 0.5 flat), for the IW3
+/// water. Made once.
+fn ripple_normal_map() -> (u32, u32, Vec<u8>) {
+    use std::sync::OnceLock;
+    static MAP: OnceLock<(u32, u32, Vec<u8>)> = OnceLock::new();
+    MAP.get_or_init(|| {
+        const N: usize = 256;
+        // (cycles across the tile in x and y, amplitude, phase)
+        const WAVES: [(f32, f32, f32, f32); 8] = [
+            (3.0, 1.0, 1.0, 0.3),
+            (-2.0, 4.0, 0.8, 1.1),
+            (5.0, -3.0, 0.5, 2.0),
+            (1.0, 7.0, 0.4, 0.7),
+            (-8.0, 2.0, 0.3, 2.9),
+            (9.0, 6.0, 0.2, 1.7),
+            (-4.0, -11.0, 0.15, 0.4),
+            (13.0, -5.0, 0.12, 2.2),
+        ];
+        let tau = std::f32::consts::TAU;
+        let mut grads = vec![(0.0f32, 0.0f32); N * N];
+        let mut largest = 1e-6f32;
+        for y in 0..N {
+            for x in 0..N {
+                let (mut gx, mut gy) = (0.0, 0.0);
+                for (kx, ky, a, ph) in WAVES {
+                    let c = (tau * (kx * x as f32 + ky * y as f32) / N as f32 + ph).cos();
+                    gx += a * kx * c;
+                    gy += a * ky * c;
+                }
+                largest = largest.max((gx * gx + gy * gy).sqrt());
+                grads[y * N + x] = (gx, gy);
+            }
+        }
+        // The steepest slope 0.6.
+        let scale = 0.6 / largest;
+        let mut rgba = Vec::with_capacity(N * N * 4);
+        for (gx, gy) in grads {
+            let n = [-gx * scale, -gy * scale, 1.0];
+            let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+            for v in n {
+                rgba.push(((v / len * 0.5 + 0.5) * 255.0).round().clamp(0.0, 255.0) as u8);
+            }
+            rgba.push(255);
+        }
+        (N as u32, N as u32, rgba)
+    })
+    .clone()
+}
+
+/// bo2mp: a CoD4 / World at War water material's (`wc_water`, not the
+/// dynamic ocean, whose colour map is its real foam) colour as one sRGB
+/// texel: its `waterColor` constant (gamma values; alpha its opacity, 0
+/// read as opaque), else a muddy grey-green. The game's shader reflects the
+/// sky over it by at least `envMapParms.x` (its fresnel's least share), which
+/// this draw has no reflection for: the colour keeps the rest (Cargoship's
+/// night sea, 0.5 reflected, drew as a bright lavender sheet).
+fn legacy_water_colour(technique_set: &str, material: &iw3::zone::Material) -> Option<[u8; 4]> {
+    let tokens: Vec<&str> = technique_set.trim_start_matches(',').split('_').collect();
+    if !tokens.contains(&"water") || tokens.contains(&"dynamic") {
+        return None;
+    }
+    let constant = |name: &str| material.constants.iter().find(|c| c.name == name).map(|c| c.literal);
+    let colour = constant("waterColor").unwrap_or([0.26, 0.28, 0.22, 0.6]);
+    let kept = 1.0 - constant("envMapParms").map_or(0.0, |p| p[0]).clamp(0.0, 0.8);
+    let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let alpha = if colour[3] > 0.0 { colour[3].max(0.35) } else { 1.0 };
+    Some([byte(colour[0] * kept), byte(colour[1] * kept), byte(colour[2] * kept), byte(alpha)])
+}
+
+#[cfg(test)]
+mod moving_water_tests {
+    #[test]
+    fn the_ripple_map_tiles_and_is_unit_length() {
+        let (w, h, px) = super::ripple_normal_map();
+        assert_eq!((w, h, px.len()), (256, 256, 256 * 256 * 4));
+        let at = |x: usize, y: usize| -> [f32; 3] {
+            let p = &px[(y * 256 + x) * 4..][..3];
+            [0, 1, 2].map(|c| f32::from(p[c]) / 255.0 * 2.0 - 1.0)
+        };
+        for (x, y) in [(0, 0), (17, 200), (255, 255), (128, 3)] {
+            let n = at(x, y);
+            let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+            assert!((len - 1.0).abs() < 0.02, "{len}");
+            assert!(n[2] > 0.8);
+        }
+        // Whole waves: the last column leads into the first.
+        let (a, b) = (at(255, 40), at(0, 40));
+        assert!((a[0] - b[0]).abs() < 0.08 && (a[1] - b[1]).abs() < 0.08);
+    }
+}
+
+#[cfg(test)]
+mod water_tests {
+    fn water(technique_set: &str, constants: &[(&str, [f32; 4])]) -> Option<[u8; 4]> {
+        let material = iw3::zone::Material {
+            name: "wc/water".into(),
+            game_flags: 0,
+            sort_key: 4,
+            surface_type_bits: 0,
+            state_bits_entry: [0xff; 34],
+            state_flags: 0,
+            camera_region: 0,
+            technique_set: None,
+            textures: Vec::new(),
+            constants: constants
+                .iter()
+                .map(|(n, v)| iw3::zone::MaterialConstant { name_hash: 0, name: (*n).into(), literal: *v })
+                .collect(),
+            state_bits: Vec::new(),
+        };
+        super::legacy_water_colour(technique_set, &material)
+    }
+
+    #[test]
+    fn water_takes_its_colour_less_its_reflection() {
+        // Cargoship's night sea: half of it is the sky's reflection.
+        let sea = water("wc_water", &[("waterColor", [0.4, 0.4, 0.5, 1.0]), ("envMapParms", [0.5, 0.9, 1.0, 2.5])]);
+        assert_eq!(sea, Some([51, 51, 64, 255]));
+        // A muddy puddle (no reflection at its least), half see-through.
+        let mud = water("wc_water", &[("waterColor", [0.4, 0.35, 0.3, 0.5]), ("envMapParms", [0.0, 0.45, 4.0, 2.5])]);
+        assert_eq!(mud, Some([102, 89, 77, 128]));
+        // The dynamic ocean keeps its own foam picture; lit surfaces are not water.
+        assert_eq!(water("wc_water_dynamic", &[]), None);
+        assert_eq!(water("wc_l_sm_r0c0n0s0", &[]), None);
+    }
+}
+
+/// The spawn points in the map's entities (`mp_*_spawn*`), and the first
+/// one's place for the start-up scripts.
+fn spawns_of(entities: &[iw3::ents::Entity]) -> Vec<asset_world::SpawnPoint> {
+    entities
+        .iter()
+        .filter(|e| {
+            let c = e.classname();
+            c.starts_with("mp_") && c.contains("spawn") || c == "info_player_start"
+        })
+        .filter_map(|e| {
+            Some(asset_world::SpawnPoint {
+                classname: e.classname().to_owned(),
+                origin: e.origin()?,
+                angles: e.angles(),
+                script_linkto: e.get("script_linkto").unwrap_or_default().to_owned(),
+                script_destructable_area: e.get("script_destructable_area").unwrap_or_default().to_owned(),
+            })
+        })
+        .collect()
+}
+
+/// Which legacy game a map comes from, for the report and the gaps.
+pub(crate) struct Legacy {
+    /// Asset and report prefix: `iw3`, `t4`.
+    pub tag: &'static str,
+    /// For messages: `CoD4`, `World at War`.
+    pub title: &'static str,
+    /// The loading screen's stage for the material links.
+    pub stage_materials: &'static str,
+    pub addr_no_world: &'static str,
+    pub addr_world_mesh: &'static str,
+}
+
+pub(crate) const COD4: Legacy = Legacy {
+    tag: "iw3",
+    title: "CoD4",
+    stage_materials: "cod4 materials",
+    addr_no_world: "assets::lane::iw3::load_world/no_world",
+    addr_world_mesh: "assets::lane::iw3::load_world/world_mesh",
+};
+
+/// Loads a Call of Duty 4 map zone into the match's world.
+pub(crate) fn load_iw3_world(
+    path: &Path,
+    progress: &LoadProgress,
+    material_seed: MaterialCatalog,
+) -> LoadedWorld {
+    let report = vec![format!("game: IW3 / Call of Duty 4 ({})", path.display())];
+    let stage = progress.begin_scoped(StageId::MapAssets, "cod4 zone", None);
+    let parsed = iw3::fastfile::load(path).and_then(|bytes| {
+        iw3::zone::Zone::parse(&bytes, iw3::zone::ParseOptions::default())
+    });
+    let zone = match parsed {
+        Ok(zone) => {
+            stage.done();
+            zone
+        }
+        Err(error) => {
+            stage.fail();
+            return LoadedWorld::with_gap(
+                WorldDrawPolicy::t5(),
+                PreparedCapability::PreparedWorld,
+                format!("CoD4 zone: {error:#}"),
+                Some("assets::lane::iw3::load_world/zone"),
+            );
+        }
+    };
+    let loaded = build_legacy_world(&COD4, path, &zone, report, progress, material_seed);
+    diag::info!(
+        World,
+        "bo2mp iw3: {} loaded: {}",
+        path.display(),
+        loaded.report.iter().filter(|l| l.starts_with("iw3 ") || l.starts_with("world mesh")).cloned().collect::<Vec<_>>().join("; ")
+    );
+    loaded
+}
+
+/// bo2mp: a CoD4 / World at War map's createart fog: distance fog
+/// (CoD4's `setExpFog`) or height fog (WaW's `setVolFog`, base height and
+/// half height as Black Ops II's own fog).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct LegacyFog {
+    pub(super) start: f32,
+    pub(super) half: f32,
+    pub(super) opacity: f32,
+    pub(super) colour: [f32; 3],
+    pub(super) sun: Option<asset_world::SunFog>,
+    pub(super) base_height: f32,
+    pub(super) half_height: f32,
+}
+
+/// bo2mp: a script without its `//` and `/* */` comments.
+fn strip_gsc_comments(script: &str) -> String {
+    let mut out = String::with_capacity(script.len());
+    let mut rest = script;
+    while !rest.is_empty() {
+        match (rest.find("//"), rest.find("/*")) {
+            (Some(line), block) if block.is_none_or(|b| line < b) => {
+                out.push_str(&rest[..line]);
+                rest = rest[line..].find('\n').map_or("", |n| &rest[line + n..]);
+            }
+            (_, Some(block)) => {
+                out.push_str(&rest[..block]);
+                rest = rest[block + 2..].find("*/").map_or("", |e| &rest[block + 2 + e + 2..]);
+            }
+            _ => {
+                out.push_str(rest);
+                rest = "";
+            }
+        }
+    }
+    out
+}
+
+/// The fog a createart script sets: `setVolFog(start, halfway,
+/// halfwayHeight, baseHeight, r, g, b, transition)` (WaW), else
+/// `setExpFog(...)` (CoD4: no height, so a base far above every map and a
+/// vast half height).
+fn legacy_fog(script: &str) -> Option<LegacyFog> {
+    // bo2mp: commented-out calls do not count: Shipment's and Cargoship's
+    // createart keep `//setExpFog(...)` with no fog of their own (they
+    // drew grey fog 300 units out).
+    let script = &strip_gsc_comments(script);
+    let lower = script.to_ascii_lowercase();
+    // (The usage comment after the call names it too: the first call with
+    // numbers wins.)
+    let mut from = 0;
+    while let Some(at) = lower[from..].find("setvolfog(").map(|i| from + i) {
+        from = at + 10;
+        let close = lower[from..].find(')').map(|i| from + i)?;
+        let args: Vec<f32> = script[from..close].split(',').filter_map(|a| a.trim().parse::<f32>().ok()).collect();
+        if args.len() >= 7 && args[1] > 0.0 {
+            return Some(LegacyFog {
+                start: args[0].max(0.0),
+                half: args[1],
+                opacity: 1.0,
+                colour: [args[4], args[5], args[6]].map(|c| c.clamp(0.0, 1.0)),
+                sun: None,
+                base_height: args[3],
+                half_height: args[2].max(1.0),
+            });
+        }
+    }
+    let f = asset_world::parse_set_exp_fog(script)?;
+    Some(LegacyFog {
+        start: f.start_dist,
+        half: f.halfway_dist,
+        opacity: f.max_opacity,
+        colour: f.color_rgb,
+        sun: f.sun,
+        base_height: 1.0e7,
+        half_height: 1.0e9,
+    })
+}
+
+/// bo2mp: the fallback pass's light table for a CoD4 / World at War world:
+/// no lights of its own (slots 0..29 empty), and its createart fog
+/// (`setExpFog` in `maps/createart/<map>_art.gsc`) in the fog slots (31:
+/// start, half distance, opacity, on; colour, base height; sun fog colour
+/// and opacity; its direction and half height; 30: the sun fog blend), as
+/// `lane::t6` lays them out. The IW fog is distance fog only: a base far
+/// above every map and a vast half height flatten the shader's height term
+/// to 1, leaving 1 - 2^-((d - start) / half). Its colours are gamma values,
+/// squared for the linear fallback pass.
+pub(super) fn legacy_fog_table(fog: &LegacyFog) -> Vec<[f32; 16]> {
+    let lin = |c: [f32; 3]| c.map(|x| x * x);
+    let colour = lin(fog.colour);
+    let (sun_colour, sun_dir, blend) = match fog.sun {
+        Some(sun) => {
+            let n = (sun.sun_dir.iter().map(|x| x * x).sum::<f32>()).sqrt().max(1e-6);
+            let (ci, co) = (sun.begin_angle_deg.to_radians().cos(), sun.end_angle_deg.to_radians().cos());
+            let scale = if (ci - co).abs() > 1e-4 { 1.0 / (ci - co) } else { 0.0 };
+            (lin(sun.color_rgb), sun.sun_dir.map(|x| x / n), [-co * scale, scale])
+        }
+        None => (colour, [0.0, 0.0, 1.0], [0.0, 0.0]),
+    };
+    // bo2mp: the fog rows follow the table's 256 lights (`t6::FOG_SLOT`);
+    // in rows 30 and 31, where they sat before the table grew, the pass
+    // never read them (no fog on any CoD4 / World at War map) and row 31
+    // drew as a stray sun.
+    let (sun_slot, fog_slot) = (super::t6::SUN_FOG_SLOT, super::t6::FOG_SLOT);
+    let mut table = vec![[0.0f32; 16]; fog_slot + 1];
+    table[fog_slot] = [
+        fog.start,
+        fog.half,
+        fog.opacity,
+        1.0,
+        colour[0],
+        colour[1],
+        colour[2],
+        fog.base_height,
+        sun_colour[0],
+        sun_colour[1],
+        sun_colour[2],
+        fog.opacity,
+        sun_dir[0],
+        sun_dir[1],
+        sun_dir[2],
+        fog.half_height,
+    ];
+    table[sun_slot][0] = blend[0];
+    table[sun_slot][1] = blend[1];
+    table
+}
+
+/// A legacy (CoD4-format) map zone, already read, into the match's world:
+/// entities and spawns, collision, materials and the world draw.
+pub(crate) fn build_legacy_world(
+    game: &Legacy,
+    path: &Path,
+    zone: &iw3::zone::Zone,
+    mut report: Vec<String>,
+    progress: &LoadProgress,
+    material_seed: MaterialCatalog,
+) -> LoadedWorld {
+    let tag = game.tag;
+    let title = game.title;
+    super::bo2_look::set_pending_grade(None);
+    // bo2mp: the map's createfx as Black Ops II effects (burning maps).
+    {
+        let map = path.file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned());
+        let text = |name: &str| {
+            zone.assets.iter().find_map(|a| match a {
+                iw3::zone::Asset::RawFile(r) if r.name.eq_ignore_ascii_case(name) => Some(String::from_utf8_lossy(&r.data).into_owned()),
+                _ => None,
+            })
+        };
+        super::bo2_look::set_pending_fx(super::bo2_look::map_fx(&map, text, &mut report));
+    }
+    report.push(format!(
+        "{tag} zone: {} of {} assets{}",
+        zone.stats.top_level_parsed,
+        zone.stats.top_level_total,
+        zone.stats.stopped_at.as_ref().map_or_else(String::new, |s| format!(", stopped at {s}"))
+    ));
+    let map = path.file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned());
+
+    // Entities and spawns.
+    let entity_string = zone.map_ents().map(|m| m.entity_string.clone()).unwrap_or_default();
+    let entities = iw3::ents::parse(&entity_string);
+    let spawns = spawns_of(&entities);
+    report.push(format!("{tag} entities: {}, spawn points {}", entities.len(), spawns.len()));
+    let mut scripts = crate::ScriptSources::default();
+    scripts.set_entities(entity_string);
+
+    // Collision.
+    let collision = match zone.clip_map().map(asset_world::world_iw3::build_iw3_clip_collision) {
+        Some(Ok(clip)) => {
+            let origins: Vec<[f32; 3]> = spawns.iter().map(|s| s.origin).collect();
+            let census = asset_world::world_iw3::spawn_ground_census(&clip, &origins);
+            report.push(format!(
+                "{tag} clip: {} brushes ({} the world's, in {} tree leaves), {} mesh tris in {} trees, {} models; {census}",
+                clip.brushes.len(),
+                clip.cmodels.first().map_or(0, |m| m.num_brushes),
+                clip.leaves.len(),
+                clip.mesh.tri_indices.len() / 3,
+                clip.mesh.aabb_roots.len(),
+                clip.cmodels.len()
+            ));
+            if census.spawns > 0 && census.on_ground * 2 < census.spawns {
+                diag::warn!(
+                    World,
+                    "bo2mp {tag}: {map}: most spawn points have no floor of their own in the collision ({census})"
+                );
+            }
+            Some(clip)
+        }
+        Some(Err(error)) => {
+            report.push(format!("{tag} clip gap: {error}"));
+            None
+        }
+        None => {
+            report.push(format!("{tag} clip gap: zone has no clipMap"));
+            None
+        }
+    };
+
+    let Some(world) = zone.gfx_world() else {
+        let reason = match &zone.stats.stopped_at {
+            Some(stop) => format!("{title} zone has no GfxWorld (reading stopped at {stop})"),
+            None => format!("{title} zone has no GfxWorld"),
+        };
+        let mut loaded = LoadedWorld::with_gap(
+            WorldDrawPolicy::t5(),
+            PreparedCapability::PreparedWorld,
+            reason,
+            Some(game.addr_no_world),
+        );
+        loaded.scripts = scripts;
+        loaded.collision = collision;
+        loaded.spawns = spawns;
+        loaded.report.extend(report);
+        return loaded;
+    };
+
+    // Materials and their colour maps, from the game's own IWDs.
+    let stage = progress.begin_scoped(StageId::MapAssets, game.stage_materials, None);
+    let main = asset_transport::game_root_for_zone(path).ok().map(|root| root.join("main"));
+    let mut materials = material_seed;
+    materials.set_capture_ns(AssetNamespace::T6);
+    // bo2mp: a World at War map in a Black Ops II map's look (`bo2_look`).
+    let look = (tag == "t4")
+        .then(|| super::bo2_look::recipe(&map))
+        .flatten()
+        .and_then(|recipe| {
+            // The colour images the world's surfaces are drawn with.
+            let mut images: Vec<String> = world
+                .surfaces
+                .iter()
+                .filter_map(|s| s.material.and_then(|m| zone.material(m)))
+                .filter_map(|m| {
+                    m.textures
+                        .iter()
+                        .find(|t| t.semantic == iw3::zone::TextureSemantic::Color && t.image.is_some())
+                        .and_then(|t| t.image.and_then(|i| zone.image(i)))
+                        .map(|i| i.name.clone())
+                })
+                .collect();
+            images.sort();
+            images.dedup();
+            super::bo2_look::load(recipe, &images, &mut report)
+        });
+    // bo2mp: the game's common_mp (shared with the guest guns' read), for
+    // what the map only names.
+    let legacy = if tag == "t4" { super::legacy_guns::Legacy::T4 } else { super::legacy_guns::Legacy::Iw3 };
+    let common = super::legacy_guns::legacy_common_zone(legacy);
+    // (And localized_common_mp beside the map: its region's shared models
+    // and materials, World at War's flags among them.)
+    let localized = path.parent().map(|d| d.join("localized_common_mp.ff")).filter(|p| p.is_file()).and_then(|p| {
+        let r = if tag == "t4" {
+            t4::load_map(&p).map(|m| m.zone).map_err(|e| e.to_string())
+        } else {
+            iw3::fastfile::load(&p)
+                .map_err(|e| e.to_string())
+                .and_then(|d| iw3::zone::Zone::parse(&d, iw3::zone::ParseOptions::default()).map_err(|e| e.to_string()))
+        };
+        r.map_err(|e| report.push(format!("{tag} localized_common_mp: {e}"))).ok()
+    });
+    // bo2mp: and the code zones (`code_post_gfx_mp`,
+    // `localized_code_post_gfx_mp`): what common_mp only names lives there
+    // (CoD4's `mc/lambert1`, World at War's destructibles' `mtl_fx_dest_atlas`:
+    // Roundhouse's and Downfall's wrecks were left undrawn without it).
+    let code_zones: Vec<iw3::zone::Zone> = ["code_post_gfx_mp.ff", "localized_code_post_gfx_mp.ff"]
+        .iter()
+        .filter_map(|name| path.parent().map(|d| d.join(name)).filter(|p| p.is_file()))
+        .filter_map(|p| {
+            let r = if tag == "t4" {
+                std::panic::catch_unwind(|| t4::load_map(&p))
+                    .map_err(|_| "reader panicked".to_owned())
+                    .and_then(|r| r.map(|m| m.zone).map_err(|e| e.to_string()))
+            } else {
+                iw3::fastfile::load(&p)
+                    .map_err(|e| e.to_string())
+                    .and_then(|d| iw3::zone::Zone::parse(&d, iw3::zone::ParseOptions::default()).map_err(|e| e.to_string()))
+            };
+            r.map_err(|e| report.push(format!("{tag} {}: {e}", p.display()))).ok()
+        })
+        .collect();
+    let mut commons: Vec<&iw3::zone::Zone> = Vec::new();
+    commons.extend(localized.as_ref());
+    commons.extend(common.as_deref().map(|c| &**c));
+    commons.extend(code_zones.iter());
+    report.push(format!(
+        "{tag} shared zones: localized_common_mp {}, common_mp {}, {} code zones",
+        if localized.is_some() { "read" } else { "not found" },
+        if common.is_some() { "read" } else { "not found" },
+        code_zones.len()
+    ));
+    let surface_materials = link_world_materials(
+        tag,
+        zone,
+        world,
+        main.as_deref(),
+        &mut materials,
+        &map,
+        &mut report,
+        look.as_ref(),
+        &commons,
+    );
+    // bo2mp: the placed models (statues, debris, furniture, flags).
+    let props = super::legacy_guns::legacy_static_models(
+        tag,
+        if tag == "t4" { AssetNamespace::T4 } else { AssetNamespace::Iw3 },
+        path,
+        zone,
+        &commons,
+        world,
+        std::mem::take(&mut materials),
+    );
+    materials = props.catalog;
+    report.push(props.report);
+    let (prop_meshes, prop_placements) = (props.meshes, props.placements);
+    stage.done();
+
+    // The map's film vision: its colour grade, drawn under Black Ops II's
+    // rules as the colour table.
+    // bo2mp: not on a map in a Black Ops II look: its model map's colour
+    // table is the grade there, and both together lifted Dome and Makin
+    // into a milky veil.
+    let film_vision = if look.is_some() {
+        report.push("film vision: the Black Ops II look's colour table grades this map instead".to_owned());
+        None
+    } else {
+        let mut zones: Vec<&iw3::zone::Zone> = vec![zone];
+        zones.extend(commons.iter().copied());
+        legacy_film_vision(&map, &zones, main.as_deref(), &mut report)
+    };
+
+    // The sun (the fallback pass's IW3 branch adds it by its baked
+    // visibility, as CoD4's lit shaders do).
+    let sun = &world.sun;
+    let (pitch, yaw) = (sun.angles[0].to_radians(), sun.angles[1].to_radians());
+    // Toward the sun: the sun's angles as a forward vector (pitch down).
+    let parse_dir = [pitch.cos() * yaw.cos(), pitch.cos() * yaw.sin(), -pitch.sin()];
+    // bo2mp: the sun the games light with is the compiled one, the world's
+    // sun primary light (its `ComWorld` entry: the grid's sun index, kind 1;
+    // the same direction as sunParse, its colour a little under
+    // sunColor * sunLight: Cargoship 0.64 0.74 1.21 against 0.65 0.78 1.3,
+    // Dome 1.15 1.21 1.21 against 1.39 1.4 1.33). sunParse where the zone
+    // has none.
+    let sun_index = world.light_grid.sun_primary_light_index.max(1) as usize;
+    let compiled = zone
+        .com_world()
+        .and_then(|c| c.primary_lights.get(sun_index).or_else(|| c.primary_lights.iter().find(|l| l.kind == 1)))
+        .filter(|l| l.kind == 1 && l.dir.iter().any(|v| *v != 0.0));
+    let (dir, colour) = match compiled {
+        Some(l) => {
+            report.push(format!("{tag} sun: primary light {sun_index}, colour {:?}, toward {:?}", l.color, l.dir));
+            (l.dir, [l.color[0], l.color[1], l.color[2], 1.0])
+        }
+        None => {
+            report.push(format!("{tag} sun: sunParse (no sun primary light), colour {:?} x {}", sun.sun_color, sun.sun_light));
+            (
+                parse_dir,
+                [sun.sun_color[0] * sun.sun_light, sun.sun_color[1] * sun.sun_light, sun.sun_color[2] * sun.sun_light, 1.0],
+            )
+        }
+    };
+    // bo2mp: in a Black Ops II map's look the sun stays this map's own (its
+    // colour is the original's mood: Dome's smoky haze, Asylum's grey rain);
+    // the model map gives the grade, fog and reflections.
+    if look.is_some() {
+        report.push("bo2 look: the sun is the map's own".to_owned());
+    }
+    // bo2mp: a Black Ops II model's sky cube is HDR for the model map's
+    // exposure and its sky material's brightness (`skyColorParm`); this map
+    // draws at exposure 1, so its row takes both (at 1 Makin's, Airfield's
+    // and Castle's borrowed skies burned white).
+    let sky_brightness = look
+        .as_ref()
+        .filter(|l| l.sky.is_some())
+        .and_then(|l| {
+            let model = l.capture.world.as_ref()?;
+            let exposure = model.exposure_volumes.first().map_or(model.init_sun_exposure, |v| v[0]);
+            Some(l.sky_parm[0] * (-exposure).exp2())
+        })
+        .filter(|b| b.is_finite() && *b > 0.0)
+        .unwrap_or(1.0);
+    if look.as_ref().is_some_and(|l| l.sky.is_some()) {
+        report.push(format!("bo2 look: sky brightness {sky_brightness:.4} (the model's skyColorParm and exposure)"));
+    }
+    let lighting = asset_world::T6WorldLighting {
+        sun: asset_world::WorldSunLight { direction: dir, diffuse: colour, specular: colour },
+        exposure_scale: 1.0,
+        // The sky cube as the game looks it up (world x, y, z: no turn).
+        sky: [0.0, 1.0, 0.0, sky_brightness],
+        // (Both sky cubes, the map's own and a BO2 model's, are `rgb / a`;
+        // the grade is the BO2 look's, installed on its own.)
+        sky_parms: [1.0, 0.0],
+        saturation: None,
+        grade: None,
+    };
+    // The baked light: each lightmap page pair from the zone (the images
+    // carry their pixels), packed for the fallback pass's IW3 branch.
+    let mut lightmap_gaps = Vec::new();
+    let lightmaps: Vec<Option<asset_world::WorldLightmap>> = world
+        .lightmaps
+        .iter()
+        .enumerate()
+        .map(|(i, pair)| {
+            let raw = |id: Option<iw3::zone::AssetId>| {
+                let image = id.and_then(|id| zone.image(id))?;
+                let def = image.load_def.as_ref()?;
+                Some((def.dimensions[0], def.dimensions[1], def.format, def.data.as_slice(), image.name.as_str()))
+            };
+            let (Some(p), Some(sec)) = (raw(pair.primary), raw(pair.secondary)) else {
+                lightmap_gaps.push(format!("page {i}: images not in the zone"));
+                return None;
+            };
+            match asset_world::world_iw3::iw3_lightmap((p.0, p.1, p.2, p.3), (sec.0, sec.1, sec.2, sec.3), (p.4, sec.4)) {
+                Ok(page) => Some(page),
+                Err(e) => {
+                    lightmap_gaps.push(format!("page {i}: {e}"));
+                    None
+                }
+            }
+        })
+        .collect();
+    report.push(format!(
+        "{tag} lightmaps: {}/{} pages decoded{}",
+        lightmaps.iter().filter(|p| p.is_some()).count(),
+        lightmaps.len(),
+        if lightmap_gaps.is_empty() { String::new() } else { format!(" ({})", lightmap_gaps.join("; ")) }
+    ));
+    // The sky's surfaces (a sky technique: `wc_sky`): the sky pass draws
+    // behind them, the world does not draw them.
+    let sky_surfaces: Vec<bool> = world
+        .surfaces
+        .iter()
+        .map(|s| {
+            s.material
+                .and_then(|m| zone.material(m))
+                .and_then(|m| m.technique_set)
+                .and_then(|t| zone.technique_set(t))
+                .is_some_and(|t| t.name.trim_start_matches(',').split('_').any(|w| w.starts_with("sky")))
+        })
+        .collect();
+    report.push(format!("{tag} sky surfaces: {} (not drawn in the world)", sky_surfaces.iter().filter(|&&s| s).count()));
+    match asset_world::world_iw3::build_iw3_world_draw(world, &surface_materials, &sky_surfaces, lightmaps, Some(lighting)) {
+        Ok(mut draw) => {
+            // The createart fog (the zone's `maps/createart/<map>_art.gsc`).
+            // (CoD4: maps/createart/<map>_art.gsc; WaW: maps/mp/createart/.)
+            let lower = map.to_ascii_lowercase();
+            let art = [format!("maps/createart/{lower}_art.gsc"), format!("maps/mp/createart/{lower}_art.gsc")];
+            let fog = zone.assets.iter().find_map(|a| match a {
+                iw3::zone::Asset::RawFile(r) if art.iter().any(|n| r.name.eq_ignore_ascii_case(n)) => {
+                    legacy_fog(&String::from_utf8_lossy(&r.data))
+                }
+                _ => None,
+            });
+            let art = &art[0];
+            match &fog {
+                Some(f) => {
+                    report.push(format!(
+                        "{tag} fog: READY start={:.1} half={:.1} opacity={:.3} base={:.0} half height={:.0} sun={}",
+                        f.start, f.half, f.opacity, f.base_height, f.half_height, f.sun.is_some()
+                    ));
+                    draw.t6_lights = legacy_fog_table(f);
+                }
+                None => report.push(format!("{tag} fog: none ({art} sets none)")),
+            }
+            // bo2mp: the model map's fog, probes and grade (`bo2_look`).
+            if let Some(look) = &look
+                && let Some(model) = look.capture.world.as_ref()
+            {
+                // bo2mp: the map's own createart fog when it sets one (the
+                // model map's, Nuketown Zombies' on Dome, washed the whole
+                // map white once fog drew); the model's only where it has
+                // none.
+                if fog.is_some() {
+                    report.push("bo2 look: fog is the map's own".to_owned());
+                } else if let Some(mut rows) = super::t6::world_fog_rows(model) {
+                    // Its fog colours are HDR for the model map's exposure
+                    // (2^-exposure, a quarter to an eighth); this map draws
+                    // at exposure 1, so they take that scale here (at 1 the
+                    // far city and the dome's glass burned white).
+                    let exposure = model.exposure_volumes.first().map_or(model.init_sun_exposure, |v| v[0]);
+                    let scale = (-exposure).exp2();
+                    for k in (4..7).chain(8..11) {
+                        rows[1][k] *= scale;
+                    }
+                    let (sun_slot, fog_slot) = (super::t6::SUN_FOG_SLOT, super::t6::FOG_SLOT);
+                    draw.t6_lights.resize(draw.t6_lights.len().max(fog_slot + 1), [0.0; 16]);
+                    draw.t6_lights[sun_slot] = rows[0];
+                    draw.t6_lights[fog_slot] = rows[1];
+                    report.push("bo2 look: fog from the model map".to_owned());
+                }
+                if let Some(line) =
+                    super::t6_materials::link_reflection_probes(&mut materials, &look.capture, model, look.model, &[])
+                {
+                    draw.t6_probes = model.reflection_probes.iter().map(|p| p.lighting_sh).collect();
+                    // Every surface reflects the model map's brightest real
+                    // probe (this map has none of its own in that form).
+                    let best = model
+                        .reflection_probes
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, p)| {
+                            p.image
+                                .and_then(|k| look.capture.images.get(k.index))
+                                .is_some_and(|img| img.embedded.as_ref().is_some_and(|e| matches!(e.dxgi_format, 77 | 78)))
+                        })
+                        .max_by(|a, b| {
+                            let l = |p: &asset_t6::ReflectionProbeRef| p.lighting_sh[0][0] + p.lighting_sh[0][1] + p.lighting_sh[0][2];
+                            l(a.1).total_cmp(&l(b.1))
+                        })
+                        .map_or(0, |(i, _)| i as u8);
+                    draw.surface_reflection_probes.iter_mut().for_each(|p| *p = best);
+                    report.push(format!("bo2 look: {line}; surfaces reflect probe {best}"));
+                }
+                let (grade, line) = super::t6::t6_grade(&look.capture, model, Some(&look.packs), look.model);
+                report.push(format!("bo2 look: {line}"));
+                super::bo2_look::set_pending_grade(grade);
+            }
+            // bo2mp: the map's own reflection probes, for its specular maps
+            // (a Black Ops II look brings its model map's instead).
+            if draw.t6_probes.is_empty()
+                && let Some(line) = link_own_probes(tag, zone, world, &mut materials, &map)
+            {
+                report.push(line);
+            }
+            // bo2mp: the light grid, for what moves (players, bots, the gun
+            // in his hands, dropped guns, grenades, effects):
+            // `t6::foreign_t6_lighting` hands it to the renderer's sampler.
+            let light_grid = asset_world::world_iw3::iw3_owned_light_grid(&world.light_grid);
+            report.push(match &light_grid {
+                Some(g) => format!(
+                    "{tag} light grid: READY {} entries, {} colour sets, sun primary {}",
+                    g.entries.len() / 4,
+                    g.color_count,
+                    g.sun_primary_light_index
+                ),
+                None => format!("{tag} light grid: none"),
+            });
+            report.push(format!(
+                "world mesh: {} vertices, {} triangles, {} surfaces ({title}, fallback draw with colour maps{})",
+                draw.stats.vertices, draw.stats.triangles, draw.stats.surfaces,
+                if draw.iw3_lightmaps { " and its lightmaps" } else { "" }
+            ));
+            // bo2mp: what the world's culling has to work with.
+            report.push(match &world.dpvs {
+                Some(d) if draw.dpvs.cell_count > 1 => format!(
+                    "visibility: cells={} portals={} aabbNodes={} sorted={} ({title}'s own cells and portals)",
+                    draw.dpvs.cell_count,
+                    draw.dpvs.portals_per_cell.iter().map(Vec::len).sum::<usize>(),
+                    draw.dpvs.aabb_trees.iter().map(Vec::len).sum::<usize>(),
+                    d.sorted_surf_index.len(),
+                ),
+                Some(_) => "visibility: one cell (the zone's cells did not convert; every surface is frustum-tested)".to_owned(),
+                None => "visibility: one cell (the zone carries no whole cell data; every surface is frustum-tested)".to_owned(),
+            });
+            let (min, max) = (draw.stats.min, draw.stats.max);
+            LoadedWorld {
+                scripts,
+                world: PreparedWorld {
+                    draw: Some(draw),
+                    min,
+                    max,
+                    film_vision,
+                    light_grid,
+                    policy: WorldDrawPolicy::t5(),
+                    static_model_meshes: prop_meshes,
+                    static_model_instances: prop_placements,
+                    ..Default::default()
+                },
+                materials,
+                collision,
+                spawns,
+                report,
+                ..Default::default()
+            }
+        }
+        Err(error) => {
+            let mut loaded = LoadedWorld::with_gap(
+                WorldDrawPolicy::t5(),
+                PreparedCapability::PreparedWorld,
+                format!("{title} world mesh: {error}"),
+                Some(game.addr_world_mesh),
+            );
+            loaded.scripts = scripts;
+            loaded.collision = collision;
+            loaded.spawns = spawns;
+            loaded.report.extend(report);
+            loaded
+        }
+    }
+}
+
+#[cfg(test)]
+mod fog_tests {
+    #[test]
+    fn exp_fog_fills_the_fog_slots() {
+        let fog = super::legacy_fog("setExpFog(800, 6000, 0.5, 0.6, 0.7, 0);").expect("parses");
+        let t = super::legacy_fog_table(&fog);
+        // (The fog rows after the 256 lights, where the pass reads them.)
+        let (sun, row) = (super::super::t6::SUN_FOG_SLOT, super::super::t6::FOG_SLOT);
+        assert_eq!((sun, row), (256, 257));
+        assert_eq!(t.len(), row + 1);
+        assert_eq!(&t[row][0..4], &[800.0, 6000.0, 1.0, 1.0]);
+        assert!((t[row][4] - 0.25).abs() < 1e-6);
+        assert_eq!(t[sun][1], 0.0);
+        assert!(t[..sun].iter().all(|r| r[3] == 0.0));
+        // WaW's height fog, past the usage comment's own mention.
+        let waw = "setVolFog(0, 4400, 1400, 0, 0.552, 0.682, 0.71, 0);\n// setVolFog(<startDist>, <halfwayDist>, ...)";
+        let f = super::legacy_fog(waw).expect("parses");
+        assert_eq!((f.start, f.half, f.half_height, f.base_height), (0.0, 4400.0, 1400.0, 0.0));
+        assert!((f.colour[0] - 0.552).abs() < 1e-6);
+        // Commented out: no fog (Cargoship's createart).
+        let cargo = "\tsetdvar( \"scr_fog_disable\", \"0\" );\n\t//setExpFog(300, 1400, 0.5, 0.5, 0.5, 0);\n\tVisionSetNaked( \"mp_cargoship\", 0 );";
+        assert!(super::legacy_fog(cargo).is_none());
+        assert!(super::legacy_fog("/* setExpFog(1, 2, 0.5, 0.5, 0.5, 0); */").is_none());
+        assert_eq!(super::strip_gsc_comments("a // b\nc /* d */ e"), "a \nc  e");
+        // Cargoship's vision: the commented-out look after its own loses.
+        let vision = "r_filmEnable \"1\"\nr_filmContrast \"1.615\"\nr_filmBrightness \"0.25\"\nr_filmDesaturation \"0.6\"\nr_filmInvert \"0\"\nr_filmLightTint \"1.141 1.275 1.360\"\nr_filmDarkTint \"1 1.158 1.169\"\n/*\nr_filmContrast \"1.4\"\n*/\n";
+        let v = asset_world::parse_film_vision_rawfile("vision/mp_cargoship.vision", super::strip_gsc_comments(vision).as_bytes(), false)
+            .expect("parses")
+            .expect("a vision");
+        assert_eq!(v.contrast, 1.615);
+    }
+}
+
+#[cfg(test)]
+mod mip_tests {
+    #[test]
+    fn a_full_chain_keeps_alpha_coverage() {
+        // 8x4: the left half opaque, the right clear (a fence's edge).
+        let mut top = Vec::new();
+        for _y in 0..4 {
+            for x in 0..8 {
+                top.extend_from_slice(&[200, 100, 50, if x < 4 { 255 } else { 0 }]);
+            }
+        }
+        let (data, levels) = super::mip_chain(8, 4, top);
+        assert_eq!(levels, 4);
+        // 8x4 + 4x2 + 2x1 + 1x1 texels.
+        assert_eq!(data.len(), (32 + 8 + 2 + 1) * 4);
+        // Level 1 (4x2): half of it still passes the 0.5 test.
+        let l1 = &data[32 * 4..40 * 4];
+        let pass = l1.chunks_exact(4).filter(|p| p[3] >= 128).count();
+        assert_eq!(pass, 4);
+        // Colour averaged in linear light stays the colour.
+        assert_eq!(l1[0], 200);
+    }
+}
+
+#[cfg(test)]
+mod mip_bench {
+    #[test]
+    #[ignore = "timing"]
+    fn a_1024_chain() {
+        let top: Vec<u8> = (0..1024 * 1024 * 4).map(|i| (i % 251) as u8).collect();
+        let t = std::time::Instant::now();
+        let (_, levels) = super::mip_chain(1024, 1024, top);
+        eprintln!("1024^2 chain: {levels} levels in {:?}", t.elapsed());
+    }
+}

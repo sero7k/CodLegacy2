@@ -1,0 +1,34 @@
+[package]
+name = "accounts"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "CodLegacy account service: password and Steam sign-in, sessions, profile, leaderboard, join tickets."
+
+[lib]
+name = "codlegacy_accounts"
+path = "src/lib.rs"
+
+[[bin]]
+name = "codlegacy-accounts"
+path = "src/main.rs"
+
+[dependencies]
+argon2 = "0.6.0"
+axum = "0.8.9"
+base64 = "0.22"
+getrandom = "0.3"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2 = "0.10"
+tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "net", "signal", "time", "fs"] }
+ureq = "3.1"
+url = "2.5.8"
+
+[dev-dependencies]
+http-body-util = "0.1.5"
+tower = { version = "0.5.3", features = ["util"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,99 @@
+{
+  "about": "Which files of each game the portable export copies (docs/EXPORT.md). Patterns are relative to the game's folder, '/'-separated, case-insensitive: '*' is any run of characters inside one name, '**' any number of folders. A file is copied when it matches 'keep', and either matches 'force' or matches neither 'drop' nor 'common_drop'. 'map_zones' lists patterns with {map}: each map is a stem found by 'map_marker' (a map's load zone), and every file matching one of them for one of those maps is dropped, unless 'force' keeps it.",
+  "common_drop": [
+    "**/*.bik", "**/*.mkv", "**/*.webm", "**/*.mp4", "video/**", "raw/video/**", "main/video/**",
+    "redist/**", "_commonredist/**", "directx/**", "**/*.cab", "**/vcredist*", "**/dxsetup*",
+    "**/crashreporter*", "crash-reporter/**", "**/*.log", "**/*.dmp", "**/*.tmp",
+    "**/*.french.*", "**/*.german.*", "**/*.italian.*", "**/*.spanish.*", "**/*.polish.*",
+    "**/*.russian.*", "**/*.japanese.*", "**/*.portuguese.*",
+    "**/localized_french*", "**/localized_german*", "**/localized_italian*", "**/localized_spanish*",
+    "**/localized_polish*", "**/localized_russian*", "**/localized_japanese*", "**/localized_portuguese*",
+    "**/french/**", "**/german/**", "**/italian/**", "**/spanish/**", "**/polish/**", "**/russian/**",
+    "**/japanese/**", "**/portuguese/**", "**/fulljap/**", "**/chinese/**", "**/korean/**", "**/arabic/**"
+  ],
+  "games": {
+    "bo2": {
+      "title": "Black Ops II (multiplayer and its own Zombies)",
+      "keep": ["zone/all/*.ff", "zone/all/*.ipak", "zone/english/*.ff", "zone/english/*.ipak", "sound/*.all.sab*", "sound/*.english.sab*"]
+    },
+    "bo1": {
+      "title": "Black Ops",
+      "keep": ["zone/common/*_mp.ff", "zone/common/mp_*.ff", "zone/english/en_*.ff", "main/*.iwd"],
+      "drop": ["**/*_sp.ff", "**/*_zm.ff"]
+    },
+    "mw2": {
+      "title": "Modern Warfare 2 (2009)",
+      "keep": ["zone/**/*_mp.ff", "zone/**/mp_*.ff", "main/*.iwd", "main/iw4x/**", "iw4x/**", "usermaps/**"],
+      "drop": ["iw4x/video/**"]
+    },
+    "mw3": {
+      "title": "Modern Warfare 3 (2011)",
+      "keep": ["zone/**/*_mp.ff", "zone/**/mp_*.ff", "main/*.iwd"]
+    },
+    "waw": {
+      "title": "World at War",
+      "keep": ["zone/**/*_mp.ff", "zone/**/mp_*.ff", "main/*.iwd"],
+      "drop": ["**/nazi_zombie_*"]
+    },
+    "cod4": {
+      "title": "Call of Duty 4",
+      "keep": ["zone/**/*_mp.ff", "zone/**/mp_*.ff", "main/*.iwd"],
+      "drop": ["**/nazi_zombie_*"]
+    },
+    "ghosts": {
+      "title": "Ghosts",
+      "keep": ["zone/*_mp.ff", "zone/mp_*.ff", "zone/imagefile*.pak", "zone/soundfile*.pak", "zone/english/eng_soundfile*.pak", "zone/english/*.ff"],
+      "drop": ["zone/mp_alien_*"]
+    },
+    "iw": {
+      "title": "Infinite Warfare (maps and its Zombies; none of its sound is read)",
+      "keep": ["**/ui.ff", "**/iw7_ui.ff", "**/mp_*.ff", "**/cp_*.ff", "**/techsets_*.ff", "**/patch_*.ff", "**/common*.ff", "**/global*.ff", "**/assetfile*.pak", "**/imagefile*.pak", "**/iw7_imagefile*.bin"],
+      "drop": ["**/*.sab*", "**/soundfile*"]
+    },
+    "aw": {
+      "title": "Advanced Warfare (guns only: its maps are left out)",
+      "keep": ["zone/*_mp.ff", "zone/mp_*.ff", "zone/imagefile*.pak", "zone/soundfile*.pak", "zone/english/*.ff", "zone/english/eng_soundfile*.pak"],
+      "drop": ["zone/*_zm_mp.ff", "zone/mp_zombie_*"],
+      "map_marker": "zone/mp_*_load.ff",
+      "map_zones": ["zone/{map}.ff", "zone/{map}_load.ff", "zone/{map}_path.ff", "zone/{map}_patch*.ff", "zone/{map}.pak", "zone/english/*_{map}.ff", "zone/english/{map}.ff"]
+    },
+    "mwr": {
+      "title": "Modern Warfare Remastered / Horizon MW (guns only: its maps and usermaps are left out)",
+      "keep": ["zone/*.ff", "zone/*.pak", "hmw-mod/zone/*.ff", "hmw-mod/zone/*.pak", "hmw-mod/maps/**"],
+      "drop": ["hmw-usermaps/**", "usermaps/**", "zone/*_sp.ff", "hmw-mod/zone/de_*", "hmw-mod/zone/deu_*", "hmw-mod/zone/ens_*", "hmw-mod/zone/rus_*", "hmw-mod/zone/spa_*"],
+      "map_marker": "zone/mp_*_load.ff",
+      "map_zones": ["zone/{map}.ff", "zone/{map}_load.ff", "zone/{map}_path.ff", "zone/{map}_patch*.ff", "zone/{map}.pak", "zone/*_{map}.ff"]
+    },
+    "bo3": {
+      "title": "Black Ops III (multiplayer maps and guns: its Zombies maps and campaign are left out)",
+      "keep": ["zone/core_*.ff", "zone/en_core_*.ff", "zone/mp_*.ff", "zone/en_mp_*.ff", "zone/zm_common.ff", "zone/zm_levelcommon.ff", "zone/*.xpak", "zone/**/mp_common.all.sab*", "zone/**/mp_common.en.sab*", "usermaps/**"],
+      "drop": ["zone/cp_*", "zone/en_cp_*", "zone/zm_*", "zone/en_zm_*", "zone/**/zm_*", "usermaps/zm_*/**"],
+      "force": ["zone/zm_common.*", "zone/zm_levelcommon.*"]
+    },
+    "jup": {
+      "title": "Modern Warfare III (2023) and Modern Warfare II (2022): guns, their parts, pictures and sounds, camos, calling cards and emblems; no maps",
+      "method": "export-mw3"
+    },
+    "cw": { "title": "Black Ops Cold War (Create-a-Class banner only)", "method": "banner" },
+    "vg": { "title": "Vanguard (Create-a-Class banner only)", "method": "banner" },
+    "bo2mod": {
+      "title": "the @leetinservers Black Ops II mod",
+      "keep": ["mod.ff", "mod.json", "*.iwd", "*.sab*"]
+    },
+    "bo2extra": {
+      "title": "the Black Ops II DLC5 Zombies mod",
+      "keep": ["**"]
+    }
+  },
+  "verify_maps": {
+    "bo2": "mp_nuketown_2020",
+    "bo1": "t5:mp_nuked",
+    "mw2": "iw4:mp_rust",
+    "mw3": "iw5:mp_dome",
+    "waw": "t4:mp_castle",
+    "cod4": "iw3:mp_crash",
+    "ghosts": "iw6:mp_prisonbreak",
+    "iw": "iw7:mp_breakneck",
+    "bo3": "t7:mp_biodome"
+  }
+}

@@ -1,0 +1,60 @@
+[package]
+name = "render_gpu"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "wgpu resources, pipelines, upload, render graph, and submit."
+
+[features]
+# NVIDIA DLSS Super Resolution. Off by default: it needs the DLSS SDK at build
+# time (set DLSS_SDK, VULKAN_SDK; clang) and its DLL beside the executable. See
+# "Enabling DLSS" in docs/RENDER.md.
+dlss = ["dep:dlss_wgpu", "bevy/dlss"]
+# bo2mp: games left out of the game (owner, 5 Nov 2026): their own renderers.
+# (Infinite Warfare's presents through Modern Warfare III's, so it needs it.)
+jup = ["dep:render_jup", "assets/jup"]
+iw7 = ["dep:render_iw7", "dep:fastfile_iw7", "jup", "assets/iw7", "hud/iw7"]
+
+[dependencies]
+codlegacy_env.workspace = true
+asset_iw4.workspace = true
+asset_core.workspace = true
+asset_material.workspace = true
+asset_world.workspace = true
+assets.workspace = true
+bytemuck = { version = "1", features = ["derive"] }
+d3d9_sm3.workspace = true
+d3d9_state.workspace = true
+diag.workspace = true
+dpvs_iw4.workspace = true
+frame.workspace = true
+fx_iw4.workspace = true
+hud_iw4.workspace = true
+hud = { path = "../hud" }
+lighting_iw4.workspace = true
+perf.workspace = true
+render_backend.workspace = true
+render_frame.workspace = true
+render_h1.workspace = true
+render_iw6.workspace = true
+render_t7.workspace = true
+render_jup = { workspace = true, optional = true } # bo2mp: feature `jup`
+render_iw7 = { workspace = true, optional = true } # bo2mp: feature `iw7`
+fastfile_iw7 = { workspace = true, optional = true } # bo2mp: feature `iw7`
+render_material.workspace = true
+render_scene.workspace = true
+bevy.workspace = true
+# FSR 3.1 (AMD FidelityFX Super Resolution 3 upscaler, SPIR-V compute: Vulkan only).
+wgpu-ffx = "0.1"
+wgpu = "29"
+# (Same version as bevy 0.19 pulls in for its own DLSS; wgpu 29.)
+dlss_wgpu = { version = "4", optional = true }
+
+[dev-dependencies]
+# The shader composer bevy uses (same version and features as bevy_shader), to
+# compile geometry_diagnostic.wgsl the way the renderer does.
+naga_oil = { version = "0.22", default-features = false, features = ["test_shader"] }
+naga = { version = "29", features = ["wgsl-in"] }
+
+[lints]
+workspace = true

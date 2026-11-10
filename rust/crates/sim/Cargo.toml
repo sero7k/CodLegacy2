@@ -1,0 +1,41 @@
+[package]
+name = "sim"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "The funnel: UserCmd in, Snapshot out. The single simulation path shared by live play, prediction and replay."
+
+[dependencies]
+codlegacy_env.workspace = true
+bevy_ecs.workspace = true
+sha2.workspace = true
+diag.workspace = true
+playerstate_iw4.workspace = true
+movement_iw4.workspace = true
+math_iw4.workspace = true
+trace_iw4.workspace = true
+clipmap_iw4.workspace = true
+gamemode_iw4.workspace = true
+hud_iw4.workspace = true
+weapon_iw4.workspace = true
+entity_iw4.workspace = true
+anim_iw4.workspace = true
+fx_iw4.workspace = true
+xmodel_runtime.workspace = true
+glam.workspace = true
+gsc_t6.workspace = true # bo2zm
+gsc_iw6.workspace = true # bo2mp: Ghosts map scripts
+gsc_iw6_vm.workspace = true
+iw6_pose.workspace = true # bo2mp: Ghosts script-model skeletons and clips
+miniz_oxide.workspace = true # bo2mp: Bot Warfare's waypoint packs
+serde.workspace = true # bo2mp: the host's weapon layout for joining clients
+serde_json.workspace = true
+bo2_profile.workspace = true # bo2mp
+perf.workspace = true
+asset_world.workspace = true # bo2mp: visionsetnaked
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+fastfile_iw6.workspace = true # bo2mp: the Ghosts script integration test

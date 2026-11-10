@@ -1,0 +1,13 @@
+[package]
+name = "repo_tts"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "R.E.P.O.'s text-to-speech voice (its own Klattersynth.dll, run in its own Mono runtime from the owner's install) for the chat."
+
+[dependencies]
+libloading.workspace = true
+diag = { path = "../diag" }
+
+[lints]
+workspace = true

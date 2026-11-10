@@ -1846,7 +1846,8 @@ local function add_after_build(menu)
             end
         end
     end)
-    menu:addElement(LUI.UITimer.new(400, "claude_card_tick"))
+    -- (Often: HMW puts its card back whenever the lobby rebuilds it.)
+    menu:addElement(LUI.UITimer.new(50, "claude_card_tick"))
     menu:registerEventHandler("claude_card_tick", function()
         local ok, err = pcall(place_card, menu)
         if not ok and not card_logged then

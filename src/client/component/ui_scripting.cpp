@@ -661,8 +661,20 @@ namespace ui_scripting
 
 			// Our front-end look, then our HUD, after the game's own scripts so
 			// they can wrap its widgets.
-			load_script("claude_ui", claude_ui);
-			load_script("claude_hud", claude_hud);
+			// A copy beside the game (claude_ui.lua / claude_hud.lua) wins over
+			// the built-in one, so the UI can be changed without a rebuild.
+			{
+				std::string loose;
+				const auto ui_loose = utils::io::read_file("claude_ui.lua", &loose);
+				load_script("claude_ui", ui_loose ? loose : claude_ui);
+				if (ui_loose) claude_log("[claude_ui] using claude_ui.lua beside the game");
+			}
+			{
+				std::string loose;
+				const auto hud_loose = utils::io::read_file("claude_hud.lua", &loose);
+				load_script("claude_hud", hud_loose ? loose : claude_hud);
+				if (hud_loose) claude_log("[claude_hud] using claude_hud.lua beside the game");
+			}
 		}
 
 		void try_start()

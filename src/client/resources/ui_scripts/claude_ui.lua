@@ -149,7 +149,11 @@ end
 ----------------------------------------------------------------------------
 
 local function greenish(c)
-    return c.g > c.r + 0.06 and c.g >= c.b + 0.02
+    if c.g > c.r + 0.06 and c.g >= c.b + 0.02 then
+        return true
+    end
+    -- HMW's accent is yellow / gold: that becomes our blue too.
+    return c.r >= 0.5 and c.g >= 0.4 and c.b <= c.g - 0.2 and math.abs(c.r - c.g) <= 0.3
 end
 
 -- The same colour's lightness in our blue (its brightest channel and its
@@ -273,6 +277,23 @@ rule({
     "h1_ui_deco_green_triangle", "h1_ui_topbar_title_bg", "h1_ui_topbar_titletext_bg_not_tiled",
     "h1_title_background", "logo_game_big_glow",
 }, { hide = true })
+
+-- HMW's own (h2_) menu art: the rows, the title band, the dividers.
+rule({ "h2_btn_unfocused" }, { color = UI.BLACK, alpha = 0.45 })
+rule({ "h2_btn_unfocused_locked" }, { color = UI.BLACK, alpha = 0.3 })
+rule({ "h2_btn_focused_fill" }, { color = UI.ACCENT, alpha = 0.9 })
+rule({ "h2_btn_focused_locked" }, { color = UI.ACCENT, alpha = 0.35 })
+rule({
+    "h2_btn_focused_stroke", "h2_btn_focused_outerglow", "h2_btn_dot_pattern", "btn_focused_rect_innerglow",
+    "h2_title_splatter_01", "h2_title_splatter_02", "h2_title_smoke_01", "h2_title_smoke_02",
+    "h2_title_pattern_dot", "h2_title_backglow_pc", "h2_title_backglow_light", "h2_title_arrow",
+    "h1_deco_title_point", "h1_deco_double_triangle", "h1_deco_scanlines_overlay",
+}, { hide = true })
+rule({ "h2_ui_divider_yellow", "h1_ui_divider_gradient_left", "h1_ui_frame_green" }, { color = UI.ACCENT, alpha = 0.85 })
+
+-- HMW's HUD boxes.
+rule({ "h2m_hud_weapwidget_blur", "h2m_hud_as_kbm_blur" }, { color = UI.PANEL, alpha = 0.72, ingame = true })
+rule({ "h2m_hud_weapwidget_border", "h2m_hud_as_kbm_border" }, { hide = true, ingame = true })
 
 -- The main menu's logo: ours over it.
 rule({ "h1_logo_mw_medium" }, { logo = true })
@@ -741,6 +762,28 @@ local function after_build(menu)
                     log("realign: " .. tostring(err))
                 end
             end
+        end
+    end)
+    pcall(function()
+        local title = menu:getChildById("generic_title")
+        if title and not title.claude_bar then
+            title.claude_bar = true
+            -- The bar standing at the title's left (view.rs ghosts_frame).
+            title:addElement(LUI.UIImage.new({
+                topAnchor = true,
+                bottomAnchor = false,
+                leftAnchor = true,
+                rightAnchor = false,
+                top = UI.px(70),
+                height = UI.px(40),
+                left = UI.px(118),
+                width = math.max(3, UI.px(7)),
+                material = UI.material("white"),
+                red = UI.ACCENT.r,
+                green = UI.ACCENT.g,
+                blue = UI.ACCENT.b,
+                alpha = 1,
+            }))
         end
     end)
     if not logged_trees[key] then

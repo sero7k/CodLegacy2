@@ -1312,6 +1312,38 @@ local function sweep_old_look(menu, backdrop)
     end
 end
 
+-- HMW's player card is never built: our banner takes its place.
+if in_frontend and type(AddPlayerCard) == "function" then
+    AddPlayerCard = function(menu, controller)
+        pcall(function()
+            menu.claude_card_slot = true
+        end)
+    end
+end
+
+-- Killstreaks and Personalization are not rows of the lobby screens in our
+-- shell (streaks are in Create-a-Class, the card and emblem in Barracks):
+-- HMW adds both from this one function.
+if in_frontend and LUI.MPLobbyBase and type(LUI.MPLobbyBase.AddPersonalizationButton) == "function" then
+    LUI.MPLobbyBase.AddPersonalizationButton = function(menu) end
+    UI.actions = UI.actions or {}
+    UI.actions.KILLSTREAKS = function(el, ev)
+        LUI.FlowManager.RequestAddMenu(nil, "killstreak_selection", true, Cac.GetSelectedControllerIndex(), nil, {
+            storageCategory = "Primary",
+            weaponType = "streak",
+            menuTitle = "@LUA_MENU_KILLSTREAKS",
+            showAttributes = false,
+            subCategories = {},
+            attributesDelta = false,
+            optionsForVL = {},
+            showUnlocks = true,
+        })
+    end
+    UI.actions.PERSONALIZATION = function(el, ev)
+        LUI.FlowManager.RequestAddMenu(el, "PlayercardMenu", true, (ev and ev.controller) or 0, false)
+    end
+end
+
 -- No build number over the title.
 if LUI.MenuTemplate then
     LUI.MenuTemplate.AddBuildNumber = function() end
@@ -1891,38 +1923,27 @@ end
 
 local banner_logged = false
 local function place_card(menu)
+    -- Our banner where HMW would have put its card (AddPlayerCard below
+    -- marks the place instead of building HMW's).
+    local wanted = menu.claude_card_slot or (menu.subContainer and menu.subContainer.claude_card_slot)
+    -- (A card HMW built anyway, by another way: hidden.)
     local bg = UI.card_bg
-    if not bg then
-        return
-    end
-    local card = bg:getParent()
-    if not card then
-        return
-    end
-    local inside, p = false, card
-    while p do
-        if p == menu then
-            inside = true
-            break
-        end
-        p = p:getParent()
-    end
-    if not inside then
-        return
-    end
-    -- HMW's card and the pieces drawn with it (its rule above) go.
-    hide(card)
-    local parent = card:getParent()
-    if parent then
-        local c = parent:getFirstChild()
-        while c do
-            if c.id == "LUIImage" then
-                hide(c)
+    if bg then
+        local card = bg:getParent()
+        local inside, p = false, card
+        while p do
+            if p == menu then
+                inside = true
+                break
             end
-            c = c:getNextSibling()
+            p = p:getParent()
+        end
+        if inside then
+            wanted = true
+            hide(card)
         end
     end
-    if not menu.claude_banner then
+    if wanted and not menu.claude_banner then
         local ok, err = pcall(build_banner, menu)
         menu.claude_banner = true
         if not banner_logged then
@@ -2225,5 +2246,110 @@ pcall(function()
 end)
 pcall(function() log("mwr_weapons: added " .. added .. " missing stock weapons (hidden-fix hooks installed)") end)
 
+end
+end
+
+----------------------------------------------------------------------------
+-- 7. Map select: an "AW (2014)" tab for Advanced Warfare's maps in
+-- hmw-usermaps (already in this game's zone format, each with its .arena).
+-- HMW's map screen has its tabs written into it (MWR / MW2 / MW3), so its
+-- AddTabs is replaced by the same one with our tab added; choosing one of
+-- ours sets the map and leaves, as HMW's single-map choice does.
+----------------------------------------------------------------------------
+if in_frontend and LUI.MapSetup and type(LUI.MapSetup.AddTabs) == "function" then
+do
+    local AW_MAPS = {
+        { "mp_refraction", "Ascend" }, { "mp_lab2", "Bio Lab" }, { "mp_comeback", "Comeback" },
+        { "mp_laser2", "Defender" }, { "mp_detroit", "Detroit" }, { "mp_greenband", "Greenband" },
+        { "mp_levity", "Horizon" }, { "mp_instinct", "Instinct" }, { "mp_recovery", "Recovery" },
+        { "mp_venus", "Retreat" }, { "mp_prison", "Riot" }, { "mp_solar", "Solar" },
+        { "mp_terrace", "Terrace" }, { "mp_dam", "Atlas Gorge" }, { "mp_clowntown3", "Sideshow" },
+        { "mp_urban", "Urban" }, { "mp_climate_3", "Climate" }, { "mp_perplex_1", "Perplex" },
+        { "mp_kremlin", "Kremlin" }, { "mp_bigben2", "Parliament" }, { "mp_highrise2", "Skyrise" },
+        { "mp_blackbox", "Compound" }, { "mp_fracture", "Fracture" },
+        -- (Their names unconfirmed: the map's own file name for now.)
+        { "mp_lost", "Lost" }, { "mp_torqued", "Torqued" }, { "mp_spark", "Spark" },
+        { "mp_liberty", "Liberty" }, { "mp_lair", "Lair" }, { "mp_seoul2", "Seoul" },
+        { "mp_sector17", "Sector 17" },
+    }
+
+    local function aw_name(e)
+        local ok, n = pcall(function()
+            return Engine.Localize("@MPUI_" .. string.upper(string.sub(e[1], 4)))
+        end)
+        if ok and type(n) == "string" and n ~= "" and not string.find(n, "MPUI_") then
+            return n
+        end
+        return e[2]
+    end
+
+    LUI.AWMaps = InheritFrom(LUI.UIElement)
+    LUI.AWMaps.Buttons = {}
+    LUI.AWMaps.MapFeeder = function(menu, menu2)
+        LUI.AWMaps.Buttons = {}
+        local current = Engine.GetDvarString("ui_mapname")
+        for _, e in ipairs(AW_MAPS) do
+            local load_name = e[1]
+            local name = aw_name(e)
+            local data = {
+                button_text = name,
+                variant = GenericButtonSettings.Variants.FlatButton,
+                content_margin = 0,
+                content_width = 60,
+            }
+            local button = menu2:AddButton(name, function(el, ev)
+                Engine.SetDvarString("ui_mapname", load_name)
+                pcall(function()
+                    Engine.ExecNow("xupdatepartystate")
+                end)
+                Engine.SetDvarBool("ui_showDLCMaps", false)
+                LUI.FlowManager.RequestLeaveMenu(el)
+            end, nil, nil, nil, data)
+            button.listDefaultFocus = load_name == current
+            LUI.AWMaps.Buttons[#LUI.AWMaps.Buttons + 1] = button
+        end
+    end
+    LUI.AWMaps.GetTabLabel = function()
+        return "AW (2014)"
+    end
+    LUI.AWMaps.GetTabReferrer = function()
+        return "s1"
+    end
+    LUI.AWMaps.new = function()
+        local st = CoD.CreateState(nil, 80, nil, nil, CoD.AnchorTypes.TopLeft)
+        st.alpha = 0
+        local root = LUI.UIElement.new(st)
+        root.id = "AWMapsRoot"
+        root:setClass(LUI.AWMaps)
+        root:registerAnimationState("disabled", { alpha = 0 })
+        root:registerAnimationState("enabled", { alpha = 1 })
+        return root
+    end
+    LUI.MenuBuilder.m_types_build.s1_tab = LUI.AWMaps.new
+
+    LUI.MapSetup.AddTabs = function(menu)
+        local tabManager = LUI.MenuBuilder.BuildRegisteredType("MFTabManager", {
+            defState = CoD.CreateState(nil, nil, nil, nil, CoD.AnchorTypes.TopLeftRight),
+            numOfTabs = 4,
+        })
+        tabManager:keepRightBumperAlignedToHeader(false)
+        tabManager.tabSelected = 1
+        local tabs = {}
+        for _, kind in ipairs({ "h1_tab", "iw4_tab", "iw5_tab", "s1_tab" }) do
+            local t = LUI.MenuBuilder.BuildRegisteredType(kind, { controller = menu.controller })
+            tabs[#tabs + 1] = t
+            menu:addElement(t)
+        end
+        tabs[1]:MapFeeder(menu)
+        for i = 1, #tabs do
+            local n = i
+            tabManager:addTab(menu.controller, tabs[n]:GetTabLabel(), function()
+                menu:ChangeTab(tabs[n], tabManager)
+            end)
+        end
+        tabManager:refreshTab(menu.controller)
+        menu:addElement(tabManager)
+    end
+    log("map select: AW (2014) tab added (" .. #AW_MAPS .. " maps)")
 end
 end

@@ -333,9 +333,23 @@ local function restyle(state, r)
     return s
 end
 
+local seen_materials, seen_count = {}, 0
+local function note_material(m)
+    if seen_count >= 250 or m == nil or seen_materials[m] then
+        return
+    end
+    seen_materials[m] = true
+    seen_count = seen_count + 1
+    if frontend_now() then
+        local n = names[m]
+        log("material: " .. tostring(n or "?") .. (n and RULES[n] and " (ruled)" or ""))
+    end
+end
+
 local orig_ras = LUI.UIElement.registerAnimationState
 local function our_ras(self, name, state, ...)
     if type(state) == "table" and state.material ~= nil then
+        pcall(note_material, state.material)
         local r = rule_for(state.material)
         if r and not r.logo then
             local ok, s = pcall(restyle, state, r)
@@ -660,6 +674,98 @@ local function add_unlock_poll(menu)
     end)
 end
 
+-- After a menu has built its rows (whatever built them): each row's label
+-- goes to the right end of its row, as our shell's rows (ghosts.rs). The
+-- label's default and focus states are registered again, right-aligned.
+local logged_trees = {}
+local function walk(el, depth, fn)
+    local c = el:getFirstChild()
+    while c do
+        fn(c, depth)
+        if depth < 12 then
+            walk(c, depth + 1, fn)
+        end
+        c = c:getNextSibling()
+    end
+end
+
+local function realign_label(label)
+    local ts = CoD.TextSettings.TitleFontTiny
+    local h = ts.Height * ((LUI.UIGenericButton and LUI.UIGenericButton.fontScale) or 0.8)
+    local y = -3
+    local function st(c, a)
+        return {
+            alignment = LUI.Alignment.Right,
+            font = ts.Font,
+            topAnchor = false,
+            bottomAnchor = false,
+            leftAnchor = true,
+            rightAnchor = true,
+            left = 0,
+            right = -UI.px(36),
+            top = y - h / 2,
+            bottom = y + h / 2,
+            red = c.r,
+            green = c.g,
+            blue = c.b,
+            alpha = a,
+        }
+    end
+    label:registerAnimationState("default", st(UI.TEXT, 0.82))
+    label:registerAnimationState("focus", st(UI.WHITE, 1))
+    label:animateToState("default")
+end
+
+local function after_build(menu)
+    local key = tostring(menu.id or menu.type or "?")
+    local count = 0
+    walk(menu, 0, function(el, depth)
+        local id = tostring(el.id or "")
+        if id == "text_label" then
+            local parent = el:getParent()
+            -- (Only list rows: buttons inside the menu's list.)
+            local in_list = false
+            local p = parent
+            while p do
+                if p == menu.list then
+                    in_list = true
+                    break
+                end
+                p = p:getParent()
+            end
+            if in_list then
+                local ok, err = pcall(realign_label, el)
+                if ok then
+                    count = count + 1
+                else
+                    log("realign: " .. tostring(err))
+                end
+            end
+        end
+    end)
+    if not logged_trees[key] then
+        logged_trees[key] = true
+        log("menu '" .. key .. "': realigned " .. count .. " row labels")
+        local lines = 0
+        walk(menu, 0, function(el, depth)
+            if lines < 60 and depth <= 4 then
+                lines = lines + 1
+                log("  tree " .. string.rep("  ", depth) .. tostring(el.id or "-"))
+            end
+        end)
+    end
+end
+
+local function add_after_build(menu)
+    menu:addElement(LUI.UITimer.new(50, "claude_after_build", nil, true))
+    menu:registerEventHandler("claude_after_build", function()
+        local ok, err = pcall(after_build, menu)
+        if not ok then
+            log("after_build: " .. tostring(err))
+        end
+    end)
+end
+
 local function decorate(menu)
     if not in_frontend then
         -- (In a match the pause menu sits over the game: no shade.)
@@ -715,6 +821,7 @@ local function decorate(menu)
     end
     menu:addElement(band)
     add_unlock_poll(menu)
+    pcall(add_after_build, menu)
 end
 
 if LUI.MenuTemplate and type(LUI.MenuTemplate.new) == "function" then

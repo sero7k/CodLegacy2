@@ -773,6 +773,7 @@ local ROW_WORDS = {
     ["LEADERBOARDS"] = { "LEADERBOARDS", "Where you stand against everyone else." },
 }
 
+local build_cac_panel -- (defined with the banner, further down)
 local logged_trees = {}
 local function walk(el, depth, fn)
     local c = el:getFirstChild()
@@ -956,6 +957,13 @@ local function after_build(menu)
     local count = 0
     pcall(add_moved_rows, menu, key)
     pcall(row_words, menu)
+    if key == "CacMenu_container" and not menu.claude_cac then
+        menu.claude_cac = true
+        local ok, err = pcall(build_cac_panel, menu)
+        if not ok then
+            log("cac panel: " .. tostring(err))
+        end
+    end
     walk(menu, 0, function(el, depth)
         local id = tostring(el.id or "")
         if id == "text_label" then
@@ -1250,6 +1258,22 @@ local function sweep_old_look(menu, backdrop)
         end
     end
     hide(menu.listDivider)
+    -- Create-a-Class: only the title, the classes, the hints and ours stay.
+    if tostring(menu.id) == "CacMenu_container" then
+        local c = menu:getFirstChild()
+        local after = false
+        while c do
+            local id = tostring(c.id or "")
+            if after and not c.claude and c ~= menu.list and not string.find(id, "help")
+                and not string.find(id, "LUITimer") and id ~= "CacMenu_list" then
+                hide(c)
+            end
+            if id == "generic_title" then
+                after = true
+            end
+            c = c:getNextSibling()
+        end
+    end
     if menu.list then
         hide(menu.list.bottomDivider)
     end
@@ -1561,6 +1585,184 @@ local function build_banner(menu)
     end)
     menu:addElement(root)
     return root
+end
+
+-- Create-a-Class, as our shell's (cac.rs): the classes at the left, and in
+-- the middle the class in focus laid out: PRIMARY and SECONDARY with their
+-- pictures and what is on them, LETHAL / TACTICAL, the three PERKS with
+-- their coloured rules. HMW's own panels on that screen are hidden; its
+-- rows still open its editor.
+local function cac_item(cat, ref)
+    local name, img = "", nil
+    if not ref or ref == "" or ref == "none" or ref == "specialty_null" then
+        return "None", nil
+    end
+    pcall(function()
+        name = Cac.GetWeaponName(cat, ref) or ""
+    end)
+    pcall(function()
+        local n = Cac.GetWeaponImageName(cat, ref)
+        if n and n ~= "" and n ~= "ui_transparent" then
+            img = UI.material(n)
+        end
+    end)
+    if name == "" or string.sub(name, 1, 1) == "@" then
+        name = ref
+    end
+    return name, img
+end
+
+function build_cac_panel(menu)
+    local ox, oy = menu:getCurrentGlobalRect()
+    ox, oy = ox or 0, oy or 0
+    local body = (CoD.TextSettings.BodyFont or CoD.TextSettings.TitleFontTiny).Font
+    local bold = (CoD.TextSettings.BodyFontBold or CoD.TextSettings.BodyFont).Font
+    local function box(x1, y1, x2, y2)
+        return {
+            topAnchor = true, leftAnchor = true, bottomAnchor = false, rightAnchor = false,
+            left = UI.px(x1) - ox, top = UI.px(y1) - oy,
+            width = UI.px(x2 - x1), height = UI.px(y2 - y1),
+        }
+    end
+    local root = LUI.UIElement.new({
+        topAnchor = true, bottomAnchor = true, leftAnchor = true, rightAnchor = true,
+        top = 0, bottom = 0, left = 0, right = 0,
+    })
+    root.claude = true
+    local function image(x1, y1, x2, y2, mat, c, a)
+        local st = box(x1, y1, x2, y2)
+        st.material = mat or UI.material("white")
+        st.color = c or UI.WHITE
+        st.alpha = a or 1
+        local el = LUI.UIImage.new(st)
+        root:addElement(el)
+        return el
+    end
+    local function text(x1, y, h, str, font, c, a, w, align)
+        local st = box(x1, y, x1 + (w or 400), y + h)
+        st.font = font
+        st.alignment = align or LUI.Alignment.Left
+        st.color = c or UI.WHITE
+        st.alpha = a or 1
+        local el = LUI.UIText.new(st)
+        el:setText(str)
+        root:addElement(el)
+        return el
+    end
+    local function rule(y)
+        image(788, y, 1296, y + 1, nil, UI.WHITE, 0.12)
+    end
+    local function pic(el, mat)
+        pcall(function()
+            if mat then
+                el:setImage(mat)
+                el:setAlpha(1)
+            else
+                el:setAlpha(0)
+            end
+        end)
+    end
+
+    -- (A dark panel behind it, so it reads over the backdrop.)
+    image(770, 240, 1314, 790, nil, UI.PANEL, 0.55)
+    local w = {}
+    text(788, 254, 22, "PRIMARY", body, UI.DIM, 0.75)
+    image(866, 256, 867, 276, nil, UI.WHITE, 0.3)
+    w.pname = text(876, 252, 26, "", bold, UI.WHITE, 1, 400)
+    w.pimg = image(830, 288, 1050, 368, nil, UI.WHITE, 0)
+    w.pslots = {}
+    for i = 0, 3 do
+        local x = 788 + i * 127
+        if i > 0 then
+            image(x, 384, x + 1, 430, nil, UI.WHITE, 0.12)
+        end
+        w.pslots[i + 1] = image(x + 43, 386, x + 85, 428, nil, UI.WHITE, 0)
+    end
+    rule(442)
+    text(788, 452, 22, "SECONDARY", body, UI.DIM, 0.75)
+    image(894, 454, 895, 474, nil, UI.WHITE, 0.3)
+    w.sname = text(904, 450, 26, "", bold, UI.WHITE, 1, 380)
+    w.simg = image(830, 486, 960, 540, nil, UI.WHITE, 0)
+    w.sslots = { image(1020, 490, 1060, 530, nil, UI.WHITE, 0), image(1100, 490, 1140, 530, nil, UI.WHITE, 0) }
+    rule(552)
+    text(788, 562, 22, "LETHAL", body, UI.DIM, 0.75)
+    text(1052, 562, 22, "TACTICAL", body, UI.DIM, 0.75)
+    image(1042, 562, 1043, 636, nil, UI.WHITE, 0.12)
+    w.limg = image(798, 596, 830, 628, nil, UI.WHITE, 0)
+    w.lname = text(846, 600, 22, "", body, UI.WHITE, 0.9, 190)
+    w.timg = image(1062, 596, 1094, 628, nil, UI.WHITE, 0)
+    w.tname = text(1110, 600, 22, "", body, UI.WHITE, 0.9, 186)
+    rule(648)
+    text(788, 658, 22, "PERKS", body, UI.DIM, 0.75)
+    w.perks = {}
+    local rules = { UI.ENEMY, { r = 0.7, g = 0.7, b = 0.72 }, UI.ACCENT }
+    for i = 1, 3 do
+        local x = 788 + (i - 1) * 170
+        w.perks[i] = {
+            img = image(x + 66, 688, x + 104, 726, nil, UI.WHITE, 0),
+            name = text(x, 730, 20, "", body, UI.WHITE, 0.9, 166, LUI.Alignment.Center),
+        }
+        image(x, 756, x + 166, 760, nil, rules[i], 0.95)
+    end
+
+    local function render(index)
+        local loc = Cac.GetCustomClassLoc()
+        local lo = Cac.GetLoadout(loc, index)
+        if type(lo) ~= "table" then
+            return
+        end
+        local n, m = cac_item("Primary", lo.primary)
+        w.pname:setText(string.upper(n))
+        pic(w.pimg, m)
+        local pk = { { "Primary_AttachKit", lo.primaryAttachKit }, { "Primary_FurnitureKit", lo.primaryFurnitureKit },
+            { "Primary_Reticle", lo.primaryReticle }, { "Primary_Camo", lo.primaryCamo } }
+        for i, it in ipairs(pk) do
+            local _, im = cac_item(it[1], it[2])
+            pic(w.pslots[i], im)
+        end
+        n, m = cac_item("Secondary", lo.secondary)
+        w.sname:setText(string.upper(n))
+        pic(w.simg, m)
+        local _, a1 = cac_item("Secondary_AttachKit", lo.secondaryAttachKit)
+        local _, a2 = cac_item("Secondary_Camo", lo.secondaryCamo)
+        pic(w.sslots[1], a1)
+        pic(w.sslots[2], a2)
+        n, m = cac_item("Lethal", lo.lethal)
+        w.lname:setText(n)
+        pic(w.limg, m)
+        n, m = cac_item("Tactical", lo.tactical)
+        w.tname:setText(n)
+        pic(w.timg, m)
+        for i, cat in ipairs({ "Perk_Slot1", "Perk_Slot2", "Perk_Slot3" }) do
+            n, m = cac_item(cat, lo["perk" .. i])
+            w.perks[i].name:setText(n)
+            pic(w.perks[i].img, m)
+        end
+    end
+
+    -- The class in focus: each class row says when it is in focus.
+    local c = menu.list:getFirstChild()
+    while c do
+        local id = tostring(c.id or "")
+        local index = tonumber(string.match(id, "cac_class_button_(%d+)"))
+        if index then
+            local spy = LUI.UIElement.new({ topAnchor = true, leftAnchor = true, width = 1, height = 1 })
+            spy.claude = true
+            spy:registerEventHandler("button_over", function()
+                local ok, err = pcall(render, index)
+                if not ok then
+                    log("cac panel: " .. tostring(err))
+                end
+            end)
+            pcall(function()
+                c:addElement(spy)
+            end)
+        end
+        c = c:getNextSibling()
+    end
+    pcall(render, 0)
+    menu:addElement(root)
+    log("cac panel: built")
 end
 
 local banner_logged = false

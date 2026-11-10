@@ -1323,10 +1323,11 @@ local function add_backdrop(menu)
     if MAP_BACKDROP_MENUS[tostring(menu.id)] then
         map_pic = UI.map_art()
     end
+    local solid = MAP_BACKDROP_MENUS[tostring(menu.id)] and not map_pic
     if map_pic then
         pics = { map_pic }
     end
-    if #pics == 0 then
+    if #pics == 0 and not solid then
         return
     end
     local holder = LUI.UIElement.new({
@@ -1353,7 +1354,7 @@ local function add_backdrop(menu)
         }
     end
     local layers = {}
-    for n = 1, 2 do
+    for n = 1, (solid and 0 or 2) do
         local img = LUI.UIImage.new(frame(0, 0))
         img:setImage(pics[1])
         img:registerAnimationState("start", frame(0, 0))
@@ -1385,7 +1386,7 @@ local function add_backdrop(menu)
         incoming:animateToState("in", BACKDROP_FADE)
         outgoing:animateToState("out", BACKDROP_FADE)
     end
-    if not map_pic then
+    if not map_pic and not solid then
         holder:addElement(LUI.UITimer.new(BACKDROP_HOLD, "claude_backdrop_next"))
         holder:registerEventHandler("claude_backdrop_next", function()
             pcall(show_next)
@@ -1394,7 +1395,9 @@ local function add_backdrop(menu)
     pcall(function()
         math.randomseed(Engine.GetMilliseconds and Engine.GetMilliseconds() or os.time())
     end)
-    pcall(show_next)
+    if not solid then
+        pcall(show_next)
+    end
     if map_pic then
         -- (The map's picture dimmed, as the shell's lobby: the text reads.)
         holder:addElement(LUI.UIImage.new({

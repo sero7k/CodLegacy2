@@ -1,29 +1,3 @@
-![license](https://img.shields.io/github/license/auroramod/h1-mod.svg)
-[![open bugs](https://img.shields.io/github/issues/HorizonMW/HorizonMW-Client/bug?label=bugs)](https://github.com/HorizonMW/HorizonMW-Client/issues?q=is%3Aissue+is%3Aopen+label%3Abug)
-[![Build](https://github.com/auroramod/h1-mod/workflows/Build/badge.svg)](https://github.com/auroramod/h1-mod/actions)
-[![Build status](https://ci.appveyor.com/api/projects/status/0sh80kdnsvm53rno?svg=true)](https://ci.appveyor.com/project/auroramod/h1-mod)
-[![Discord](https://img.shields.io/discord/1272500523010097202?color=%237289DA&label=members&logo=discord&logoColor=%23FFFFFF)](https://discord.gg/horizonmw)
-
-# HorizonMW - H2M-Mod
-
-<p align="center">
-  <img src="assets/github/banner.png?raw=true" />
-</p>
-
-NOTE: You must legally own Call of Duty®: Modern Warfare Remastered to run this mod. Cracked/Pirated versions of the game are **NOT** supported.
-
-## Compile from source
-
-- Clone the Git repo. Do NOT download it as ZIP, that won't work.
-- Update the submodules and run `premake5 vs2022` or simply use the delivered `generate.bat`.
-- Build via solution file in `build\h1-mod.sln`.
-
-### Premake arguments
-
-| Argument                    | Description                                    |
-|:----------------------------|:-----------------------------------------------|
-| `--copy-to=PATH`            | Optional, copy the EXE to a custom folder after build, define the path here if wanted. |
-| `--dev-build`               | Enable development builds of the client. |
 
 ## Credits
 

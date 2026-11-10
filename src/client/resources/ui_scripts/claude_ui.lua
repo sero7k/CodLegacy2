@@ -730,6 +730,47 @@ end
 -- After a menu has built its rows (whatever built them): each row's label
 -- goes to the right end of its row, as our shell's rows (ghosts.rs). The
 -- label's default and focus states are registered again, right-aligned.
+-- Our screens' words, from the old client (crates/ui/src/shell: mod.rs
+-- rows, view.rs headers): each HMW screen's title trail, and for its rows
+-- (by the label HMW gives them) our name and the line about it.
+local SCREEN_TITLES = {
+    mp_main_menu_container = "MAIN MENU",
+    menu_xboxlive_container = "MULTIPLAYER  /  MATCH SELECT",
+    menu_systemlink_container = "MULTIPLAYER  /  MATCH SELECT",
+    menu_xboxlive_privatelobby_container = "CUSTOM GAME  /  LOBBY",
+    gamesetup_menu_main_container = "CUSTOM GAME  /  SETTINGS",
+    mapsetup_menu_main_container = "CUSTOM GAME  /  SELECT MAP",
+    CacMenu_container = "MULTIPLAYER  /  CREATE A CLASS",
+    OperatorMenu_container = "MULTIPLAYER  /  BARRACKS",
+    killstreak_selection_container = "MULTIPLAYER  /  SCORESTREAKS",
+    PrestigeMenu_container = "MULTIPLAYER  /  BARRACKS  /  PRESTIGE",
+    ChallengeCategoryMenu_container = "MULTIPLAYER  /  BARRACKS  /  CHALLENGES",
+    OpLeaderboardMain_container = "MULTIPLAYER  /  BARRACKS  /  LEADERBOARDS",
+}
+
+local ROW_WORDS = {
+    ["MULTIPLAYER"] = { "MULTIPLAYER", "Find a match, or a custom game with bots on every map." },
+    ["OPTIONS"] = { "OPTIONS", "Graphics, sound and controls." },
+    ["QUIT"] = { "QUIT", "Back to the desktop." },
+    ["FIND A MATCH"] = { "FIND A MATCH", "Public matches by playlist, and the server's active lobbies." },
+    ["CUSTOM GAME"] = { "CUSTOM GAME", "Pick the map, the mode and the bots, then play." },
+    ["PRIVATE MATCH"] = { "CUSTOM GAME", "Pick the map, the mode and the bots, then play." },
+    ["CREATE A CLASS"] = { "CREATE A CLASS", "Build your loadouts." },
+    ["BARRACKS"] = { "BARRACKS", "Your combat record, calling card, emblem and prestige." },
+    ["KILLSTREAKS"] = { "SCORESTREAKS", "Pick the streaks you earn in a match." },
+    ["PERSONALIZATION"] = { "PERSONALIZATION", "Your calling card, emblem and faction." },
+    ["START GAME"] = { "START MATCH", "Everyone in, the match begins." },
+    ["START MATCH"] = { "START MATCH", "Everyone in, the match begins." },
+    ["GAME SETUP"] = { "GAME SETTINGS", "The map, the mode, the bots and the rules." },
+    ["CHANGE MAP"] = { "CHANGE MAP", "Every map from every game installed." },
+    ["MAP"] = { "MAP", "Every map from every game installed." },
+    ["GAME MODE"] = { "GAME MODE", "Team Deathmatch, Domination, Search & Destroy..." },
+    ["COMBAT RECORD"] = { "COMBAT RECORD", "Your kills, wins and time played." },
+    ["PRESTIGE"] = { "PRESTIGE", "Reach the top level to enter the next prestige." },
+    ["CHALLENGES"] = { "CHALLENGES", "Challenges and the camos and cards they unlock." },
+    ["LEADERBOARDS"] = { "LEADERBOARDS", "Where you stand against everyone else." },
+}
+
 local logged_trees = {}
 local function walk(el, depth, fn)
     local c = el:getFirstChild()
@@ -769,9 +810,94 @@ local function realign_label(label)
     label:animateToState("default")
 end
 
+local function row_words(menu)
+    if not menu.list or menu.claude_words then
+        return
+    end
+    menu.claude_words = true
+    local body = (CoD.TextSettings.BodyFont or CoD.TextSettings.TitleFontTiny).Font
+    -- The line under the list: an accent bar and the words about the row.
+    local line = LUI.UIElement.new({
+        topAnchor = false, bottomAnchor = true, leftAnchor = true, rightAnchor = true,
+        bottom = UI.px(52), height = UI.px(26), left = 0, right = 0,
+    })
+    line.claude = true
+    local mark = LUI.UIImage.new({
+        topAnchor = true, bottomAnchor = true, leftAnchor = true, rightAnchor = false,
+        top = 2, bottom = -2, left = 0, width = math.max(3, UI.px(6)),
+        material = UI.material("white"), color = UI.ACCENT, alpha = 0,
+    })
+    local words = LUI.UIText.new({
+        topAnchor = true, bottomAnchor = true, leftAnchor = true, rightAnchor = true,
+        top = 0, bottom = 0, left = UI.px(18), right = 0,
+        font = body, alignment = LUI.Alignment.Left, color = UI.TEXT, alpha = 1,
+    })
+    words:setText("")
+    line:addElement(mark)
+    line:addElement(words)
+    -- (Under the list, placed from where the list is now; the menu, not
+    -- the list, holds it so it is never one of the rows.)
+    local ok = pcall(function()
+        local lx, _, _, lb = menu.list:getCurrentGlobalRect()
+        local mx, my = menu:getCurrentGlobalRect()
+        line:registerAnimationState("default", {
+            topAnchor = true, bottomAnchor = false, leftAnchor = true, rightAnchor = false,
+            left = lx - mx, top = lb - my + UI.px(20), width = UI.px(760), height = UI.px(26),
+        })
+        line:animateToState("default")
+        menu:addElement(line)
+    end)
+    if not ok then
+        return
+    end
+    local function show(text)
+        pcall(function()
+            words:setText(text or "")
+            mark:setAlpha((text and text ~= "") and 1 or 0)
+        end)
+    end
+    local c = menu.list:getFirstChild()
+    while c do
+        local btn = c
+        local label = nil
+        walk(btn, 0, function(el)
+            if not label and el.id == "text_label" then
+                label = el
+            end
+        end)
+        if label then
+            local have = ""
+            pcall(function()
+                have = string.upper(label:getText() or "")
+            end)
+            local w = ROW_WORDS[have]
+            if w then
+                pcall(function()
+                    label:setText(w[1])
+                end)
+                local spy = LUI.UIElement.new({
+                    topAnchor = true, leftAnchor = true, width = 1, height = 1,
+                })
+                spy.claude = true
+                spy:registerEventHandler("button_over", function()
+                    show(w[2])
+                end)
+                spy:registerEventHandler("button_over_disable", function()
+                    show(w[2])
+                end)
+                pcall(function()
+                    btn:addElement(spy)
+                end)
+            end
+        end
+        c = c:getNextSibling()
+    end
+end
+
 local function after_build(menu)
     local key = tostring(menu.id or menu.type or "?")
     local count = 0
+    pcall(row_words, menu)
     walk(menu, 0, function(el, depth)
         local id = tostring(el.id or "")
         if id == "text_label" then
@@ -817,6 +943,7 @@ local function after_build(menu)
                 end)
                 return ok and type(t) == "string" and t or ""
             end
+            local ours = SCREEN_TITLES[tostring(menu.id)]
             local line = text_of(head)
             local c = text_of(crumb)
             log("title texts: crumb='" .. c .. "' head='" .. line .. "' in " .. tostring(menu.id))
@@ -824,6 +951,9 @@ local function after_build(menu)
                 line = c .. "  /  " .. line
             elseif line == "" then
                 line = c
+            end
+            if ours then
+                line = ours
             end
             -- (Coordinates inside generic_title, whose corner sits at about
             -- 101, 43 on a 1080-line screen.)
@@ -886,6 +1016,9 @@ local function after_build(menu)
                             l2 = c2 .. "  /  " .. l2
                         elseif l2 == "" then
                             l2 = c2
+                        end
+                        if ours then
+                            l2 = ours
                         end
                         if l2 ~= "" then
                             t:setText(l2)

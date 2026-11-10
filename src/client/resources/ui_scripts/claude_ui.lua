@@ -374,6 +374,21 @@ local function our_ras(self, name, state, ...)
         pcall(function()
             if names[state.material] == "h2m_ui_playercard_bg" then
                 UI.card_bg = self
+                -- (Every copy HMW builds, not only the last: the lobby under a
+                -- menu builds its own, and the one on screen must be found.)
+                UI.card_bgs = UI.card_bgs or {}
+                local known = false
+                for _, e in ipairs(UI.card_bgs) do
+                    if e == self then
+                        known = true
+                    end
+                end
+                if not known then
+                    UI.card_bgs[#UI.card_bgs + 1] = self
+                    if #UI.card_bgs > 24 then
+                        table.remove(UI.card_bgs, 1)
+                    end
+                end
             end
         end)
         local r = rule_for(state.material)
@@ -1009,8 +1024,6 @@ local function add_moved_rows(menu, key)
                 LUI.FlowManager.RequestAddMenu(el, name, true, ev and ev.controller or 0, false)
             end
         end
-        add("CUSTOM CALLING CARDS", open("claude_custom_cards"))
-        add("CUSTOM EMBLEMS", open("claude_custom_emblems"))
     end
 end
 
@@ -1705,6 +1718,308 @@ pcall(function()
     LUI.MenuBuilder.m_types_build.claude_custom_emblems = custom_picker("emblems")
 end)
 
+-- Calling cards and emblems on one screen, as our shell's pickers (cards.rs:
+-- one game's pictures at a time, a category list at the left, a grid of
+-- pictures with their names, pages): MWR (the game's own tables), MW2R (the
+-- same tables' Modern Warfare 2 Remastered entries) and CUSTOM (ours). A
+-- category with nothing in it is not listed. Replaces HMW's own Emblem and
+-- Calling Card screens; if this fails to build, HMW's is kept.
+local function table_items(kind)
+    local cards = kind == "cards"
+    local out = {}
+    local file = cards and CallingCardTable and CallingCardTable.File or (EmblemIconTable and EmblemIconTable.File)
+    if not file then
+        return out
+    end
+    local n = 0
+    pcall(function()
+        n = tonumber(Engine.TableGetRowCount(file)) or 0
+    end)
+    for row = 0, n - 1 do
+        pcall(function()
+            local img, id, label
+            if cards then
+                img = Engine.TableLookupByRow(file, row, CallingCardTable.Cols.Image)
+                id = row
+                if CallingCardTable.Cols.Name then
+                    label = Engine.TableLookupByRow(file, row, CallingCardTable.Cols.Name)
+                end
+            else
+                img = Engine.TableLookupByRow(file, row, EmblemIconTable.Cols.Image)
+                id = tonumber(Engine.TableLookupByRow(file, row, EmblemIconTable.Cols.ID))
+                if EmblemIconTable.Cols.Name then
+                    label = Engine.TableLookupByRow(file, row, EmblemIconTable.Cols.Name)
+                end
+            end
+            if img and img ~= "" and id ~= nil then
+                local text = ""
+                if label and label ~= "" then
+                    pcall(function()
+                        text = Engine.Localize(label) or ""
+                    end)
+                    if text == "" or text == label then
+                        text = label
+                    end
+                end
+                if text == "" then
+                    text = tostring(img):gsub("^cardtitle_", ""):gsub("^cardicon_", ""):gsub("_", " ")
+                end
+                out[#out + 1] = { img = tostring(img), id = id, label = text }
+            end
+        end)
+    end
+    return out
+end
+
+-- Modern Warfare 2 Remastered's entries carry h2 in their picture's name.
+local function is_mw2r(img)
+    local l = string.lower(img)
+    return l:find("^h2_") ~= nil or l:find("_h2_") ~= nil or l:find("^h2") ~= nil
+end
+
+local function cards_picker(kind, original)
+    local cards = kind == "cards"
+    local list = cards and CUSTOM_CARDS or CUSTOM_EMBLEMS
+    local dvar = cards and "clc_card" or "clc_emblem"
+    local stat_name = cards and "callingCardIndex" or "emblemPatchIndex"
+    return function(a1, a2, ...)
+        local ok, menu_or_err = pcall(function()
+            local menu = LUI.MenuTemplate.new(a1, {
+                menu_title = cards and "MULTIPLAYER  /  BARRACKS  /  CALLING CARD" or "MULTIPLAYER  /  BARRACKS  /  EMBLEM",
+            })
+            local body = (CoD.TextSettings.BodyFont or CoD.TextSettings.TitleFontTiny).Font
+            local bold = (CoD.TextSettings.BodyFontBold or CoD.TextSettings.BodyFont or CoD.TextSettings.TitleFontTiny).Font
+
+            -- The three categories, each with its items.
+            local mwr, mw2r, custom = {}, {}, {}
+            for _, it in ipairs(table_items(kind)) do
+                it.kind = "table"
+                if is_mw2r(it.img) then
+                    mw2r[#mw2r + 1] = it
+                else
+                    mwr[#mwr + 1] = it
+                end
+            end
+            for _, e in ipairs(list) do
+                custom[#custom + 1] = { kind = "custom", entry = e, name = e[1], label = CUSTOM_TITLES[e[1]] or e[1] }
+            end
+            local cats = {}
+            if #mwr > 0 then cats[#cats + 1] = { title = "MWR", items = mwr } end
+            if #mw2r > 0 then cats[#cats + 1] = { title = "MW2R", items = mw2r } end
+            if #custom > 0 then cats[#cats + 1] = { title = "CUSTOM", items = custom } end
+            log(string.format("%s picker: %d MWR, %d MW2R, %d custom", kind, #mwr, #mw2r, #custom))
+            if #cats == 0 then
+                error("nothing to list")
+            end
+
+            local cols = cards and 3 or 6
+            local rows = cards and 8 or 4
+            local tw, th = cards and 360 or 150, cards and 52 or 150
+            local gx, gy = cards and 12 or 14, cards and 10 or 40
+            local per_page = cols * rows
+            local x0, y0 = 360, 230
+            local function st(x1, y1, x2, y2)
+                return {
+                    topAnchor = true, leftAnchor = true, bottomAnchor = false, rightAnchor = false,
+                    left = UI.px(x1), top = UI.px(y1), width = UI.px(x2 - x1), height = UI.px(y2 - y1),
+                }
+            end
+            local function put_text(parent, x1, y1, x2, y2, str, font, color, alpha, align)
+                local t = st(x1, y1, x2, y2)
+                t.font = font
+                t.alignment = align or LUI.Alignment.Left
+                t.color = color
+                t.alpha = alpha or 1
+                local el = LUI.UIText.new(t)
+                el:setText(str)
+                parent:addElement(el)
+                return el
+            end
+
+            local state = { cat = 1, page = 1 }
+            -- Start on the category his current pick is in.
+            do
+                local cur = ""
+                pcall(function() cur = Engine.GetDvarString(dvar) or "" end)
+                if cur ~= "" then
+                    for i, c in ipairs(cats) do
+                        if c.title == "CUSTOM" then state.cat = i end
+                    end
+                end
+            end
+
+            local function chosen(it)
+                local cur = ""
+                pcall(function() cur = Engine.GetDvarString(dvar) or "" end)
+                if it.kind == "custom" then
+                    return cur == it.name
+                end
+                if cur ~= "" then
+                    return false
+                end
+                local v = nil
+                pcall(function()
+                    v = tonumber(Engine.GetPlayerData(0, CoD.StatsGroup.Common, stat_name))
+                end)
+                return v ~= nil and v == it.id
+            end
+
+            local grid = LUI.UIElement.new(st(0, 0, 1920, 1080))
+            grid.claude = true
+            local side = LUI.UIElement.new(st(0, 0, 1920, 1080))
+            side.claude = true
+            menu:addElement(side)
+            menu:addElement(grid)
+
+            local render_side
+            local function clear(el)
+                local c = el:getFirstChild()
+                while c do
+                    local nxt = c:getNextSibling()
+                    pcall(function() c:close() end)
+                    c = nxt
+                end
+            end
+
+            local function render_grid()
+                clear(grid)
+                local cat = cats[state.cat]
+                local total = #cat.items
+                local pages = math.max(1, math.ceil(total / per_page))
+                state.page = math.max(1, math.min(state.page, pages))
+                local first = (state.page - 1) * per_page
+                for i = 1, per_page do
+                    local it = cat.items[first + i]
+                    if not it then
+                        break
+                    end
+                    local c = (i - 1) % cols
+                    local r = math.floor((i - 1) / cols)
+                    local x = x0 + c * (tw + gx)
+                    local y = y0 + r * (th + gy)
+                    local holder = LUI.UIElement.new(st(x, y, x + tw, y + th + (cards and 0 or 28)))
+                    holder.claude = true
+                    local bg = st(0, 0, tw, th)
+                    bg.material = UI.material("white")
+                    bg.color = UI.PANEL
+                    bg.alpha = 0.85
+                    holder:addElement(LUI.UIImage.new(bg))
+                    local m = nil
+                    if it.kind == "custom" then
+                        m = custom_frame(kind, it.entry, 0)
+                    else
+                        pcall(function() m = UI.material(it.img) end)
+                    end
+                    if m then
+                        local im = st(0, 0, tw, th)
+                        im.material = m
+                        im.alpha = 1
+                        holder:addElement(LUI.UIImage.new(im))
+                    end
+                    local on = chosen(it)
+                    local mk = st(0, th - 4, tw, th)
+                    mk.material = UI.material("white")
+                    mk.color = UI.ACCENT
+                    mk.alpha = on and 1 or 0
+                    holder:addElement(LUI.UIImage.new(mk))
+                    if cards then
+                        -- (Its name over the picture's left, on a shade.)
+                        local sh = st(0, 0, tw * 0.55, th)
+                        sh.material = UI.material("white")
+                        sh.color = UI.BLACK
+                        sh.alpha = 0.45
+                        holder:addElement(LUI.UIImage.new(sh))
+                        put_text(holder, 10, 14, tw * 0.55, th - 8, it.label, bold, UI.WHITE, 1)
+                    else
+                        put_text(holder, 0, th + 4, tw, th + 26, it.label, body, UI.TEXT, 0.9)
+                    end
+                    holder:setHandleMouseButton(true)
+                    holder:registerEventHandler("leftmouseup", function()
+                        pcall(function()
+                            if it.kind == "custom" then
+                                Engine.SetDvarFromString(dvar, it.name)
+                            else
+                                Engine.SetDvarFromString(dvar, "")
+                                Engine.SetPlayerData(0, CoD.StatsGroup.Common, stat_name, it.id)
+                            end
+                        end)
+                        log(kind .. " picked: " .. tostring(it.name or it.img))
+                        render_grid()
+                    end)
+                    grid:addElement(holder)
+                end
+                -- Pages: the arrows and "PAGE 1/3" under the grid.
+                local py = y0 + rows * (th + gy) + 10
+                put_text(grid, x0 + 120, py, x0 + 420, py + 28, "PAGE " .. state.page .. "/" .. pages, body, UI.DIM, 1, LUI.Alignment.Left)
+                local function arrow(x, glyph, delta)
+                    local el = put_text(grid, x, py, x + 80, py + 30, glyph, bold, UI.WHITE, pages > 1 and 1 or 0.25, LUI.Alignment.Left)
+                    pcall(click_area, grid, st(x - 10, py - 4, x + 80, py + 34), function()
+                        state.page = state.page + delta
+                        if state.page < 1 then state.page = pages end
+                        if state.page > pages then state.page = 1 end
+                        render_grid()
+                    end)
+                    return el
+                end
+                arrow(x0, "<", -1)
+                arrow(x0 + 70, ">", 1)
+            end
+
+            render_side = function()
+                clear(side)
+                -- The category list at the left, as our shell's (one game each).
+                local ty = y0
+                for i, c in ipairs(cats) do
+                    local on = i == state.cat
+                    if on then
+                        local band = st(150, ty, 340, ty + 38)
+                        band.material = UI.material("white")
+                        band.color = UI.ACCENT
+                        band.alpha = 0.88
+                        side:addElement(LUI.UIImage.new(band))
+                    end
+                    put_text(side, 150, ty + 5, 330, ty + 33, c.title, on and bold or body, on and UI.WHITE or UI.TEXT, on and 1 or 0.8, LUI.Alignment.Right)
+                    pcall(click_area, side, st(150, ty, 340, ty + 38), function()
+                        state.cat = i
+                        state.page = 1
+                        render_side()
+                        render_grid()
+                    end)
+                    ty = ty + 46
+                end
+            end
+
+            render_side()
+            render_grid()
+            pcall(function()
+                menu:AddBackButton()
+            end)
+            return menu
+        end)
+        if ok then
+            return menu_or_err
+        end
+        log(kind .. " picker failed, HMW's kept: " .. tostring(menu_or_err))
+        if original then
+            return original(a1, a2, ...)
+        end
+        error(menu_or_err, 0)
+    end
+end
+
+pcall(function()
+    local types = LUI.MenuBuilder.m_types_build
+    for name, kind in pairs({ EmblemMenu = "emblems", CallingCardMenu = "cards" }) do
+        if types[name] and not UI["cards_" .. name] then
+            UI["cards_" .. name] = true
+            types[name] = cards_picker(kind, types[name])
+            log("replaced " .. name .. " with our picker")
+        else
+            log("no " .. name .. " menu type to replace")
+        end
+    end
+end)
+
 local function build_banner(menu)
     local ox, oy = menu:getCurrentGlobalRect()
     ox, oy = ox or 0, oy or 0
@@ -2017,21 +2332,22 @@ local function place_card(menu)
     -- marks the place instead of building HMW's).
     local wanted = menu.claude_card_slot or (menu.subContainer and menu.subContainer.claude_card_slot)
     -- (A card HMW built anyway, by another way: hidden.)
-    local bg = UI.card_bg
-    if bg then
-        local card = bg:getParent()
-        local inside, p = false, card
-        while p do
-            if p == menu then
-                inside = true
-                break
+    for _, bg in ipairs(UI.card_bgs or {}) do
+        pcall(function()
+            local card = bg:getParent()
+            local inside, p = false, card
+            while p do
+                if p == menu then
+                    inside = true
+                    break
+                end
+                p = p:getParent()
             end
-            p = p:getParent()
-        end
-        if inside then
-            wanted = true
-            hide(card)
-        end
+            if inside then
+                wanted = true
+                hide(card)
+            end
+        end)
     end
     if wanted and not menu.claude_banner then
         local ok, err = pcall(build_banner, menu)

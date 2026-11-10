@@ -1448,6 +1448,16 @@ local function sweep_old_look(menu, backdrop)
         while c do
             if c.id ~= "generic_menu_title_id" then
                 hide(c)
+            else
+                -- (HMW's own title text, held at zero for as long as the menu
+                -- is up: its animations bring it back otherwise.)
+                pcall(function()
+                    walk(c, 0, function(el)
+                        if el.id == "breadcrumb_text" or el.id == "header_text" then
+                            hide(el)
+                        end
+                    end)
+                end)
             end
             c = c:getNextSibling()
         end
@@ -2808,10 +2818,10 @@ local function add_after_build(menu)
     menu:addElement(LUI.UITimer.new(120, "claude_sweep_tick"))
     menu:registerEventHandler("claude_sweep_tick", function()
         sweeps = sweeps + 1
-        if sweeps <= 50 or sweeps % 10 == 0 then
+        if true then
             pcall(sweep_old_look, menu, backdrop_wanted(key0))
         end
-        if sweeps <= 60 or sweeps % 5 == 0 then
+        if sweeps <= 60 or sweeps % 3 == 0 then
             pcall(restyle_footer, menu)
         end
     end)

@@ -34,7 +34,12 @@ namespace hmw_tcp_utils {
 
 	namespace MasterServer {
 
-		std::string master_server_url = "https://ms.s2mod.to/game-servers";
+		// No HMW master server: nothing is contacted unless a master of our own is
+		// set (`clc_master_url` in the environment: CLC_MASTER_URL).
+		std::string master_server_url = []() -> std::string {
+			const char* own = std::getenv("CLC_MASTER_URL");
+			return own ? std::string(own) : std::string();
+		}();
 
 		bool get_dvar_netip_for_heartbeat(std::string& addr)
 		{
@@ -55,6 +60,10 @@ namespace hmw_tcp_utils {
 
 		void send_heartbeat()
 		{
+			if (master_server_url.empty())
+			{
+				return;
+			}
 			std::string info_json = getInfo_Json();
 			CURL* curl = curl_easy_init();
 

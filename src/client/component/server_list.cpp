@@ -599,7 +599,11 @@ namespace server_list
 		notification_message = "Refreshing server list...";
 		ui_scripting::notify("showRefreshingNotification", {});
 
-		std::string master_server_list = hmw_tcp_utils::GET_url(hmw_tcp_utils::MasterServer::get_master_server(), {}, false, 10000L, true, 3);
+		std::string master_server_list;
+		if (hmw_tcp_utils::MasterServer::get_master_server()[0] != '\0')
+		{
+			master_server_list = hmw_tcp_utils::GET_url(hmw_tcp_utils::MasterServer::get_master_server(), {}, false, 10000L, true, 3);
+		}
 
 		// Clear error message if any
 		if (error_is_displayed) {

@@ -411,7 +411,7 @@ namespace ui_scripting
 			// game as a material for LUI (nil when the file is missing or bad).
 			game_type["clcimage"] = [](const game&, const std::string& path) -> script_value
 			{
-				static std::unordered_map<std::string, game::Material*> loaded;
+				static std::unordered_map<std::string, ::game::Material*> loaded;
 				const auto found = loaded.find(path);
 				if (found != loaded.end())
 				{
@@ -419,7 +419,7 @@ namespace ui_scripting
 				}
 
 				std::string data;
-				game::Material* material = nullptr;
+				::game::Material* material = nullptr;
 				if (path.find("..") == std::string::npos && utils::io::read_file(path, &data) && !data.empty())
 				{
 					material = materials::create_material("clc_img_" + path);

@@ -1401,6 +1401,7 @@ local function add_backdrop(menu)
         pcall(show_next)
     end
     if map_pic then
+        menu.claude_map_layer = layers[1]
         -- (The map's picture dimmed, as the shell's lobby: the text reads.)
         holder:addElement(LUI.UIImage.new({
             topAnchor = true, bottomAnchor = true, leftAnchor = true, rightAnchor = true,
@@ -1822,11 +1823,50 @@ function UI.lobby_look(menu, key)
     end
     text(root, x, 118, x + 30, 150, "E", UI.ACCENT_LIFT, 1)
 
+    -- Q / E (or the shoulder buttons): the tab to the left / right.
+    local order = { { "LOBBY", nil }, { "LOADOUTS", { "CLASS", "LOADOUT" } }, { "SETTINGS", { "SETTINGS", "SETUP" } } }
+    local here = key == "gamesetup_menu_main_container" and 3 or 1
+    menu:registerEventHandler("gamepad_button", function(el, ev)
+        if not ev or not ev.down then return false end
+        local to = nil
+        if ev.button == "shoulderr" then to = here + 1 elseif ev.button == "shoulderl" then to = here - 1 end
+        if not to or to < 1 or to > 3 then return false end
+        if to == 1 then
+            pcall(function() LUI.FlowManager.RequestLeaveMenu(menu) end)
+            return true
+        end
+        local up = table.unpack or unpack
+        local act = row_action(up(order[to][2]))
+        if act then
+            pcall(act, menu, { controller = ev.controller or 0 })
+            return true
+        end
+        return false
+    end)
+
     if key ~= "menu_xboxlive_privatelobby_container" then
         menu:addElement(root)
         return
     end
 
+    local dyn = LUI.UIElement.new(st(0, 0, 1920, 1080))
+    dyn.claude = true
+    root:addElement(dyn)
+    local function members()
+        local n = 1
+        for _, f in ipairs({
+            function() return Lobby.GetMemberCount() end,
+            function() return Lobby.GetPartyMemberCount() end,
+            function() return PartyHost.GetMemberCount() end,
+        }) do
+            local ok, v = pcall(f)
+            if ok and tonumber(v) and tonumber(v) >= 1 then
+                return math.min(18, tonumber(v))
+            end
+        end
+        return n
+    end
+    local function draw()
     -- Map card, bottom left: name tag, picture, bots/ready, mode.
     local load, mapname, modename = "", "", ""
     pcall(function() load = Engine.GetDvarString("ui_mapname") or "" end)
@@ -1844,45 +1884,75 @@ function UI.lobby_look(menu, key)
         end
     end)
     local px1, py1, px2, py2 = 100, 640, 560, 900
-    box(root, px1, py1, px2, py2 + 70, UI.SHADE, 0.55)
-    box(root, px1, py1, px1 + 5, py2 + 70, UI.ACCENT, 1)
-    text(root, px1 + 20, py1 + 8, px2 - 10, py1 + 40, string.upper(mapname), UI.WHITE, 1)
+    box(dyn, px1, py1, px2, py2 + 70, UI.SHADE, 0.55)
+    box(dyn, px1, py1, px1 + 5, py2 + 70, UI.ACCENT, 1)
+    text(dyn, px1 + 20, py1 + 8, px2 - 10, py1 + 40, string.upper(mapname), UI.WHITE, 1)
     local art = UI.map_art()
     if art then
         local pic = LUI.UIImage.new(st(px1 + 20, py1 + 48, px2 - 20, py1 + 48 + 220))
         pic:setImage(art)
-        root:addElement(pic)
+        dyn:addElement(pic)
     else
-        box(root, px1 + 20, py1 + 48, px2 - 20, py1 + 48 + 220, UI.PANEL, 0.8)
+        box(dyn, px1 + 20, py1 + 48, px2 - 20, py1 + 48 + 220, UI.PANEL, 0.8)
     end
-    text(root, px1 + 20, py2 + 30, px2 - 20, py2 + 62, "0 BOTS  \194\183  READY", UI.ACCENT_LIFT, 1)
-    text(root, px1 + 20, py2 + 62, px2 - 20, py2 + 94, string.upper(modename), UI.DIM, 0.85)
+    text(dyn, px1 + 20, py2 + 30, px2 - 20, py2 + 62, "0 BOTS  \194\183  READY", UI.ACCENT_LIFT, 1)
+    text(dyn, px1 + 20, py2 + 62, px2 - 20, py2 + 94, string.upper(modename), UI.DIM, 0.85)
 
     -- Teams, right side.
     local who = "PLAYER"
     pcall(function() who = string.upper(Engine.GetUsernameByController(0) or who) end)
     local function team(y, name, tint, count, you)
-        box(root, 1180, y, 1184, y + 40, tint, 1)
-        text(root, 1200, y + 2, 1800, y + 38, name .. "  \194\183  " .. count, UI.WHITE, 1)
+        box(dyn, 1180, y, 1184, y + 40, tint, 1)
+        text(dyn, 1200, y + 2, 1800, y + 38, name .. "  \194\183  " .. count, UI.WHITE, 1)
         local ry = y + 52
         local rows = you and 1 or 0
         if you then
-            box(root, 1180, ry, 1820, ry + 52, UI.SHADE, 0.6)
-            box(root, 1180, ry, 1184, ry + 52, UI.ACCENT, 1)
-            text(root, 1204, ry + 8, 1600, ry + 44, who, UI.WHITE, 1)
-            text(root, 1620, ry + 8, 1808, ry + 44, "LEADER", UI.GOLD, 1, LUI.Alignment.Right)
+            box(dyn, 1180, ry, 1820, ry + 52, UI.SHADE, 0.6)
+            box(dyn, 1180, ry, 1184, ry + 52, UI.ACCENT, 1)
+            text(dyn, 1204, ry + 8, 1600, ry + 44, who, UI.WHITE, 1)
+            text(dyn, 1620, ry + 8, 1808, ry + 44, "LEADER", UI.GOLD, 1, LUI.Alignment.Right)
             ry = ry + 60
         end
         for _ = 1, 3 do
-            box(root, 1180, ry, 1820, ry + 44, UI.SHADE, 0.35)
-            text(root, 1204, ry + 6, 1600, ry + 40, "OPEN SLOT", UI.DIM, 0.55)
+            box(dyn, 1180, ry, 1820, ry + 44, UI.SHADE, 0.35)
+            text(dyn, 1204, ry + 6, 1600, ry + 40, "OPEN SLOT", UI.DIM, 0.55)
             ry = ry + 52
         end
         return ry
     end
-    local ny = team(250, "BLACK OPS", UI.ACCENT, "WAITING 1/9", true)
+    local ny = team(250, "BLACK OPS", UI.ACCENT, "WAITING " .. members() .. "/9", true)
     team(ny + 30, "SPETSNAZ", UI.ENEMY, "0/9", false)
 
+    end
+    local function signature()
+        local m, g, w = "", "", Engine.GetDvarString("ui_gametype") or ""
+        pcall(function() m = Engine.GetDvarString("ui_mapname") or "" end)
+        return m .. "|" .. w .. "|" .. members()
+    end
+    local last = nil
+    local function refresh()
+        local sig = signature()
+        if sig == last then return end
+        last = sig
+        local c = dyn:getFirstChild()
+        while c do
+            local nxt = c:getNextSibling()
+            pcall(function() c:close() end)
+            c = nxt
+        end
+        draw()
+        pcall(function()
+            local art = UI.map_art()
+            if art and menu.claude_map_layer then
+                menu.claude_map_layer:setImage(art)
+            end
+        end)
+    end
+    pcall(refresh)
+    root:addElement(LUI.UITimer.new(1000, "claude_lobby_refresh"))
+    root:registerEventHandler("claude_lobby_refresh", function()
+        pcall(refresh)
+    end)
     menu:addElement(root)
 end
 

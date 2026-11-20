@@ -135,9 +135,20 @@ namespace ui_scripting
 			if (load_results[0].is<function>())
 			{
 				const auto results = lua["pcall"](load_results);
-				if (!results[0].as<bool>())
+				// Never call as<>() on a mismatched type: the thrown error is formatted through
+				// a std::locale facet that is not valid in this loader context and crashes the client.
+				if (results[0].is<bool>())
 				{
-					print_error(results[1].as<std::string>());
+					if (!results[0].as<bool>())
+					{
+						print_error(results[1].is<std::string>()
+							? results[1].as<std::string>()
+							: ("script failed (non-string error): " + name));
+					}
+				}
+				else
+				{
+					print_error("script returned a non-boolean pcall result: " + name);
 				}
 			}
 			else if (load_results[1].is<std::string>())

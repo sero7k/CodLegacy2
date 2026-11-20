@@ -1,2 +1,0 @@
-# Automatic exposure keys per MWR/HMW map, fitted to HorizonMW's intermission pictures
-# (docs/look_refs/<map>/hmw_intermission.jpg). `map key`.
